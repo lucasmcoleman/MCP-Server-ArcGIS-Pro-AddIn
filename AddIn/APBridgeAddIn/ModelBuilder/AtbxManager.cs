@@ -15,11 +15,12 @@ namespace APBridgeAddIn.ModelBuilder
     /// </summary>
     internal static class AtbxManager
     {
-        // NOTE: PropertyNamingPolicy is intentionally omitted. It forces a
-        // TypeInfoResolver requirement on .NET 8's JsonSerializerOptions, and
-        // JsonNode.ToJsonString uses the keys already stored in the node —
-        // reflection-based property renaming doesn't apply.
-        private static readonly JsonSerializerOptions JsonOpts = new()
+        // Inherit from JsonSerializerOptions.Default so we get the built-in
+        // reflection-based TypeInfoResolver. Required because JsonNode.ToJsonString
+        // delegates to Utf8JsonWriter which demands a resolver when serializing
+        // JsonValueCustomized<T> instances (the type created by, e.g.,
+        // `jsonArray.Add("someCSharpString")`).
+        private static readonly JsonSerializerOptions JsonOpts = new(JsonSerializerOptions.Default)
         {
             WriteIndented = true
         };
