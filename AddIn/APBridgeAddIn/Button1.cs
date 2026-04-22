@@ -22,15 +22,11 @@ namespace APBridgeAddIn
 {
     internal class Button1 : Button
     {
-        
-
-        private ProBridgeService _service;
         protected override void OnClick()
         {
-
-            _service = new ProBridgeService("ArcGisProBridgePipe");
-            _service.Start();
-            MessageBox.Show("Hello, I start ArcGisProBridgePipe!");
+            // The bridge auto-starts with the module. This button is a
+            // manual restart in case something goes wrong.
+            MessageBox.Show("MCP Bridge is running (auto-started with ArcGIS Pro).");
         }
     }
 }

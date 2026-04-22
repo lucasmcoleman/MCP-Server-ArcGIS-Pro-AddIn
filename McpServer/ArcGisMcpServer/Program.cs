@@ -2,8 +2,15 @@
 using ArcGisMcpServer.Tools;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 
 await Host.CreateDefaultBuilder(args)
+    .ConfigureLogging(logging =>
+    {
+        // Remove all logging providers - stdout is reserved for MCP STDIO transport.
+        // .NET's default console logger writes to stdout, which corrupts the JSON stream.
+        logging.ClearProviders();
+    })
     .ConfigureServices(services =>
     {
         services.AddSingleton(new BridgeClient("ArcGisProBridgePipe"));

@@ -1,5 +1,9 @@
-﻿using ArcGIS.Desktop.Framework.Threading.Tasks;
+using ArcGIS.Desktop.Core;
+using ArcGIS.Desktop.Core.Geoprocessing;
+using ArcGIS.Desktop.Framework.Threading.Tasks;
+using ArcGIS.Desktop.GeoProcessing;
 using ArcGIS.Desktop.Mapping;
+using APBridgeAddIn.ModelBuilder;
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -7,8 +11,10 @@ using System.IO.Pipes;
 using System.Linq;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Threading;
 using System.Threading.Tasks;
+
 namespace APBridgeAddIn
 {
     internal class ProBridgeService : IDisposable
@@ -16,145 +22,362 @@ namespace APBridgeAddIn
         private readonly string _pipeName;
         private CancellationTokenSource _cts;
         private Task _serverLoop;
+
         public ProBridgeService(string pipeName) => _pipeName = pipeName;
+
         public void Start()
         {
             _cts = new CancellationTokenSource();
             _serverLoop = Task.Run(() => RunAsync(_cts.Token));
         }
+
         public void Dispose()
         {
             try { _cts?.Cancel(); _serverLoop?.Wait(2000); } catch { }
         }
+
         private async Task RunAsync(CancellationToken ct)
         {
             while (!ct.IsCancellationRequested)
             {
-                using var server = new NamedPipeServerStream(_pipeName,
-                PipeDirection.InOut, 1, PipeTransmissionMode.Message,
-                PipeOptions.Asynchronous);
-                await server.WaitForConnectionAsync(ct);
-                using var reader = new StreamReader(server, Encoding.UTF8,
-                leaveOpen: true);
-                using var writer = new StreamWriter(server, new
-                UTF8Encoding(false), leaveOpen: true)
-                { AutoFlush = true };
-                // loop richieste su questa connessione
-                while (server.IsConnected && !ct.IsCancellationRequested)
+                try
                 {
-                    var line = await reader.ReadLineAsync();
-                    if (line == null) break;
-                    IpcRequest req;
-                    try
+                    using var server = new NamedPipeServerStream(_pipeName,
+                        PipeDirection.InOut, 1, PipeTransmissionMode.Message,
+                        PipeOptions.Asynchronous);
+                    await server.WaitForConnectionAsync(ct);
+                    using var reader = new StreamReader(server, Encoding.UTF8, leaveOpen: true);
+                    using var writer = new StreamWriter(server, new UTF8Encoding(false), leaveOpen: true)
+                        { AutoFlush = true };
+
+                    while (server.IsConnected && !ct.IsCancellationRequested)
                     {
-                        req =
-                    JsonSerializer.Deserialize<IpcRequest>(line);
+                        var line = await reader.ReadLineAsync();
+                        if (line == null) break;
+
+                        IpcRequest req;
+                        try
+                        {
+                            req = JsonSerializer.Deserialize<IpcRequest>(line);
+                        }
+                        catch (Exception ex)
+                        {
+                            await SendAsync(writer, new IpcResponse(false, $"parse:{ex.Message}", null));
+                            continue;
+                        }
+
+                        try
+                        {
+                            var resp = await HandleAsync(req, ct);
+                            await SendAsync(writer, resp);
+                        }
+                        catch (Exception ex)
+                        {
+                            await SendAsync(writer, new IpcResponse(false, ex.Message, null));
+                        }
                     }
-                    catch (Exception ex)
-                    {
-                        await SendAsync(writer, new IpcResponse(false,
-                        $"parse:{ex.Message}", null));
-                        continue;
-                    }
-                    try
-                    {
-                        var resp = await HandleAsync(req, ct);
-                        await SendAsync(writer, resp);
-                    }
-                    catch (Exception ex)
-                    {
-                        await SendAsync(writer, new IpcResponse(false,
-                        ex.Message, null));
-                    }
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    break; // Clean shutdown
+                }
+                catch (Exception)
+                {
+                    // Pipe broke or other transient error — restart the listener.
+                    // Small delay prevents tight spin if errors repeat.
+                    try { await Task.Delay(100, ct); } catch { break; }
                 }
             }
         }
+
         private static Task SendAsync(StreamWriter w, IpcResponse resp)
-        => w.WriteLineAsync(JsonSerializer.Serialize(resp));
-        private static async Task<IpcResponse> HandleAsync(IpcRequest req,
-        CancellationToken ct)
+            => w.WriteLineAsync(JsonSerializer.Serialize(resp));
+
+        private static async Task<IpcResponse> HandleAsync(IpcRequest req, CancellationToken ct)
         {
             switch (req.Op)
             {
+                // ─── Existing Map Operations ────────────────────────────────
                 case "pro.getActiveMapName":
                     var name = MapView.Active?.Map?.Name ?? "<none>";
                     return new(true, null, new { name });
+
                 case "pro.listLayers":
                     var layers = await QueuedTask.Run(() =>
-                    MapView.Active?.Map?.Layers.Select(l => l.Name).ToList() ?? new
-                    List<string>());
+                        MapView.Active?.Map?.Layers.Select(l => l.Name).ToList()
+                        ?? new List<string>());
                     return new(true, null, layers);
+
                 case "pro.countFeatures":
-                    {
-                        if (req.Args == null)
-                            return new(false, "arg 'layer' required", null);
-
-
-                        if (!req.Args.TryGetValue("layer", out string? layerName) ||
+                {
+                    if (req.Args == null ||
+                        !req.Args.TryGetValue("layer", out string? layerName) ||
                         string.IsNullOrWhiteSpace(layerName))
-                            return new(false, "arg 'layer' required", null);
+                        return new(false, "arg 'layer' required", null);
 
-
-                        int count = await QueuedTask.Run(() =>
-                        {
-                            var fl = MapView.Active?.Map?.Layers
+                    int count = await QueuedTask.Run(() =>
+                    {
+                        var fl = MapView.Active?.Map?.Layers
                             .OfType<FeatureLayer>()
                             .FirstOrDefault(l => l.Name.Equals(layerName, StringComparison.OrdinalIgnoreCase));
-                            if (fl == null) return 0;
-                            using var fc = fl.GetFeatureClass();
-                            return (int)fc.GetCount();
-                        });
+                        if (fl == null) return 0;
+                        using var fc = fl.GetFeatureClass();
+                        return (int)fc.GetCount();
+                    });
+                    return new(true, null, new { count });
+                }
 
-
-                        return new(true, null, new { count });
-                    }
                 case "pro.zoomToLayer":
+                {
+                    if (req.Args == null ||
+                        !req.Args.TryGetValue("layer", out string? layerName) ||
+                        string.IsNullOrWhiteSpace(layerName))
+                        return new(false, "arg 'layer' required", null);
+
+                    await QueuedTask.Run(async () =>
                     {
-                        if (req.Args == null ||
-                            !req.Args.TryGetValue("layer", out string? layerName) ||
-                            string.IsNullOrWhiteSpace(layerName))
-                            return new(false, "arg 'layer' required", null);
-
-
-                        await QueuedTask.Run(async () =>
-                        {
-                            var fl = MapView.Active?.Map?.Layers
+                        var fl = MapView.Active?.Map?.Layers
                             .OfType<FeatureLayer>()
                             .FirstOrDefault(l => l.Name.Equals(layerName, StringComparison.OrdinalIgnoreCase));
-                            if (fl != null)
-                                await MapView.Active!.ZoomToAsync(fl);
-                        });
+                        if (fl != null)
+                            await MapView.Active!.ZoomToAsync(fl);
+                    });
+                    return new(true, null, new { done = true });
+                }
 
-
-                        return new(true, null, new { done = true });
-                    }
                 case "pro.selectByAttribute":
-                    {
-                        if (req.Args == null ||
+                {
+                    if (req.Args == null ||
                         !req.Args.TryGetValue("layer", out string? layerName) ||
                         string.IsNullOrWhiteSpace(layerName) ||
                         !req.Args.TryGetValue("where", out string? where) ||
                         string.IsNullOrWhiteSpace(where))
-                            return new(false, "args 'layer' & 'where' required", null);
+                        return new(false, "args 'layer' & 'where' required", null);
 
-
-                        await QueuedTask.Run(() =>
-                        {
-                            var fl = MapView.Active?.Map?.Layers
+                    await QueuedTask.Run(() =>
+                    {
+                        var fl = MapView.Active?.Map?.Layers
                             .OfType<FeatureLayer>()
                             .FirstOrDefault(l => l.Name.Equals(layerName, StringComparison.OrdinalIgnoreCase));
-                            if (fl != null)
-                            {
-                                fl.Select(new ArcGIS.Core.Data.QueryFilter { WhereClause = where });
-                            }
-                        });
+                        if (fl != null)
+                            fl.Select(new ArcGIS.Core.Data.QueryFilter { WhereClause = where });
+                    });
+                    return new(true, null, new { done = true });
+                }
 
+                // ─── ModelBuilder Operations ────────────────────────────────
+                case "pro.listToolboxes":
+                    return await HandleListToolboxes();
 
-                        return new(true, null, new { done = true });
-                    }
+                case "pro.listModels":
+                    return HandleListModels(req.Args);
+
+                case "pro.describeModel":
+                    return HandleDescribeModel(req.Args);
+
+                case "pro.createToolbox":
+                    return await HandleCreateToolbox(req.Args);
+
+                case "pro.createModel":
+                    return HandleCreateModel(req.Args);
+
+                case "pro.updateModel":
+                    return HandleUpdateModel(req.Args);
+
+                case "pro.runModel":
+                    return await HandleRunModel(req.Args);
+
+                case "pro.runGPTool":
+                    return await HandleRunGPTool(req.Args);
+
                 default:
                     return new(false, $"op not found: {req.Op}", null);
             }
+        }
+
+        // ─── ModelBuilder Handler Methods ────────────────────────────────────
+
+        private static async Task<IpcResponse> HandleListToolboxes()
+        {
+            var toolboxes = await QueuedTask.Run(() =>
+            {
+                var items = Project.Current.GetItems<GeoprocessingProjectItem>();
+                return items.Select(item => new Dictionary<string, string>
+                {
+                    ["name"] = item.Name,
+                    ["path"] = item.Path
+                }).ToList();
+            });
+
+            return new(true, null, toolboxes);
+        }
+
+        private static IpcResponse HandleListModels(Dictionary<string, string>? args)
+        {
+            if (args == null || !args.TryGetValue("toolboxPath", out string? path) ||
+                string.IsNullOrWhiteSpace(path))
+                return new(false, "arg 'toolboxPath' required", null);
+
+            if (!File.Exists(path))
+                return new(false, $"Toolbox not found: {path}", null);
+
+            var models = AtbxManager.ListModels(path);
+            return new(true, null, models);
+        }
+
+        private static IpcResponse HandleDescribeModel(Dictionary<string, string>? args)
+        {
+            if (args == null ||
+                !args.TryGetValue("toolboxPath", out string? path) ||
+                string.IsNullOrWhiteSpace(path) ||
+                !args.TryGetValue("modelName", out string? modelName) ||
+                string.IsNullOrWhiteSpace(modelName))
+                return new(false, "args 'toolboxPath' & 'modelName' required", null);
+
+            if (!File.Exists(path))
+                return new(false, $"Toolbox not found: {path}", null);
+
+            var description = AtbxManager.DescribeModel(path, modelName);
+            // Return as a raw JSON string that gets parsed on the other side
+            return new(true, null, JsonNode.Parse(description));
+        }
+
+        private static async Task<IpcResponse> HandleCreateToolbox(Dictionary<string, string>? args)
+        {
+            if (args == null ||
+                !args.TryGetValue("name", out string? tbxName) ||
+                string.IsNullOrWhiteSpace(tbxName))
+                return new(false, "arg 'name' required", null);
+
+            // Default path: project home folder
+            string path;
+            if (args.TryGetValue("path", out string? customPath) && !string.IsNullOrWhiteSpace(customPath))
+            {
+                path = customPath;
+            }
+            else
+            {
+                var projectHome = await QueuedTask.Run(() => Project.Current.HomeFolderPath);
+                path = Path.Combine(projectHome, $"{tbxName}.atbx");
+            }
+
+            if (!path.EndsWith(".atbx", StringComparison.OrdinalIgnoreCase))
+                path += ".atbx";
+
+            AtbxManager.CreateToolbox(path, tbxName);
+
+            // Add to project
+            await QueuedTask.Run(() =>
+            {
+                try { Project.Current.AddItem(ItemFactory.Instance.Create(path) as IProjectItem); }
+                catch { /* May fail if already added */ }
+            });
+
+            return new(true, null, new { path, name = tbxName });
+        }
+
+        private static IpcResponse HandleCreateModel(Dictionary<string, string>? args)
+        {
+            if (args == null ||
+                !args.TryGetValue("toolboxPath", out string? path) ||
+                string.IsNullOrWhiteSpace(path) ||
+                !args.TryGetValue("definition", out string? definition) ||
+                string.IsNullOrWhiteSpace(definition))
+                return new(false, "args 'toolboxPath' & 'definition' required", null);
+
+            if (!File.Exists(path))
+                return new(false, $"Toolbox not found: {path}", null);
+
+            AtbxManager.CreateModel(path, definition);
+
+            var defNode = JsonNode.Parse(definition);
+            var modelName = defNode?["name"]?.GetValue<string>() ?? "unknown";
+            return new(true, null, new { modelName, toolboxPath = path, created = true });
+        }
+
+        private static IpcResponse HandleUpdateModel(Dictionary<string, string>? args)
+        {
+            if (args == null ||
+                !args.TryGetValue("toolboxPath", out string? path) ||
+                string.IsNullOrWhiteSpace(path) ||
+                !args.TryGetValue("modelName", out string? modelName) ||
+                string.IsNullOrWhiteSpace(modelName) ||
+                !args.TryGetValue("definition", out string? definition) ||
+                string.IsNullOrWhiteSpace(definition))
+                return new(false, "args 'toolboxPath', 'modelName' & 'definition' required", null);
+
+            if (!File.Exists(path))
+                return new(false, $"Toolbox not found: {path}", null);
+
+            AtbxManager.UpdateModel(path, modelName, definition);
+            return new(true, null, new { modelName, toolboxPath = path, updated = true });
+        }
+
+        private static async Task<IpcResponse> HandleRunModel(Dictionary<string, string>? args)
+        {
+            if (args == null ||
+                !args.TryGetValue("toolboxPath", out string? path) ||
+                string.IsNullOrWhiteSpace(path) ||
+                !args.TryGetValue("modelName", out string? modelName) ||
+                string.IsNullOrWhiteSpace(modelName))
+                return new(false, "args 'toolboxPath' & 'modelName' required", null);
+
+            // Build the tool path: "toolboxPath\modelName"
+            var toolPath = $"{path}\\{modelName}";
+
+            // Collect parameter values from args (everything except toolboxPath and modelName)
+            var paramValues = new List<string>();
+            if (args.TryGetValue("parameters", out string? paramsJson) && !string.IsNullOrWhiteSpace(paramsJson))
+            {
+                var paramsNode = JsonNode.Parse(paramsJson)?.AsObject();
+                if (paramsNode != null)
+                {
+                    foreach (var kv in paramsNode)
+                        paramValues.Add(kv.Value?.GetValue<string>() ?? "");
+                }
+            }
+
+            var valueArray = Geoprocessing.MakeValueArray(paramValues.ToArray());
+            var result = await Geoprocessing.ExecuteToolAsync(toolPath, valueArray);
+
+            if (result.IsFailed)
+            {
+                var messages = string.Join("; ", result.Messages.Select(m => m.Text));
+                return new(false, $"Model execution failed: {messages}", null);
+            }
+
+            var outputMessages = result.Messages.Select(m => new { type = m.Type.ToString(), text = m.Text }).ToList();
+            return new(true, null, new { success = true, messages = outputMessages });
+        }
+
+        private static async Task<IpcResponse> HandleRunGPTool(Dictionary<string, string>? args)
+        {
+            if (args == null ||
+                !args.TryGetValue("tool", out string? toolName) ||
+                string.IsNullOrWhiteSpace(toolName) ||
+                !args.TryGetValue("parameters", out string? paramsJson) ||
+                string.IsNullOrWhiteSpace(paramsJson))
+                return new(false, "args 'tool' & 'parameters' required", null);
+
+            var paramValues = new List<object>();
+            var paramsNode = JsonNode.Parse(paramsJson)?.AsArray();
+            if (paramsNode != null)
+            {
+                foreach (var p in paramsNode)
+                    paramValues.Add(p?.GetValue<string>() ?? "");
+            }
+
+            var valueArray = Geoprocessing.MakeValueArray(paramValues.ToArray());
+            var result = await Geoprocessing.ExecuteToolAsync(toolName, valueArray);
+
+            if (result.IsFailed)
+            {
+                var messages = string.Join("; ", result.Messages.Select(m => m.Text));
+                return new(false, $"GP tool failed: {messages}", null);
+            }
+
+            var outputMessages = result.Messages.Select(m => new { type = m.Type.ToString(), text = m.Text }).ToList();
+            return new(true, null, new { success = true, messages = outputMessages });
         }
     }
 }

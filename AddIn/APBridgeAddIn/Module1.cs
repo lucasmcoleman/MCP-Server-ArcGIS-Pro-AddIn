@@ -24,25 +24,30 @@ namespace APBridgeAddIn
     internal class Module1 : Module
     {
         private static Module1 _this = null;
+        private ProBridgeService _service;
 
-        /// <summary>
-        /// Retrieve the singleton instance to this module here
-        /// </summary>
         public static Module1 Current => _this ??= (Module1)FrameworkApplication.FindModule("APBridgeAddIn_Module");
 
-        #region Overrides
         /// <summary>
-        /// Called by Framework when ArcGIS Pro is closing
+        /// The shared bridge service instance. Button1 can access this
+        /// to avoid creating a duplicate.
         /// </summary>
-        /// <returns>False to prevent Pro from closing, otherwise True</returns>
-        protected override bool CanUnload()
+        internal ProBridgeService BridgeService => _service;
+
+        protected override bool Initialize()
         {
-            //TODO - add your business logic
-            //return false to ~cancel~ Application close
-            return true;
+            _service = new ProBridgeService("ArcGisProBridgePipe");
+            _service.Start();
+            return base.Initialize();
         }
 
-        #endregion Overrides
+        protected override void Uninitialize()
+        {
+            _service?.Dispose();
+            _service = null;
+            base.Uninitialize();
+        }
 
+        protected override bool CanUnload() => true;
     }
 }

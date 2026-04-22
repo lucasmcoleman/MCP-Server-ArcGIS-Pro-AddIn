@@ -1,35 +1,23 @@
-﻿<ArcGIS defaultAssembly="APBridgeAddIn.dll" defaultNamespace="APBridgeAddIn" xmlns="http://schemas.esri.com/DADF/Registry" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://schemas.esri.com/DADF/Registry file:///C:/Program%20Files/ArcGIS/Pro/bin/ArcGIS.Desktop.Framework.xsd">
-  <AddInInfo id="{c56ccfd4-f12a-4916-84c2-64248b3d746c}" version="1.0" desktopVersion="3.5.57366" product="ArcGISPro">
+<ArcGIS defaultAssembly="APBridgeAddIn.dll" defaultNamespace="APBridgeAddIn" xmlns="http://schemas.esri.com/DADF/Registry" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://schemas.esri.com/DADF/Registry file:///C:/Program%20Files/ArcGIS/Pro/bin/ArcGIS.Desktop.Framework.xsd">
+  <AddInInfo id="{c56ccfd4-f12a-4916-84c2-64248b3d746c}" version="1.0" desktopVersion="3.6.59527" product="ArcGISPro">
     <Name>APBridgeAddIn</Name>
-    <Description>APBridgeAddIn description</Description>
-    <Image>Images\AddinDesktop32.png</Image>
-    <Author>nicogis</Author>
+    <Description>MCP Server bridge for ArcGIS Pro - enables Claude to interact with Pro via ModelContext Protocol</Description>
+    <Image>Images\AddInDesktop32.png</Image>
+    <Author>lucasmcoleman</Author>
     <Company></Company>
-    <Date>8/28/2025 11:42:00 AM</Date>
-    <Subject>Framework</Subject>
-    <!-- Note subject can be one or more of these topics:
-                    Content, Framework, Editing, Geodatabase, Geometry, Geoprocessing, Layouts, Map Authoring, Map Exploration -->
+    <Date>4/1/2026</Date>
+    <Subject>Framework, Geoprocessing</Subject>
   </AddInInfo>
   <modules>
-    <insertModule id="APBridgeAddIn_Module" className="Module1" autoLoad="false" caption="Module1">
-      <!-- uncomment to have the control hosted on a separate tab-->
-      <tabs>
-        <!--<tab id="APBridgeAddIn_Tab1" caption="New Tab">
-          <group refID="APBridgeAddIn_Group1"/>
-        </tab>-->
-      </tabs>
+    <insertModule id="APBridgeAddIn_Module" className="Module1" autoLoad="true" caption="MCP Bridge">
       <groups>
-        <!-- comment this out if you have no controls on the Addin tab to avoid
-              an empty group-->
-        <group id="APBridgeAddIn_Group1" caption="Group 1" appearsOnAddInTab="true">
-          <!-- host controls within groups -->
+        <group id="APBridgeAddIn_Group1" caption="MCP Server" appearsOnAddInTab="true">
           <button refID="APBridgeAddIn_Button1" size="large" />
         </group>
       </groups>
       <controls>
-        <!-- add your controls here -->
-        <button id="APBridgeAddIn_Button1" caption="Start server mcp" className="Button1" loadOnClick="true" smallImage="GenericButtonBlue16" largeImage="GenericButtonBlue32">
-          <tooltip heading="Tooltip Heading">Tooltip text<disabledText /></tooltip>
+        <button id="APBridgeAddIn_Button1" caption="Start MCP Bridge" className="Button1" loadOnClick="true" smallImage="Images\AddInDesktop16.png" largeImage="Images\AddInDesktop32.png">
+          <tooltip heading="MCP Bridge">Start the Named Pipe server for Claude MCP integration<disabledText /></tooltip>
         </button>
       </controls>
     </insertModule>
