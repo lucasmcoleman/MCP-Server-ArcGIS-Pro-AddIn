@@ -340,7 +340,7 @@ namespace APBridgeAddIn
             }
 
             var valueArray = Geoprocessing.MakeValueArray(paramValues.ToArray());
-            var result = await Geoprocessing.ExecuteToolAsync(toolPath, valueArray);
+            var result = await Geoprocessing.ExecuteToolAsync(toolPath, valueArray, DefaultRunEnvironments());
 
             if (result.IsFailed)
             {
@@ -351,6 +351,18 @@ namespace APBridgeAddIn
             var outputMessages = result.Messages.Select(m => new { type = m.Type.ToString(), text = m.Text }).ToList();
             return new(true, null, new { success = true, messages = outputMessages });
         }
+
+        /// <summary>
+        /// Default geoprocessing environment for MCP-driven runs. Enables
+        /// overwrite — programmatic invocation is idempotent-friendly and
+        /// ERROR 000210 (output already exists) is an unhelpful failure
+        /// mode when the whole point is repeatable automation.
+        /// </summary>
+        private static IReadOnlyList<KeyValuePair<string, string>> DefaultRunEnvironments() =>
+            Geoprocessing.MakeEnvironmentArray(new Dictionary<string, object>
+            {
+                ["overwriteoutput"] = true
+            });
 
         private static async Task<IpcResponse> HandleRunGPTool(Dictionary<string, string>? args)
         {
@@ -370,7 +382,7 @@ namespace APBridgeAddIn
             }
 
             var valueArray = Geoprocessing.MakeValueArray(paramValues.ToArray());
-            var result = await Geoprocessing.ExecuteToolAsync(toolName, valueArray);
+            var result = await Geoprocessing.ExecuteToolAsync(toolName, valueArray, DefaultRunEnvironments());
 
             if (result.IsFailed)
             {

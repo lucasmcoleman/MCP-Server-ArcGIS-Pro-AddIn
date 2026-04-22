@@ -274,8 +274,11 @@ namespace APBridgeAddIn.ModelBuilder
                 steps.Add(step);
             }
 
-            // Build description
-            var description = TryGetString(toolContent?["description"]) ?? "";
+            // Build description — tool.content stores "$rc:description" as a
+            // pointer into tool.content.rc's map; resolve it the same way we
+            // resolve variable titles so the round-trip returns the real text.
+            var descRaw = TryGetString(toolContent?["description"]);
+            var description = descRaw != null ? ResolveName(descRaw, descRaw) : "";
 
             var result = new JsonObject
             {
