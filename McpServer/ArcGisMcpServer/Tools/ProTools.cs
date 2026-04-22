@@ -66,8 +66,7 @@ namespace ArcGisMcpServer.Tools
         public static async Task<string> ListToolboxes()
         {
             var r = await _client!.OpAsync("pro.listToolboxes");
-            if (!r.Ok) throw new Exception(r.Error);
-            return JsonSerializer.Serialize(r.Data, new JsonSerializerOptions { WriteIndented = true });
+            return FormatResult(r, "pro.listToolboxes");
         }
 
         [McpServerTool, Description(
@@ -77,8 +76,7 @@ namespace ArcGisMcpServer.Tools
             [Description("Full file path to the .atbx toolbox file")] string toolboxPath)
         {
             var r = await _client!.OpAsync("pro.listModels", new() { ["toolboxPath"] = toolboxPath });
-            if (!r.Ok) throw new Exception(r.Error);
-            return JsonSerializer.Serialize(r.Data, new JsonSerializerOptions { WriteIndented = true });
+            return FormatResult(r, "pro.listModels");
         }
 
         [McpServerTool, Description(
@@ -98,8 +96,7 @@ namespace ArcGisMcpServer.Tools
                 ["toolboxPath"] = toolboxPath,
                 ["modelName"] = modelName
             });
-            if (!r.Ok) throw new Exception(r.Error);
-            return JsonSerializer.Serialize(r.Data, new JsonSerializerOptions { WriteIndented = true });
+            return FormatResult(r, "pro.describeModel");
         }
 
         [McpServerTool, Description(
@@ -115,8 +112,7 @@ namespace ArcGisMcpServer.Tools
                 args["path"] = path;
 
             var r = await _client!.OpAsync("pro.createToolbox", args);
-            if (!r.Ok) throw new Exception(r.Error);
-            return JsonSerializer.Serialize(r.Data, new JsonSerializerOptions { WriteIndented = true });
+            return FormatResult(r, "pro.createToolbox");
         }
 
         [McpServerTool, Description(
@@ -145,8 +141,7 @@ namespace ArcGisMcpServer.Tools
                 ["toolboxPath"] = toolboxPath,
                 ["definition"] = definition
             });
-            if (!r.Ok) throw new Exception(r.Error);
-            return JsonSerializer.Serialize(r.Data, new JsonSerializerOptions { WriteIndented = true });
+            return FormatResult(r, "pro.createModel");
         }
 
         [McpServerTool, Description(
@@ -165,8 +160,7 @@ namespace ArcGisMcpServer.Tools
                 ["modelName"] = modelName,
                 ["definition"] = definition
             });
-            if (!r.Ok) throw new Exception(r.Error);
-            return JsonSerializer.Serialize(r.Data, new JsonSerializerOptions { WriteIndented = true });
+            return FormatResult(r, "pro.updateModel");
         }
 
         [McpServerTool, Description(
@@ -187,8 +181,7 @@ namespace ArcGisMcpServer.Tools
                 args["parameters"] = parameters;
 
             var r = await _client!.OpAsync("pro.runModel", args);
-            if (!r.Ok) throw new Exception(r.Error);
-            return JsonSerializer.Serialize(r.Data, new JsonSerializerOptions { WriteIndented = true });
+            return FormatResult(r, "pro.runModel");
         }
 
         [McpServerTool, Description(
@@ -204,8 +197,23 @@ namespace ArcGisMcpServer.Tools
                 ["tool"] = tool,
                 ["parameters"] = parameters
             });
-            if (!r.Ok) throw new Exception(r.Error);
-            return JsonSerializer.Serialize(r.Data, new JsonSerializerOptions { WriteIndented = true });
+            return FormatResult(r, "pro.runGPTool");
         }
+
+        // ─── Helpers ─────────────────────────────────────────────────────
+
+        private static readonly JsonSerializerOptions _jsonOpts = new() { WriteIndented = true };
+
+        /// <summary>
+        /// Serializes a bridge response as a JSON string. On success returns the raw data;
+        /// on failure returns a structured error payload so the model can see what went wrong
+        /// (the MCP SDK swallows thrown exception messages, leaving only a generic wrapper).
+        /// </summary>
+        private static string FormatResult(IpcResponse r, string op) =>
+            r.Ok
+                ? JsonSerializer.Serialize(r.Data, _jsonOpts)
+                : JsonSerializer.Serialize(
+                    new { success = false, op, error = r.Error ?? "<empty>" },
+                    _jsonOpts);
     }
 }

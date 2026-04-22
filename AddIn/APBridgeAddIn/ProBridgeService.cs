@@ -73,7 +73,9 @@ namespace APBridgeAddIn
                         }
                         catch (Exception ex)
                         {
-                            await SendAsync(writer, new IpcResponse(false, ex.Message, null));
+                            LogException(req, ex);
+                            await SendAsync(writer, new IpcResponse(false,
+                                $"{ex.GetType().Name}: {ex.Message ?? "<no message>"}", null));
                         }
                     }
                 }
@@ -379,5 +381,35 @@ namespace APBridgeAddIn
             var outputMessages = result.Messages.Select(m => new { type = m.Type.ToString(), text = m.Text }).ToList();
             return new(true, null, new { success = true, messages = outputMessages });
         }
+
+        // ─── Logging ────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Writes a full exception record (type, message, stack trace) to mcp-bridge.log
+        /// in the active project's home folder, with a temp-dir fallback. Best-effort —
+        /// any failure here is swallowed to keep the IPC loop alive.
+        /// </summary>
+        private static void LogException(IpcRequest req, Exception ex)
+        {
+            try
+            {
+                string dir;
+                try { dir = Project.Current?.HomeFolderPath ?? Path.GetTempPath(); }
+                catch { dir = Path.GetTempPath(); }
+
+                var logPath = Path.Combine(dir, "mcp-bridge.log");
+                var argsPreview = req.Args == null
+                    ? "<none>"
+                    : string.Join(", ", req.Args.Select(kv =>
+                        $"{kv.Key}={Truncate(kv.Value, 200)}"));
+
+                var entry = $"[{DateTime.UtcNow:O}] op={req.Op} args=[{argsPreview}]\n{ex}\n\n";
+                File.AppendAllText(logPath, entry);
+            }
+            catch { /* best effort — never break the IPC loop to log */ }
+        }
+
+        private static string Truncate(string? s, int max) =>
+            s == null ? "<null>" : s.Length <= max ? s : s[..max] + $"…(+{s.Length - max})";
     }
 }
