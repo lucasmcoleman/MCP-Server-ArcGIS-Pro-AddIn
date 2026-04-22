@@ -1,0 +1,21 @@
+# Minimize the Docker build context: only the MCP server source is needed.
+# Keep this list narrow — the Dockerfile COPYs exactly what it needs.
+**/bin/
+**/obj/
+**/out/
+**/.vs/
+**/.idea/
+**/.vscode/
+**/*.user
+**/*.suo
+.git/
+.github/
+
+# Exclude the Add-In project from the build context — it references
+# on-disk ArcGIS Pro assemblies and can't build inside a Linux container.
+AddIn/
+
+# Docs and binary assets aren't needed for the server image.
+*.md
+*.gif
+*.png

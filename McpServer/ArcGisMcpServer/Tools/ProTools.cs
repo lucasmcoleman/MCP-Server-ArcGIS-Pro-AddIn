@@ -46,6 +46,54 @@ namespace ArcGisMcpServer.Tools
             return true;
         }
 
+        [McpServerTool, Description(
+            "Select features in a layer using a SQL WHERE clause. " +
+            "Returns the number of selected features. " +
+            "Example where clauses: \"POP > 1000\", \"NAME = 'Seattle'\", \"STATE IN ('WA','OR')\".")]
+        public static async Task<string> SelectByAttribute(
+            [Description("Name of the feature layer in the active map")] string layer,
+            [Description("SQL WHERE clause to filter the layer's features")] string where)
+        {
+            var r = await _client!.OpAsync("pro.selectByAttribute", new()
+            {
+                ["layer"] = layer,
+                ["where"] = where
+            });
+            return FormatResult(r, "pro.selectByAttribute");
+        }
+
+        [McpServerTool, Description(
+            "Get the current extent (viewport) of the active map view. " +
+            "Returns xmin/ymin/xmax/ymax, width/height, and the spatial reference WKID.")]
+        public static async Task<string> GetCurrentExtent()
+        {
+            var r = await _client!.OpAsync("pro.getCurrentExtent");
+            return FormatResult(r, "pro.getCurrentExtent");
+        }
+
+        [McpServerTool, Description(
+            "Export a layer's features to a feature class or shapefile. " +
+            "The output path determines the format: use a '.shp' extension for shapefile " +
+            "output, otherwise provide a path inside a file/enterprise geodatabase " +
+            "(e.g., 'C:/data/out.gdb/Buildings_Export'). An optional SQL WHERE clause " +
+            "filters the exported features.")]
+        public static async Task<string> ExportLayer(
+            [Description("Name of the feature layer in the active map")] string layer,
+            [Description("Full output path (shapefile path ending in .shp, or a feature class path inside a geodatabase)")] string output,
+            [Description("Optional SQL WHERE clause to filter exported features")] string? where = null)
+        {
+            var args = new Dictionary<string, string>
+            {
+                ["layer"] = layer,
+                ["output"] = output
+            };
+            if (!string.IsNullOrWhiteSpace(where))
+                args["where"] = where;
+
+            var r = await _client!.OpAsync("pro.exportLayer", args);
+            return FormatResult(r, "pro.exportLayer");
+        }
+
         [McpServerTool, Description("Ping test to validate the MCP server (without depending on ArcGIS Pro)")]
         public static Task<string> Ping()
         {

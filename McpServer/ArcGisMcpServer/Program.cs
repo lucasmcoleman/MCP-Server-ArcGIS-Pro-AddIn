@@ -4,6 +4,12 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
+// Pipe name can be overridden via env var to ease alternate deployments
+// (e.g., containers or hosts using a non-default bridge pipe name).
+var pipeName = Environment.GetEnvironmentVariable("ARCGIS_MCP_PIPE_NAME");
+if (string.IsNullOrWhiteSpace(pipeName))
+    pipeName = "ArcGisProBridgePipe";
+
 await Host.CreateDefaultBuilder(args)
     .ConfigureLogging(logging =>
     {
@@ -13,7 +19,7 @@ await Host.CreateDefaultBuilder(args)
     })
     .ConfigureServices(services =>
     {
-        services.AddSingleton(new BridgeClient("ArcGisProBridgePipe"));
+        services.AddSingleton(new BridgeClient(pipeName));
         services.AddMcpServer()
             .WithStdioServerTransport()
             .WithToolsFromAssembly(typeof(ProTools).Assembly);

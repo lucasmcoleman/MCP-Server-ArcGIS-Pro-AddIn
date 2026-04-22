@@ -156,16 +156,26 @@ namespace APBridgeAddIn
                         string.IsNullOrWhiteSpace(where))
                         return new(false, "args 'layer' & 'where' required", null);
 
-                    await QueuedTask.Run(() =>
+                    var selectionInfo = await QueuedTask.Run<object?>(() =>
                     {
                         var fl = MapView.Active?.Map?.Layers
                             .OfType<FeatureLayer>()
                             .FirstOrDefault(l => l.Name.Equals(layerName, StringComparison.OrdinalIgnoreCase));
-                        if (fl != null)
-                            fl.Select(new ArcGIS.Core.Data.QueryFilter { WhereClause = where });
+                        if (fl == null) return null;
+                        var sel = fl.Select(new ArcGIS.Core.Data.QueryFilter { WhereClause = where });
+                        return new { layer = fl.Name, selectedCount = sel?.GetCount() ?? 0 };
                     });
-                    return new(true, null, new { done = true });
+
+                    if (selectionInfo == null)
+                        return new(false, $"Layer not found: {layerName}", null);
+                    return new(true, null, selectionInfo);
                 }
+
+                case "pro.getCurrentExtent":
+                    return await HandleGetCurrentExtent();
+
+                case "pro.exportLayer":
+                    return await HandleExportLayer(req.Args);
 
                 // ─── ModelBuilder Operations ────────────────────────────────
                 case "pro.listToolboxes":
@@ -195,6 +205,81 @@ namespace APBridgeAddIn
                 default:
                     return new(false, $"op not found: {req.Op}", null);
             }
+        }
+
+        // ─── Map/Layer Handler Methods ───────────────────────────────────────
+
+        private static async Task<IpcResponse> HandleGetCurrentExtent()
+        {
+            var extent = await QueuedTask.Run<object?>(() =>
+            {
+                var view = MapView.Active;
+                var ext = view?.Extent;
+                if (ext == null) return null;
+                return new
+                {
+                    xmin = ext.XMin,
+                    ymin = ext.YMin,
+                    xmax = ext.XMax,
+                    ymax = ext.YMax,
+                    width = ext.Width,
+                    height = ext.Height,
+                    spatialReferenceWkid = ext.SpatialReference?.Wkid ?? 0,
+                    spatialReferenceName = ext.SpatialReference?.Name
+                };
+            });
+
+            if (extent == null)
+                return new(false, "No active map view", null);
+            return new(true, null, extent);
+        }
+
+        /// <summary>
+        /// Exports a layer (by name) to an output feature class/shapefile.
+        /// Uses the conversion.ExportFeatures GP tool so an optional SQL
+        /// WHERE clause can filter the output. Output path determines format
+        /// (.shp → shapefile, otherwise treated as a geodatabase feature class).
+        /// </summary>
+        private static async Task<IpcResponse> HandleExportLayer(Dictionary<string, string>? args)
+        {
+            if (args == null ||
+                !args.TryGetValue("layer", out string? layerName) ||
+                string.IsNullOrWhiteSpace(layerName) ||
+                !args.TryGetValue("output", out string? output) ||
+                string.IsNullOrWhiteSpace(output))
+                return new(false, "args 'layer' & 'output' required", null);
+
+            args.TryGetValue("where", out string? where);
+
+            // Resolve the layer so we return a clear error before invoking GP.
+            var resolved = await QueuedTask.Run(() =>
+                MapView.Active?.Map?.Layers
+                    .OfType<FeatureLayer>()
+                    .FirstOrDefault(l => l.Name.Equals(layerName, StringComparison.OrdinalIgnoreCase))
+                    ?.Name);
+            if (resolved == null)
+                return new(false, $"Layer not found in active map: {layerName}", null);
+
+            var valueArray = string.IsNullOrWhiteSpace(where)
+                ? Geoprocessing.MakeValueArray(resolved, output)
+                : Geoprocessing.MakeValueArray(resolved, output, where);
+
+            var result = await Geoprocessing.ExecuteToolAsync(
+                "conversion.ExportFeatures", valueArray, DefaultRunEnvironments());
+
+            if (result.IsFailed)
+            {
+                var messages = string.Join("; ", result.Messages.Select(m => m.Text));
+                return new(false, $"Export failed: {messages}", null);
+            }
+
+            return new(true, null, new
+            {
+                layer = resolved,
+                output,
+                where,
+                success = true
+            });
         }
 
         // ─── ModelBuilder Handler Methods ────────────────────────────────────
