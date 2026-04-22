@@ -357,12 +357,14 @@ namespace APBridgeAddIn
         /// overwrite — programmatic invocation is idempotent-friendly and
         /// ERROR 000210 (output already exists) is an unhelpful failure
         /// mode when the whole point is repeatable automation.
+        ///
+        /// NOTE: MakeEnvironmentArray is a named-argument method (every GP
+        /// env is a separate parameter); passing a Dictionary as a positional
+        /// arg binds it to `workspace`, producing a cryptic runtime binder
+        /// error. Use named-argument syntax.
         /// </summary>
         private static IReadOnlyList<KeyValuePair<string, string>> DefaultRunEnvironments() =>
-            Geoprocessing.MakeEnvironmentArray(new Dictionary<string, object>
-            {
-                ["overwriteoutput"] = true
-            });
+            Geoprocessing.MakeEnvironmentArray(overwriteoutput: true);
 
         private static async Task<IpcResponse> HandleRunGPTool(Dictionary<string, string>? args)
         {
