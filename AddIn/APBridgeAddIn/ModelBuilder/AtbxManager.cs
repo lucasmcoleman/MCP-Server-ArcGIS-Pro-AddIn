@@ -15,11 +15,32 @@ namespace APBridgeAddIn.ModelBuilder
     /// </summary>
     internal static class AtbxManager
     {
+        // NOTE: PropertyNamingPolicy is intentionally omitted. It forces a
+        // TypeInfoResolver requirement on .NET 8's JsonSerializerOptions, and
+        // JsonNode.ToJsonString uses the keys already stored in the node —
+        // reflection-based property renaming doesn't apply.
         private static readonly JsonSerializerOptions JsonOpts = new()
         {
-            WriteIndented = true,
-            PropertyNamingPolicy = JsonNamingPolicy.CamelCase
+            WriteIndented = true
         };
+
+        /// <summary>
+        /// Extracts a string from a JsonNode that may be either a JsonValue
+        /// (the common case) or a JsonArray (ATBX uses arrays for element_id
+        /// when multiple inputs feed one parameter slot — we take the first).
+        /// Returns null for null, missing, or non-scalar/non-array nodes.
+        /// </summary>
+        private static string? TryGetString(JsonNode? node)
+        {
+            if (node is null) return null;
+            if (node is JsonValue v)
+            {
+                try { return v.GetValue<string>(); } catch { return v.ToString(); }
+            }
+            if (node is JsonArray arr && arr.Count > 0)
+                return TryGetString(arr[0]);
+            return null;
+        }
 
         #region Read Operations
 
@@ -44,7 +65,7 @@ namespace APBridgeAddIn.ModelBuilder
                 if (tools == null) continue;
                 foreach (var tool in tools)
                 {
-                    var name = tool?.GetValue<string>();
+                    var name = TryGetString(tool);
                     if (string.IsNullOrEmpty(name)) continue;
 
                     var isModel = zip.GetEntry($"{name}.tool/tool.model") != null;
@@ -78,7 +99,7 @@ namespace APBridgeAddIn.ModelBuilder
             if (rcNode?["map"] is JsonNode map)
             {
                 foreach (var kv in map.AsObject())
-                    displayNames[kv.Key] = kv.Value?.GetValue<string>() ?? "";
+                    displayNames[kv.Key] = TryGetString(kv.Value) ?? "";
             }
 
             var contentNode = ReadJsonEntry<JsonNode>(zip, $"{modelName}.tool/tool.content");
@@ -99,7 +120,7 @@ namespace APBridgeAddIn.ModelBuilder
             var varMap = new Dictionary<string, JsonNode>();
             foreach (var v in variables)
             {
-                var id = v?["id"]?.GetValue<string>();
+                var id = TryGetString(v?["id"]);
                 if (id != null) varMap[id] = v!;
             }
 
@@ -119,10 +140,10 @@ namespace APBridgeAddIn.ModelBuilder
             var varNames = new Dictionary<string, string>();
             foreach (var v in variables)
             {
-                var id = v?["id"]?.GetValue<string>();
+                var id = TryGetString(v?["id"]);
                 if (id == null) continue;
-                var title = v?["title"]?.GetValue<string>();
-                var paramName = v?["param_name"]?.GetValue<string>();
+                var title = TryGetString(v?["title"]);
+                var paramName = TryGetString(v?["param_name"]);
                 var name = paramName ?? ResolveName(title, $"var_{id}");
                 // Ensure uniqueness
                 var baseName = name;
@@ -136,21 +157,21 @@ namespace APBridgeAddIn.ModelBuilder
             var inputs = new JsonArray();
             foreach (var v in variables)
             {
-                var id = v?["id"]?.GetValue<string>();
+                var id = TryGetString(v?["id"]);
                 if (id == null) continue;
-                if (v?["connection_type"]?.GetValue<string>() != "Parameter") continue;
+                if (TryGetString(v?["connection_type"]) != "Parameter") continue;
 
                 var input = new JsonObject
                 {
                     ["name"] = varNames[id],
-                    ["type"] = v?["datatype"]?["type"]?.GetValue<string>() ?? "GPString"
+                    ["type"] = TryGetString(v?["datatype"]?["type"]) ?? "GPString"
                 };
 
-                var value = v?["value"]?.GetValue<string>();
+                var value = TryGetString(v?["value"]);
                 if (value != null)
                     input["default"] = value;
 
-                var title = v?["title"]?.GetValue<string>();
+                var title = TryGetString(v?["title"]);
                 var displayName = ResolveName(title, varNames[id]);
                 if (displayName != varNames[id])
                     input["displayName"] = displayName;
@@ -162,10 +183,10 @@ namespace APBridgeAddIn.ModelBuilder
             var steps = new JsonArray();
             foreach (var p in processes)
             {
-                var processId = p?["id"]?.GetValue<string>();
-                var title = p?["title"]?.GetValue<string>();
-                var tool = p?["system_tool"]?.GetValue<string>()
-                    ?? p?["model_tool"]?.GetValue<string>()
+                var processId = TryGetString(p?["id"]);
+                var title = TryGetString(p?["title"]);
+                var tool = TryGetString(p?["system_tool"])
+                    ?? TryGetString(p?["model_tool"])
                     ?? "unknown";
 
                 var step = new JsonObject
@@ -186,15 +207,15 @@ namespace APBridgeAddIn.ModelBuilder
 
                         if (paramVal is JsonObject paramObj)
                         {
-                            var direction = paramObj["direction"]?.GetValue<string>();
-                            var elementId = paramObj["element_id"]?.GetValue<string>();
-                            var value = paramObj["value"]?.GetValue<string>();
+                            var direction = TryGetString(paramObj["direction"]);
+                            var elementId = TryGetString(paramObj["element_id"]);
+                            var value = TryGetString(paramObj["value"]);
 
                             if (direction == "out" && elementId != null)
                             {
                                 var outputName = varNames.GetValueOrDefault(elementId, $"output_{elementId}");
                                 var outputType = varMap.ContainsKey(elementId)
-                                    ? varMap[elementId]["datatype"]?["type"]?.GetValue<string>() ?? "DEFeatureClass"
+                                    ? TryGetString(varMap[elementId]["datatype"]?["type"]) ?? "DEFeatureClass"
                                     : "DEFeatureClass";
                                 parameters[param.Key] = new JsonObject
                                 {
@@ -237,8 +258,8 @@ namespace APBridgeAddIn.ModelBuilder
                     {
                         if (env.Value is JsonObject envObj)
                         {
-                            var elementId = envObj["element_id"]?.GetValue<string>();
-                            var value = envObj["value"]?.GetValue<string>();
+                            var elementId = TryGetString(envObj["element_id"]);
+                            var value = TryGetString(envObj["value"]);
                             if (elementId != null)
                                 environments[env.Key] = new JsonObject { ["ref"] = varNames.GetValueOrDefault(elementId, $"var_{elementId}") };
                             else if (value != null)
@@ -253,7 +274,7 @@ namespace APBridgeAddIn.ModelBuilder
             }
 
             // Build description
-            var description = toolContent?["description"]?.GetValue<string>() ?? "";
+            var description = TryGetString(toolContent?["description"]) ?? "";
 
             var result = new JsonObject
             {
@@ -324,6 +345,12 @@ namespace APBridgeAddIn.ModelBuilder
             using var fileStream = new FileStream(atbxPath, FileMode.Open, FileAccess.ReadWrite);
             using var zip = new ZipArchive(fileStream, ZipArchiveMode.Update);
 
+            // CRITICAL: Read the existing manifest BEFORE any writes. In
+            // ZipArchive Update mode, reading a pre-existing entry after
+            // writing to the archive can silently return an empty stream.
+            var existingManifestJson = ReadEntryTextOrDefault(zip, "toolbox.content",
+                "{\"version\":\"1.0\",\"toolsets\":{\"<root>\":{\"tools\":[]}}}");
+
             var folder = $"{modelName}.tool";
 
             // Remove existing entries if overwriting
@@ -332,6 +359,7 @@ namespace APBridgeAddIn.ModelBuilder
             RemoveEntryIfExists(zip, $"{folder}/tool.content.rc");
             RemoveEntryIfExists(zip, $"{folder}/tool.model.diagram");
             RemoveEntryIfExists(zip, $"{folder}/tool.model.diagram.xml");
+            RemoveEntryIfExists(zip, "toolbox.content");
 
             WriteStringEntry(zip, $"{folder}/tool.model", toolModel);
             WriteStringEntry(zip, $"{folder}/tool.content", toolContent);
@@ -339,8 +367,9 @@ namespace APBridgeAddIn.ModelBuilder
             WriteStringEntry(zip, $"{folder}/tool.model.diagram", diagram);
             WriteStringEntry(zip, $"{folder}/tool.model.diagram.xml", diagramXml);
 
-            // Update toolbox manifest to include this model
-            AddToolToManifest(zip, modelName);
+            // Compute updated manifest from the pre-read content, then write.
+            var updatedManifest = AddToolToManifestJson(existingManifestJson, modelName);
+            WriteStringEntry(zip, "toolbox.content", updatedManifest.ToJsonString(JsonOpts));
         }
 
         /// <summary>
@@ -759,22 +788,28 @@ namespace APBridgeAddIn.ModelBuilder
             entry?.Delete();
         }
 
-        private static void AddToolToManifest(ZipArchive zip, string toolName)
+        /// <summary>
+        /// Reads the text content of a ZIP entry, or returns <paramref name="defaultValue"/>
+        /// if the entry is missing or empty. Splitting this out (instead of reading inline
+        /// at the call site) makes the read-before-write ordering obvious in CreateModel.
+        /// </summary>
+        private static string ReadEntryTextOrDefault(ZipArchive zip, string entryName, string defaultValue)
         {
-            var manifestEntry = zip.GetEntry("toolbox.content");
-            string manifestJson;
-            if (manifestEntry != null)
-            {
-                using (var stream = manifestEntry.Open())
-                using (var reader = new StreamReader(stream))
-                    manifestJson = reader.ReadToEnd();
-                manifestEntry.Delete();
-            }
-            else
-            {
-                manifestJson = "{\"version\":\"1.0\",\"toolsets\":{\"<root>\":{\"tools\":[]}}}";
-            }
+            var entry = zip.GetEntry(entryName);
+            if (entry == null) return defaultValue;
+            using var stream = entry.Open();
+            using var reader = new StreamReader(stream);
+            var text = reader.ReadToEnd();
+            return string.IsNullOrWhiteSpace(text) ? defaultValue : text;
+        }
 
+        /// <summary>
+        /// Pure function: given a manifest JSON string, returns an updated manifest
+        /// JsonNode with <paramref name="toolName"/> added to the &lt;root&gt; toolset's
+        /// tools list (idempotent — no-op if already present).
+        /// </summary>
+        private static JsonNode AddToolToManifestJson(string manifestJson, string toolName)
+        {
             var manifest = JsonNode.Parse(manifestJson)!;
             var tools = manifest["toolsets"]?["<root>"]?["tools"]?.AsArray();
             if (tools == null)
@@ -783,20 +818,16 @@ namespace APBridgeAddIn.ModelBuilder
                 {
                     ["<root>"] = new JsonObject { ["tools"] = new JsonArray { toolName } }
                 };
-            }
-            else
-            {
-                // Check if already listed
-                bool found = false;
-                foreach (var t in tools)
-                {
-                    if (t?.GetValue<string>() == toolName)
-                    { found = true; break; }
-                }
-                if (!found) tools.Add(toolName);
+                return manifest;
             }
 
-            WriteJsonEntry(zip, "toolbox.content", manifest);
+            foreach (var t in tools)
+            {
+                if (TryGetString(t) == toolName)
+                    return manifest; // already listed
+            }
+            tools.Add(toolName);
+            return manifest;
         }
 
         #endregion
