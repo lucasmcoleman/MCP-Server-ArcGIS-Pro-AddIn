@@ -840,7 +840,17 @@ namespace APBridgeAddIn
 
             if (result.IsFailed)
             {
-                var messages = string.Join("; ", result.Messages.Select(m => m.Text));
+                var errorTexts = result.Messages
+                    .Where(m => m.Type == GPMessageType.Error)
+                    .Select(m => m.Text)
+                    .ToList();
+
+                var messages = result.Messages.Any()
+                    ? string.Join("; ", result.Messages.Select(m => m.Text))
+                    : errorTexts.Any()
+                        ? string.Join("; ", errorTexts)
+                        : $"arcpy reported failure with no messages — tool='{toolName}', check tool name and parameters";
+
                 return new(false, $"GP tool failed: {messages}", null);
             }
 
