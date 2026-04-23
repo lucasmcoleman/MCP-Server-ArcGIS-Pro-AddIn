@@ -97,8 +97,18 @@ namespace APBridgeAddIn
             }
         }
 
+        // AllowNamedFloatingPointLiterals is important because ArcGIS Pro SDK
+        // occasionally returns NaN / ±Infinity in double-valued properties
+        // (Camera.Pitch in 2D mode, Envelope dimensions on uninitialized views).
+        // Default STJ throws ArgumentException; named-literals serializes as
+        // "NaN" / "Infinity" strings so the bridge can still return a response.
+        private static readonly JsonSerializerOptions _sendOpts = new()
+        {
+            NumberHandling = System.Text.Json.Serialization.JsonNumberHandling.AllowNamedFloatingPointLiterals
+        };
+
         private static Task SendAsync(StreamWriter w, IpcResponse resp)
-            => w.WriteLineAsync(JsonSerializer.Serialize(resp));
+            => w.WriteLineAsync(JsonSerializer.Serialize(resp, _sendOpts));
 
         private static async Task<IpcResponse> HandleAsync(IpcRequest req, CancellationToken ct)
         {
