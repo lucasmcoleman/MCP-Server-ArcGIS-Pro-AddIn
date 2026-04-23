@@ -143,8 +143,9 @@ namespace APBridgeAddIn
                         var fl = MapView.Active?.Map?.Layers
                             .OfType<FeatureLayer>()
                             .FirstOrDefault(l => l.Name.Equals(layerName, StringComparison.OrdinalIgnoreCase));
-                        if (fl != null)
-                            await MapView.Active!.ZoomToAsync(fl);
+                        if (fl == null)
+                            throw new InvalidOperationException($"Layer not found: {layerName}");
+                        await MapView.Active!.ZoomToAsync(fl);
                     });
                     return new(true, null, new { done = true });
                 }
