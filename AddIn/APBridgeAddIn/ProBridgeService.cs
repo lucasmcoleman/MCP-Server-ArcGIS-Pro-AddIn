@@ -124,7 +124,7 @@ namespace APBridgeAddIn
                         var fl = MapView.Active?.Map?.Layers
                             .OfType<FeatureLayer>()
                             .FirstOrDefault(l => l.Name.Equals(layerName, StringComparison.OrdinalIgnoreCase));
-                        if (fl == null) return 0;
+                        if (fl == null) throw new InvalidOperationException($"Layer not found: {layerName}");
                         using var fc = fl.GetFeatureClass();
                         return (int)fc.GetCount();
                     });
