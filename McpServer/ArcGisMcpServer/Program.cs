@@ -1,13 +1,22 @@
-﻿using ArcGisMcpServer.Ipc;
+using ArcGisMcpServer.Ipc;
 using ArcGisMcpServer.Tools;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
-// Discover which Pro instance to talk to (one bridge per Pro process).
-// Falls back to the legacy "ArcGisProBridgePipe" name if no bridges are
-// registered, so this works against pre-discovery Add-In versions too.
-var pipeName = BridgeDiscovery.Discover();
+// Pipe-name selection policy:
+//   1. If ARCGIS_MCP_PIPE_NAME is set, use it verbatim. This is the
+//      escape hatch for containers / non-standard deployments / anyone
+//      who knows exactly which pipe to hit.
+//   2. Otherwise, BridgeDiscovery.Discover() reads the per-PID registry
+//      at %LOCALAPPDATA%\ArcGisMcpBridge\ and picks a live bridge
+//      (honoring ARCGIS_PROJECT for project-specific routing), falling
+//      back to the legacy "ArcGisProBridgePipe" name when no Add-In has
+//      registered yet (back-compat with older Add-In builds).
+var explicitPipe = Environment.GetEnvironmentVariable("ARCGIS_MCP_PIPE_NAME");
+var pipeName = string.IsNullOrWhiteSpace(explicitPipe)
+    ? BridgeDiscovery.Discover()
+    : explicitPipe;
 
 await Host.CreateDefaultBuilder(args)
     .ConfigureLogging(logging =>

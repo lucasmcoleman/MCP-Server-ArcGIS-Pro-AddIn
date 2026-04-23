@@ -44,6 +44,9 @@ The Add-In starts a **Named Pipe server** on ArcGIS Pro launch. It handles opera
 - `pro.listLayers`
 - `pro.countFeatures`
 - `pro.zoomToLayer`
+- `pro.selectByAttribute` — select features matching a SQL WHERE clause
+- `pro.getCurrentExtent` — return the active map view's extent + spatial reference
+- `pro.exportLayer` — export a layer (optionally filtered) to a feature class or shapefile
 
 ### Example: `Module.cs` (in sample is in a button)
 ```csharp
@@ -154,11 +157,52 @@ Place in solution root (`.mcp.json`):
 
 
 
+## IPC Retry & Timeout
+
+The MCP server's `BridgeClient` retries failed pipe calls with exponential
+backoff and enforces a per-request timeout covering connect + write + read.
+Defaults can be overridden with environment variables:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `ARCGIS_MCP_MAX_RETRIES` | `3` | Retries after the first attempt |
+| `ARCGIS_MCP_CONNECT_TIMEOUT_MS` | `5000` | Named-pipe connect timeout |
+| `ARCGIS_MCP_REQUEST_TIMEOUT_MS` | `30000` | End-to-end per-request timeout |
+| `ARCGIS_MCP_INITIAL_BACKOFF_MS` | `250` | First retry backoff (doubles each retry) |
+| `ARCGIS_MCP_MAX_BACKOFF_MS` | `4000` | Cap for the exponential backoff |
+| `ARCGIS_MCP_PIPE_NAME` | `ArcGisProBridgePipe` | Named pipe the Add-In is listening on |
+
+---
+
+## Container Image (optional)
+
+The MCP server ships with a `Dockerfile` at
+`McpServer/ArcGisMcpServer/Dockerfile`. Build from the repo root:
+
+```bash
+docker build -f McpServer/ArcGisMcpServer/Dockerfile -t arcgis-mcp-server .
+```
+
+Run with STDIO attached (required by MCP transport):
+
+```bash
+docker run --rm -i \
+  -e ARCGIS_MCP_PIPE_NAME=ArcGisProBridgePipe \
+  arcgis-mcp-server
+```
+
+> **IPC note:** Named pipes do not traverse container ↔ host boundaries on
+> Linux. The container image is intended for packaging/distribution and for
+> Windows-container hosts that share the host's pipe namespace. For local
+> development on the same Windows machine as ArcGIS Pro, `dotnet run`
+> against `ArcGisMcpServer.csproj` remains the simplest path.
+
+---
+
 ## Next Steps
-- Extend tools with operations like `pro.selectByAttribute`, `pro.getCurrentExtent`, `pro.exportLayer`.
-- Add retry/timeout logic for IPC communication.
-- Containerize the MCP server for deployment.
-...
+- Add authentication / access control between the MCP server and Add-In.
+- Surface more ArcGIS Pro domains as tools (Layout export, Editing, Tasks).
+- Stream long-running geoprocessing progress back through the MCP channel.
 ---
 
 
