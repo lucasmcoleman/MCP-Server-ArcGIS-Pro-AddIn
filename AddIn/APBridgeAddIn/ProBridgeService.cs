@@ -263,29 +263,43 @@ namespace APBridgeAddIn
                 var ext = view?.Extent;
                 if (ext == null) return null;
 
-                // MapView.Extent can return values that don't match Map.SpatialReference — e.g.,
-                // after zoom_to_layer on a layer in a different native projection, callers saw
-                // impossible WGS84 values (ymax>90). Reproject to Map SR so the bounds and the
-                // reported SR always agree. No-op when they already match.
-                var mapSr = view!.Map?.SpatialReference;
-                Envelope normalized = ext;
-                if (mapSr != null && ext.SpatialReference != null && !ext.SpatialReference.IsEqual(mapSr))
+                // MapView.Extent is the raw geometric viewport rectangle centered on the
+                // camera at the current scale. When zoomed out far enough for the rectangle
+                // to exceed the Earth's valid geographic bounds (±180°, ±90° for WGS84),
+                // the reported bounds run past physical limits — e.g., a continent-scale
+                // view centered on Portland (x=-122.6, y=45.2) produces ymax > 120° because
+                // the rectangle's half-height exceeds 45° of latitude. Pro doesn't clamp.
+                // Clamp here for geographic SRs so agents get valid lat/lon. Projected SRs
+                // pass through (no universal valid-domain for arbitrary projections).
+                double xmin = ext.XMin, ymin = ext.YMin, xmax = ext.XMax, ymax = ext.YMax;
+                var sr = ext.SpatialReference;
+                bool clamped = false;
+                if (sr != null && sr.IsGeographic)
                 {
-                    var projected = GeometryEngine.Instance.Project(ext, mapSr);
-                    if (projected?.Extent != null)
-                        normalized = projected.Extent;
+                    double cxmin = Math.Max(-180.0, xmin);
+                    double cymin = Math.Max(-90.0, ymin);
+                    double cxmax = Math.Min(180.0, xmax);
+                    double cymax = Math.Min(90.0, ymax);
+                    if (cxmax > cxmin && cymax > cymin)
+                    {
+                        // Only apply clamp if result is non-degenerate; otherwise the
+                        // viewport is entirely off-Earth and raw values are more honest.
+                        xmin = cxmin; ymin = cymin; xmax = cxmax; ymax = cymax;
+                        clamped = true;
+                    }
                 }
 
                 return new
                 {
-                    xmin = normalized.XMin,
-                    ymin = normalized.YMin,
-                    xmax = normalized.XMax,
-                    ymax = normalized.YMax,
-                    width = normalized.Width,
-                    height = normalized.Height,
-                    spatialReferenceWkid = normalized.SpatialReference?.Wkid ?? 0,
-                    spatialReferenceName = normalized.SpatialReference?.Name
+                    xmin,
+                    ymin,
+                    xmax,
+                    ymax,
+                    width = xmax - xmin,
+                    height = ymax - ymin,
+                    spatialReferenceWkid = sr?.Wkid ?? 0,
+                    spatialReferenceName = sr?.Name,
+                    clampedToSrValidRange = clamped
                 };
             });
 
