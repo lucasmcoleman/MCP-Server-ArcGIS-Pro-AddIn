@@ -96,13 +96,24 @@ namespace ArcGisMcpServer.Ipc
                     // Caller cancelled — don't retry, propagate.
                     throw;
                 }
-                catch (OperationCanceledException ex) when (timeoutCts.IsCancellationRequested)
+                catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested)
                 {
-                    lastEx = new TimeoutException(
-                        $"bridge request '{req.Op}' timed out after {_options.RequestTimeoutMs}ms", ex);
+                    // A genuine handler timeout won't be resolved by retrying — the
+                    // bridge isn't responding within the allotted time, and N more
+                    // attempts of the same duration just stalls the agent for minutes.
+                    // Return a structured response so FormatResult surfaces it to the
+                    // agent immediately instead of the generic MCP error wrapper.
+                    return new IpcResponse(false,
+                        $"timeout: bridge op '{req.Op}' exceeded {_options.RequestTimeoutMs}ms; " +
+                        "the handler started but didn't respond. Check mcp-bridge.log for progress.",
+                        null);
                 }
                 catch (Exception ex)
                 {
+                    // Transient errors (pipe not yet created after Pro restart,
+                    // broken pipe mid-request, connection refused) — retry with
+                    // backoff. G7's per-request pipe rediscovery means retries
+                    // automatically follow Pro across restarts.
                     lastEx = ex;
                 }
             }
