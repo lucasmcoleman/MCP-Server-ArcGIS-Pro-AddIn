@@ -772,8 +772,18 @@ namespace APBridgeAddIn
 
             if (result.IsFailed)
             {
-                var messages = string.Join("; ", result.Messages.Select(m => m.Text));
-                return new(false, $"Model execution failed: {messages}", null);
+                var errorTexts = result.Messages
+                    .Where(m => m.Type == GPMessageType.Error)
+                    .Select(m => m.Text)
+                    .ToList();
+
+                var msgs = result.Messages.Any()
+                    ? string.Join("; ", result.Messages.Select(m => m.Text))
+                    : errorTexts.Any()
+                        ? string.Join("; ", errorTexts)
+                        : "arcpy reported failure with no messages — check parameters";
+
+                return new(false, $"Model execution failed: {msgs}", null);
             }
 
             var outputMessages = result.Messages.Select(m => new { type = m.Type.ToString(), text = m.Text }).ToList();
