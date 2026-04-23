@@ -614,7 +614,20 @@ namespace APBridgeAddIn
                 if (!ef.ValidateOutputFilePath())
                     return new(false, $"Invalid output path: {output}", null);
 
-                layout.Export(ef);
+                try
+                {
+                    layout.Export(ef);
+                }
+                catch (Exception ex)
+                {
+                    return new(false, $"Export failed: {ex.Message}", null);
+                }
+
+                if (!File.Exists(output))
+                    return new(false,
+                        $"Export returned no error but file was not written: {output} — likely a permission or path issue.",
+                        null);
+
                 return new(true, null, new
                 {
                     layout = name,
