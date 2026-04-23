@@ -831,7 +831,7 @@ namespace APBridgeAddIn
             if (paramsNode != null)
             {
                 foreach (var p in paramsNode)
-                    paramValues.Add(p?.GetValue<string>() ?? "");
+                    paramValues.Add(FlattenGpParam(p));
             }
 
             var valueArray = Geoprocessing.MakeValueArray(paramValues.ToArray());
@@ -872,6 +872,20 @@ namespace APBridgeAddIn
                 File.AppendAllText(logPath, entry);
             }
             catch { /* best effort — never break the IPC loop to log */ }
+        }
+
+        private static string FlattenGpParam(JsonNode? node)
+        {
+            if (node is null) return "";
+            if (node is JsonValue v) return v.GetValue<string>();
+            if (node is JsonArray arr)
+            {
+                return string.Join(";", arr.Select(row =>
+                    row is JsonArray inner
+                        ? string.Join(" ", inner.Select(t => t?.GetValue<string>() ?? ""))
+                        : (row?.GetValue<string>() ?? "")));
+            }
+            return node.ToJsonString();
         }
 
         private static string Truncate(string? s, int max) =>
