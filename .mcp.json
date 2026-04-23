@@ -3,13 +3,8 @@
   "servers": {
     "arcgis": {
       "type": "stdio",
-      "command": "dotnet",
-      "args": [
-        "run",
-        "--no-build",
-        "--project",
-        "McpServer/ArcGisMcpServer/ArcGisMcpServer.csproj"
-      ],
+      "command": "McpServer/ArcGisMcpServer/publish/ArcGisMcpServer.exe",
+      "args": [],
       "env": {}
     }
   }

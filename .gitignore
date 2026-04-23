@@ -364,3 +364,6 @@ FodyWeavers.xsd
 
 # Claude Code per-user session state
 .claude/
+
+# MCP server published single-file exe (rebuilt locally via build-mcp-server.ps1)
+McpServer/ArcGisMcpServer/publish/

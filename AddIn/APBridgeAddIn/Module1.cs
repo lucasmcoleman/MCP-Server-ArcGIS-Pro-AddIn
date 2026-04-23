@@ -1,23 +1,10 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
+using System;
+using System.Diagnostics;
 using System.Threading.Tasks;
-using System.Windows.Input;
-using ArcGIS.Core.CIM;
-using ArcGIS.Core.Data;
-using ArcGIS.Core.Geometry;
-using ArcGIS.Desktop.Catalog;
 using ArcGIS.Desktop.Core;
-using ArcGIS.Desktop.Editing;
-using ArcGIS.Desktop.Extensions;
+using ArcGIS.Desktop.Core.Events;
 using ArcGIS.Desktop.Framework;
 using ArcGIS.Desktop.Framework.Contracts;
-using ArcGIS.Desktop.Framework.Dialogs;
-using ArcGIS.Desktop.Framework.Threading.Tasks;
-using ArcGIS.Desktop.KnowledgeGraph;
-using ArcGIS.Desktop.Layouts;
-using ArcGIS.Desktop.Mapping;
 
 namespace APBridgeAddIn
 {
@@ -25,6 +12,8 @@ namespace APBridgeAddIn
     {
         private static Module1 _this = null;
         private ProBridgeService _service;
+        private int _pid;
+        private string _pipeName = "";
 
         public static Module1 Current => _this ??= (Module1)FrameworkApplication.FindModule("APBridgeAddIn_Module");
 
@@ -36,18 +25,64 @@ namespace APBridgeAddIn
 
         protected override bool Initialize()
         {
-            _service = new ProBridgeService("ArcGisProBridgePipe");
+            // Pipe name is per-Pro-instance (PID-suffixed) so multiple
+            // Pro instances can each have their own bridge instead of
+            // racing for the single legacy "ArcGisProBridgePipe" name.
+            // The MCP server discovers which pipe to talk to via the
+            // BridgeRegistry directory.
+            _pid = Process.GetCurrentProcess().Id;
+            _pipeName = $"ArcGisProBridge_{_pid}";
+
+            _service = new ProBridgeService(_pipeName);
             _service.Start();
+
+            // Capture project info if a project is already loaded (e.g.,
+            // Pro launched with an .aprx). For projects opened later,
+            // ProjectOpenedAsyncEvent updates the registry.
+            var (path, name) = TryGetProjectInfo();
+            BridgeRegistry.Register(_pid, _pipeName, path, name);
+
+            ProjectOpenedAsyncEvent.Subscribe(OnProjectOpened);
+            ProjectClosedEvent.Subscribe(OnProjectClosed);
+
             return base.Initialize();
         }
 
         protected override void Uninitialize()
         {
+            try { ProjectOpenedAsyncEvent.Unsubscribe(OnProjectOpened); } catch { }
+            try { ProjectClosedEvent.Unsubscribe(OnProjectClosed); } catch { }
+
             _service?.Dispose();
             _service = null;
+
+            BridgeRegistry.Unregister(_pid);
+
             base.Uninitialize();
         }
 
         protected override bool CanUnload() => true;
+
+        private static (string? path, string? name) TryGetProjectInfo()
+        {
+            try
+            {
+                var p = Project.Current;
+                if (p == null) return (null, null);
+                return (p.URI, p.Name);
+            }
+            catch { return (null, null); }
+        }
+
+        private Task OnProjectOpened(ProjectEventArgs args)
+        {
+            BridgeRegistry.UpdateProject(_pid, args.Project?.URI, args.Project?.Name);
+            return Task.CompletedTask;
+        }
+
+        private void OnProjectClosed(ProjectEventArgs args)
+        {
+            BridgeRegistry.UpdateProject(_pid, null, null);
+        }
     }
 }

@@ -4,6 +4,11 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
+// Discover which Pro instance to talk to (one bridge per Pro process).
+// Falls back to the legacy "ArcGisProBridgePipe" name if no bridges are
+// registered, so this works against pre-discovery Add-In versions too.
+var pipeName = BridgeDiscovery.Discover();
+
 await Host.CreateDefaultBuilder(args)
     .ConfigureLogging(logging =>
     {
@@ -13,7 +18,7 @@ await Host.CreateDefaultBuilder(args)
     })
     .ConfigureServices(services =>
     {
-        services.AddSingleton(new BridgeClient("ArcGisProBridgePipe"));
+        services.AddSingleton(new BridgeClient(pipeName));
         services.AddMcpServer()
             .WithStdioServerTransport()
             .WithToolsFromAssembly(typeof(ProTools).Assembly);
