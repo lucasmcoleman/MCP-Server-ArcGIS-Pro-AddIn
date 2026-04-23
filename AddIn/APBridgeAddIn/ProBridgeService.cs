@@ -274,7 +274,8 @@ namespace APBridgeAddIn
                 double xmin = ext.XMin, ymin = ext.YMin, xmax = ext.XMax, ymax = ext.YMax;
                 var sr = ext.SpatialReference;
                 bool clamped = false;
-                if (sr != null && sr.IsGeographic)
+                if (sr != null && sr.IsGeographic &&
+                    (xmin < -180.0 || ymin < -90.0 || xmax > 180.0 || ymax > 90.0))
                 {
                     double cxmin = Math.Max(-180.0, xmin);
                     double cymin = Math.Max(-90.0, ymin);
