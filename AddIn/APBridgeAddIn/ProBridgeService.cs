@@ -357,8 +357,9 @@ namespace APBridgeAddIn
             if (!string.IsNullOrWhiteSpace(template))
                 settings.TemplatePath = template;
 
-            var project = await System.Windows.Application.Current.Dispatcher.InvokeAsync(
+            var projectTask = await System.Windows.Application.Current.Dispatcher.InvokeAsync(
                 () => Project.CreateAsync(settings));
+            var project = await projectTask;
             if (project == null)
                 return new(false, "Project.CreateAsync returned null", null);
 
@@ -383,8 +384,9 @@ namespace APBridgeAddIn
             try { if (Project.Current != null) await Project.Current.SaveAsync(); }
             catch { }
 
-            var project = await System.Windows.Application.Current.Dispatcher.InvokeAsync(
+            var projectTask = await System.Windows.Application.Current.Dispatcher.InvokeAsync(
                 () => Project.OpenAsync(path));
+            var project = await projectTask;
             if (project == null)
                 return new(false, $"Failed to open project: {path}", null);
 
