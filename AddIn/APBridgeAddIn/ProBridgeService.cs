@@ -321,54 +321,57 @@ namespace APBridgeAddIn
         /// </summary>
         private static async Task<IpcResponse> HandleCreateProject(Dictionary<string, string>? args)
         {
-            if (args == null ||
-                !args.TryGetValue("name", out string? name) ||
-                string.IsNullOrWhiteSpace(name) ||
-                !args.TryGetValue("location", out string? location) ||
-                string.IsNullOrWhiteSpace(location))
-                return new(false, "args 'name' & 'location' required", null);
-
-            args.TryGetValue("template", out string? template);
-            bool overwrite = args.TryGetValue("overwrite", out string? ow)
-                             && bool.TryParse(ow, out var b) && b;
-
-            try { if (Project.Current != null) await Project.Current.SaveAsync(); }
-            catch { /* best-effort save; don't block create on save failure */ }
-
-            // CreateProjectSettings has no built-in overwrite flag; emulate it
-            // by removing the target project folder before creating. Safer
-            // than a silent failure when the folder already exists.
-            if (overwrite)
+            return await QueuedTask.Run<IpcResponse>(async () =>
             {
-                var outDir = Path.Combine(location, name);
-                if (Directory.Exists(outDir))
+                if (args == null ||
+                    !args.TryGetValue("name", out string? name) ||
+                    string.IsNullOrWhiteSpace(name) ||
+                    !args.TryGetValue("location", out string? location) ||
+                    string.IsNullOrWhiteSpace(location))
+                    return new(false, "args 'name' & 'location' required", null);
+
+                args.TryGetValue("template", out string? template);
+                bool overwrite = args.TryGetValue("overwrite", out string? ow)
+                                 && bool.TryParse(ow, out var b) && b;
+
+                try { if (Project.Current != null) await Project.Current.SaveAsync(); }
+                catch { /* best-effort save; don't block create on save failure */ }
+
+                // CreateProjectSettings has no built-in overwrite flag; emulate it
+                // by removing the target project folder before creating. Safer
+                // than a silent failure when the folder already exists.
+                if (overwrite)
                 {
-                    try { Directory.Delete(outDir, recursive: true); }
-                    catch (Exception ex)
+                    var outDir = Path.Combine(location, name);
+                    if (Directory.Exists(outDir))
                     {
-                        return new(false,
-                            $"Cannot overwrite — failed to remove '{outDir}': {ex.Message}", null);
+                        try { Directory.Delete(outDir, recursive: true); }
+                        catch (Exception ex)
+                        {
+                            return new(false,
+                                $"Cannot overwrite — failed to remove '{outDir}': {ex.Message}", null);
+                        }
                     }
                 }
-            }
 
-            var settings = new CreateProjectSettings
-            {
-                Name = name,
-                LocationPath = location
-            };
-            if (!string.IsNullOrWhiteSpace(template))
-                settings.TemplatePath = template;
+                var settings = new CreateProjectSettings
+                {
+                    Name = name,
+                    LocationPath = location
+                };
+                if (!string.IsNullOrWhiteSpace(template))
+                    settings.TemplatePath = template;
 
-            var project = await Project.CreateAsync(settings);
-            if (project == null)
-                return new(false, "Project.CreateAsync returned null", null);
+                var project = await Project.CreateAsync(settings);
+                if (project == null)
+                    return new(false, "Project.CreateAsync returned null", null);
 
-            return new(true, null, new
-            {
-                name = project.Name,
-                path = project.URI,
-                homeFolder = project.HomeFolderPath
+                return new(true, null, new
+                {
+                    name = project.Name,
+                    path = project.URI,
+                    homeFolder = project.HomeFolderPath
+                });
             });
         }
 
