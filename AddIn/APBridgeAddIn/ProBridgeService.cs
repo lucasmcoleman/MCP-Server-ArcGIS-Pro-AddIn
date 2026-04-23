@@ -1,3 +1,4 @@
+using ArcGIS.Core.Geometry;
 using ArcGIS.Desktop.Core;
 using ArcGIS.Desktop.Core.Geoprocessing;
 using ArcGIS.Desktop.Framework;
@@ -248,16 +249,30 @@ namespace APBridgeAddIn
                 var view = MapView.Active;
                 var ext = view?.Extent;
                 if (ext == null) return null;
+
+                // MapView.Extent can return values that don't match Map.SpatialReference — e.g.,
+                // after zoom_to_layer on a layer in a different native projection, callers saw
+                // impossible WGS84 values (ymax>90). Reproject to Map SR so the bounds and the
+                // reported SR always agree. No-op when they already match.
+                var mapSr = view!.Map?.SpatialReference;
+                Envelope normalized = ext;
+                if (mapSr != null && ext.SpatialReference != null && !ext.SpatialReference.IsEqual(mapSr))
+                {
+                    var projected = GeometryEngine.Instance.Project(ext, mapSr);
+                    if (projected?.Extent != null)
+                        normalized = projected.Extent;
+                }
+
                 return new
                 {
-                    xmin = ext.XMin,
-                    ymin = ext.YMin,
-                    xmax = ext.XMax,
-                    ymax = ext.YMax,
-                    width = ext.Width,
-                    height = ext.Height,
-                    spatialReferenceWkid = ext.SpatialReference?.Wkid ?? 0,
-                    spatialReferenceName = ext.SpatialReference?.Name
+                    xmin = normalized.XMin,
+                    ymin = normalized.YMin,
+                    xmax = normalized.XMax,
+                    ymax = normalized.YMax,
+                    width = normalized.Width,
+                    height = normalized.Height,
+                    spatialReferenceWkid = normalized.SpatialReference?.Wkid ?? 0,
+                    spatialReferenceName = normalized.SpatialReference?.Name
                 };
             });
 
