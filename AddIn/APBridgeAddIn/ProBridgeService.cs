@@ -321,85 +321,78 @@ namespace APBridgeAddIn
         /// </summary>
         private static async Task<IpcResponse> HandleCreateProject(Dictionary<string, string>? args)
         {
-            return await QueuedTask.Run<IpcResponse>(async () =>
+            if (args == null ||
+                !args.TryGetValue("name", out string? name) ||
+                string.IsNullOrWhiteSpace(name) ||
+                !args.TryGetValue("location", out string? location) ||
+                string.IsNullOrWhiteSpace(location))
+                return new(false, "args 'name' & 'location' required", null);
+
+            args.TryGetValue("template", out string? template);
+            bool overwrite = args.TryGetValue("overwrite", out string? ow)
+                             && bool.TryParse(ow, out var b) && b;
+
+            try { if (Project.Current != null) await Project.Current.SaveAsync(); }
+            catch { }
+
+            if (overwrite)
             {
-                if (args == null ||
-                    !args.TryGetValue("name", out string? name) ||
-                    string.IsNullOrWhiteSpace(name) ||
-                    !args.TryGetValue("location", out string? location) ||
-                    string.IsNullOrWhiteSpace(location))
-                    return new(false, "args 'name' & 'location' required", null);
-
-                args.TryGetValue("template", out string? template);
-                bool overwrite = args.TryGetValue("overwrite", out string? ow)
-                                 && bool.TryParse(ow, out var b) && b;
-
-                try { if (Project.Current != null) await Project.Current.SaveAsync(); }
-                catch { /* best-effort save; don't block create on save failure */ }
-
-                // CreateProjectSettings has no built-in overwrite flag; emulate it
-                // by removing the target project folder before creating. Safer
-                // than a silent failure when the folder already exists.
-                if (overwrite)
+                var outDir = Path.Combine(location, name);
+                if (Directory.Exists(outDir))
                 {
-                    var outDir = Path.Combine(location, name);
-                    if (Directory.Exists(outDir))
+                    try { Directory.Delete(outDir, recursive: true); }
+                    catch (Exception ex)
                     {
-                        try { Directory.Delete(outDir, recursive: true); }
-                        catch (Exception ex)
-                        {
-                            return new(false,
-                                $"Cannot overwrite — failed to remove '{outDir}': {ex.Message}", null);
-                        }
+                        return new(false,
+                            $"Cannot overwrite — failed to remove '{outDir}': {ex.Message}", null);
                     }
                 }
+            }
 
-                var settings = new CreateProjectSettings
-                {
-                    Name = name,
-                    LocationPath = location
-                };
-                if (!string.IsNullOrWhiteSpace(template))
-                    settings.TemplatePath = template;
+            var settings = new CreateProjectSettings
+            {
+                Name = name,
+                LocationPath = location
+            };
+            if (!string.IsNullOrWhiteSpace(template))
+                settings.TemplatePath = template;
 
-                var project = await Project.CreateAsync(settings);
-                if (project == null)
-                    return new(false, "Project.CreateAsync returned null", null);
+            var project = await System.Windows.Application.Current.Dispatcher.InvokeAsync(
+                () => Project.CreateAsync(settings));
+            if (project == null)
+                return new(false, "Project.CreateAsync returned null", null);
 
-                return new(true, null, new
-                {
-                    name = project.Name,
-                    path = project.URI,
-                    homeFolder = project.HomeFolderPath
-                });
+            return new(true, null, new
+            {
+                name = project.Name,
+                path = project.URI,
+                homeFolder = project.HomeFolderPath
             });
         }
 
         private static async Task<IpcResponse> HandleOpenProject(Dictionary<string, string>? args)
         {
-            return await QueuedTask.Run<IpcResponse>(async () =>
+            if (args == null ||
+                !args.TryGetValue("path", out string? path) ||
+                string.IsNullOrWhiteSpace(path))
+                return new(false, "arg 'path' required", null);
+
+            if (!File.Exists(path))
+                return new(false, $"Project file not found: {path}", null);
+
+            try { if (Project.Current != null) await Project.Current.SaveAsync(); }
+            catch { }
+
+            var project = await System.Windows.Application.Current.Dispatcher.InvokeAsync(
+                () => Project.OpenAsync(path));
+            if (project == null)
+                return new(false, $"Failed to open project: {path}", null);
+
+            return new(true, null, new
             {
-                if (args == null ||
-                    !args.TryGetValue("path", out string? path) ||
-                    string.IsNullOrWhiteSpace(path))
-                    return new(false, "arg 'path' required", null);
-
-                if (!File.Exists(path))
-                    return new(false, $"Project file not found: {path}", null);
-
-                try { if (Project.Current != null) await Project.Current.SaveAsync(); }
-                catch { }
-
-                var project = await Project.OpenAsync(path);
-                if (project == null)
-                    return new(false, $"Failed to open project: {path}", null);
-
-                return new(true, null, new
-                {
-                    name = project.Name,
-                    path = project.URI,
-                    homeFolder = project.HomeFolderPath
-                });
+                name = project.Name,
+                path = project.URI,
+                homeFolder = project.HomeFolderPath
             });
         }
 
