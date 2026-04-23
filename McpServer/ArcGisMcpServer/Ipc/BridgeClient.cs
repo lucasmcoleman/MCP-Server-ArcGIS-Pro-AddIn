@@ -13,7 +13,11 @@ namespace ArcGisMcpServer.Ipc
     {
         public int MaxRetries { get; init; } = 3;
         public int ConnectTimeoutMs { get; init; } = 5000;
-        public int RequestTimeoutMs { get; init; } = 30000;
+        // 120s default covers slow Pro operations like create_project on a fresh
+        // template (.gdb init + template copy + UI setup can easily take 60s+).
+        // Agents can't show incremental progress, so cutting off mid-operation
+        // makes successful work look like a failure.
+        public int RequestTimeoutMs { get; init; } = 120000;
         public int InitialBackoffMs { get; init; } = 250;
         public int MaxBackoffMs { get; init; } = 4000;
 
@@ -28,7 +32,7 @@ namespace ArcGisMcpServer.Ipc
         {
             MaxRetries        = EnvInt("ARCGIS_MCP_MAX_RETRIES",        3),
             ConnectTimeoutMs  = EnvInt("ARCGIS_MCP_CONNECT_TIMEOUT_MS", 5000),
-            RequestTimeoutMs  = EnvInt("ARCGIS_MCP_REQUEST_TIMEOUT_MS", 30000),
+            RequestTimeoutMs  = EnvInt("ARCGIS_MCP_REQUEST_TIMEOUT_MS", 120000),
             InitialBackoffMs  = EnvInt("ARCGIS_MCP_INITIAL_BACKOFF_MS", 250),
             MaxBackoffMs      = EnvInt("ARCGIS_MCP_MAX_BACKOFF_MS",     4000),
         };
