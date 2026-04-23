@@ -467,18 +467,34 @@ namespace APBridgeAddIn
                 string.IsNullOrWhiteSpace(name))
                 return new(false, "arg 'name' required", null);
 
-            var result = await QueuedTask.Run(async () =>
+            var getResult = await QueuedTask.Run(() =>
             {
                 var item = Project.Current?.GetItems<LayoutProjectItem>()
                     .FirstOrDefault(i => i.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
-                if (item == null) return (ok: false, err: $"Layout not found: {name}");
+                if (item == null) return (ok: false, err: $"Layout not found: {name}", layout: (Layout?)null);
                 var layout = item.GetLayout();
-                if (layout == null) return (ok: false, err: $"Could not load layout: {name}");
-                await FrameworkApplication.Panes.CreateLayoutPaneAsync(layout);
-                return (ok: true, err: (string?)null);
+                if (layout == null) return (ok: false, err: $"Could not load layout: {name}", layout: (Layout?)null);
+                return (ok: true, err: (string?)null, layout: layout);
             });
 
-            if (!result.ok) return new(false, result.err, null);
+            if (!getResult.ok) return new(false, getResult.err, null);
+            if (getResult.layout == null) return new(false, "Layout is null", null);
+
+            try
+            {
+                var app = System.Windows.Application.Current;
+                var dispatcher = app?.Dispatcher;
+                if (dispatcher != null && !dispatcher.CheckAccess())
+                    await dispatcher.InvokeAsync(() =>
+                        FrameworkApplication.Panes.CreateLayoutPaneAsync(getResult.layout!));
+                else
+                    await FrameworkApplication.Panes.CreateLayoutPaneAsync(getResult.layout!);
+            }
+            catch
+            {
+                await FrameworkApplication.Panes.CreateLayoutPaneAsync(getResult.layout!);
+            }
+
             return new(true, null, new { name, opened = true });
         }
 
