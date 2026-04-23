@@ -14,36 +14,40 @@ namespace ArcGisMcpServer.Tools
 
         // ─── Existing Map Tools ──────────────────────────────────────────
 
+        // The four tools below return Task<string> (not typed values) so that
+        // bridge-side errors reach the agent as structured JSON via FormatResult.
+        // The MCP SDK swallows thrown exception messages (leaves only a generic
+        // "An error occurred invoking X"), so `throw new Exception(r.Error)`
+        // loses all the structured error context the bridge already produces.
+        // Returning FormatResult(r, op) matches the pattern used by the other
+        // tools and keeps error text visible to the model.
+
         [McpServerTool, Description("Name of the active map in ArcGIS Pro")]
         public static async Task<string> GetActiveMapName()
         {
             var r = await _client!.OpAsync("pro.getActiveMapName");
-            if (!r.Ok) throw new Exception(r.Error);
-            return ((JsonElement)r.Data!).GetProperty("name").GetString()!;
+            return FormatResult(r, "pro.getActiveMapName");
         }
 
         [McpServerTool, Description("List of layers in the active map")]
-        public static async Task<List<string>> ListLayers()
+        public static async Task<string> ListLayers()
         {
             var r = await _client!.OpAsync("pro.listLayers");
-            if (!r.Ok) throw new Exception(r.Error);
-            return JsonSerializer.Deserialize<List<string>>(r.Data!.ToString()!)!;
+            return FormatResult(r, "pro.listLayers");
         }
 
         [McpServerTool, Description("Count features in a layer by name")]
-        public static async Task<int> CountFeatures(string layer)
+        public static async Task<string> CountFeatures(string layer)
         {
             var r = await _client!.OpAsync("pro.countFeatures", new() { ["layer"] = layer });
-            if (!r.Ok) throw new Exception(r.Error);
-            return ((JsonElement)r.Data!).GetProperty("count").GetInt32();
+            return FormatResult(r, "pro.countFeatures");
         }
 
         [McpServerTool, Description("Zoom to a layer's extent by name")]
-        public static async Task<bool> ZoomToLayer(string layer)
+        public static async Task<string> ZoomToLayer(string layer)
         {
             var r = await _client!.OpAsync("pro.zoomToLayer", new() { ["layer"] = layer });
-            if (!r.Ok) throw new Exception(r.Error);
-            return true;
+            return FormatResult(r, "pro.zoomToLayer");
         }
 
         [McpServerTool, Description(
