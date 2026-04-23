@@ -67,6 +67,23 @@ namespace ArcGisMcpServer.Tools
         }
 
         [McpServerTool, Description(
+            "Clear feature selections in the active map. If 'layer' is specified, " +
+            "clears selection only on that layer (errors if the layer is not found). " +
+            "If omitted, clears selections across every feature layer in the active map. " +
+            "Useful as a pre-op reset — leftover selections silently restrict geoprocessing " +
+            "tool inputs when those tools accept layer names, which is a common source of " +
+            "confusing 'unexpectedly-empty' outputs.")]
+        public static async Task<string> ClearSelection(
+            [Description("Optional: name of a specific layer to clear. Omit to clear all layers.")] string? layer = null)
+        {
+            var args = new Dictionary<string, string>();
+            if (!string.IsNullOrWhiteSpace(layer))
+                args["layer"] = layer;
+            var r = await _client!.OpAsync("pro.clearSelection", args);
+            return FormatResult(r, "pro.clearSelection");
+        }
+
+        [McpServerTool, Description(
             "Get the current extent (viewport) of the active map view. " +
             "Returns xmin/ymin/xmax/ymax, width/height, and the spatial reference WKID.")]
         public static async Task<string> GetCurrentExtent()
@@ -111,6 +128,18 @@ namespace ArcGisMcpServer.Tools
         }
 
         // ─── Project Tools ───────────────────────────────────────────────
+
+        [McpServerTool, Description(
+            "Get metadata about the currently open ArcGIS Pro project — name, aprx file " +
+            "path, home folder, default geodatabase, default toolbox, counts of maps / " +
+            "layouts / toolboxes, and active map info (name + spatial reference). " +
+            "Useful for agents to orient themselves before operations that depend on " +
+            "project context.")]
+        public static async Task<string> GetProjectInfo()
+        {
+            var r = await _client!.OpAsync("pro.getProjectInfo");
+            return FormatResult(r, "pro.getProjectInfo");
+        }
 
         [McpServerTool, Description(
             "Create a new ArcGIS Pro project. The current project is saved first " +
