@@ -71,6 +71,8 @@ namespace APBridgeAddIn
                         try
                         {
                             var resp = await HandleAsync(req, ct);
+                            if (!resp.Ok)
+                                LogNonSuccess(req, resp.Error);
                             await SendAsync(writer, resp);
                         }
                         catch (Exception ex)
@@ -880,6 +882,31 @@ namespace APBridgeAddIn
                         $"{kv.Key}={Truncate(kv.Value, 200)}"));
 
                 var entry = $"[{DateTime.UtcNow:O}] op={req.Op} args=[{argsPreview}]\n{ex}\n\n";
+                File.AppendAllText(logPath, entry);
+            }
+            catch { /* best effort — never break the IPC loop to log */ }
+        }
+
+        /// <summary>
+        /// Writes a non-success response (Ok=false, with its error text) to mcp-bridge.log.
+        /// Mirrors LogException so handlers that return structured `{success:false}` instead
+        /// of throwing still leave an audit trail. Best-effort — swallowed to keep the IPC loop alive.
+        /// </summary>
+        private static void LogNonSuccess(IpcRequest req, string? error)
+        {
+            try
+            {
+                string dir;
+                try { dir = Project.Current?.HomeFolderPath ?? Path.GetTempPath(); }
+                catch { dir = Path.GetTempPath(); }
+
+                var logPath = Path.Combine(dir, "mcp-bridge.log");
+                var argsPreview = req.Args == null
+                    ? "<none>"
+                    : string.Join(", ", req.Args.Select(kv =>
+                        $"{kv.Key}={Truncate(kv.Value, 200)}"));
+
+                var entry = $"[{DateTime.UtcNow:O}] op={req.Op} args=[{argsPreview}] RESPONSE_NOT_OK error={Truncate(error, 500)}\n\n";
                 File.AppendAllText(logPath, entry);
             }
             catch { /* best effort — never break the IPC loop to log */ }
