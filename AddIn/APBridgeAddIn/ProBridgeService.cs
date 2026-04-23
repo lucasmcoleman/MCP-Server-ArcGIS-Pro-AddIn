@@ -1,7 +1,9 @@
 using ArcGIS.Desktop.Core;
 using ArcGIS.Desktop.Core.Geoprocessing;
+using ArcGIS.Desktop.Framework;
 using ArcGIS.Desktop.Framework.Threading.Tasks;
 using ArcGIS.Desktop.GeoProcessing;
+using ArcGIS.Desktop.Layouts;
 using ArcGIS.Desktop.Mapping;
 using APBridgeAddIn.ModelBuilder;
 using System;
@@ -177,6 +179,33 @@ namespace APBridgeAddIn
                 case "pro.exportLayer":
                     return await HandleExportLayer(req.Args);
 
+                // ─── Project Operations ─────────────────────────────────────
+                case "pro.createProject":
+                    return await HandleCreateProject(req.Args);
+
+                case "pro.openProject":
+                    return await HandleOpenProject(req.Args);
+
+                // ─── Layer-from-URL ─────────────────────────────────────────
+                case "pro.addLayerFromUrl":
+                    return await HandleAddLayerFromUrl(req.Args);
+
+                // ─── Layout Operations ──────────────────────────────────────
+                case "pro.listLayouts":
+                    return await HandleListLayouts();
+
+                case "pro.openLayout":
+                    return await HandleOpenLayout(req.Args);
+
+                case "pro.listLayoutElements":
+                    return await HandleListLayoutElements(req.Args);
+
+                case "pro.setLayoutText":
+                    return await HandleSetLayoutText(req.Args);
+
+                case "pro.exportLayout":
+                    return await HandleExportLayout(req.Args);
+
                 // ─── ModelBuilder Operations ────────────────────────────────
                 case "pro.listToolboxes":
                     return await HandleListToolboxes();
@@ -279,6 +308,303 @@ namespace APBridgeAddIn
                 output,
                 where,
                 success = true
+            });
+        }
+
+        // ─── Project Handler Methods ─────────────────────────────────────────
+
+        /// <summary>
+        /// Creates a new ArcGIS Pro project. Saves the current project first
+        /// so Pro doesn't raise a modal "save changes?" dialog that would
+        /// hang the bridge (the IPC handler is blocked while the dialog
+        /// awaits user interaction, causing the caller to see a timeout).
+        /// </summary>
+        private static async Task<IpcResponse> HandleCreateProject(Dictionary<string, string>? args)
+        {
+            if (args == null ||
+                !args.TryGetValue("name", out string? name) ||
+                string.IsNullOrWhiteSpace(name) ||
+                !args.TryGetValue("location", out string? location) ||
+                string.IsNullOrWhiteSpace(location))
+                return new(false, "args 'name' & 'location' required", null);
+
+            args.TryGetValue("template", out string? template);
+            bool overwrite = args.TryGetValue("overwrite", out string? ow)
+                             && bool.TryParse(ow, out var b) && b;
+
+            try { if (Project.Current != null) await Project.Current.SaveAsync(); }
+            catch { /* best-effort save; don't block create on save failure */ }
+
+            // CreateProjectSettings has no built-in overwrite flag; emulate it
+            // by removing the target project folder before creating. Safer
+            // than a silent failure when the folder already exists.
+            if (overwrite)
+            {
+                var outDir = Path.Combine(location, name);
+                if (Directory.Exists(outDir))
+                {
+                    try { Directory.Delete(outDir, recursive: true); }
+                    catch (Exception ex)
+                    {
+                        return new(false,
+                            $"Cannot overwrite — failed to remove '{outDir}': {ex.Message}", null);
+                    }
+                }
+            }
+
+            var settings = new CreateProjectSettings
+            {
+                Name = name,
+                LocationPath = location
+            };
+            if (!string.IsNullOrWhiteSpace(template))
+                settings.TemplatePath = template;
+
+            var project = await Project.CreateAsync(settings);
+            if (project == null)
+                return new(false, "Project.CreateAsync returned null", null);
+
+            return new(true, null, new
+            {
+                name = project.Name,
+                path = project.URI,
+                homeFolder = project.HomeFolderPath
+            });
+        }
+
+        private static async Task<IpcResponse> HandleOpenProject(Dictionary<string, string>? args)
+        {
+            if (args == null ||
+                !args.TryGetValue("path", out string? path) ||
+                string.IsNullOrWhiteSpace(path))
+                return new(false, "arg 'path' required", null);
+
+            if (!File.Exists(path))
+                return new(false, $"Project file not found: {path}", null);
+
+            try { if (Project.Current != null) await Project.Current.SaveAsync(); }
+            catch { }
+
+            var project = await Project.OpenAsync(path);
+            if (project == null)
+                return new(false, $"Failed to open project: {path}", null);
+
+            return new(true, null, new
+            {
+                name = project.Name,
+                path = project.URI,
+                homeFolder = project.HomeFolderPath
+            });
+        }
+
+        // ─── Layer Handler Methods ───────────────────────────────────────────
+
+        /// <summary>
+        /// Adds a layer to the active map from a URL. Supports feature services,
+        /// image services, tile services, WMS, and any other URI source that
+        /// LayerFactory understands.
+        /// </summary>
+        private static async Task<IpcResponse> HandleAddLayerFromUrl(Dictionary<string, string>? args)
+        {
+            if (args == null ||
+                !args.TryGetValue("url", out string? url) ||
+                string.IsNullOrWhiteSpace(url))
+                return new(false, "arg 'url' required", null);
+
+            args.TryGetValue("name", out string? layerName);
+
+            return await QueuedTask.Run<IpcResponse>(() =>
+            {
+                var map = MapView.Active?.Map;
+                if (map == null)
+                    return new(false, "No active map view", null);
+
+                Uri uri;
+                try { uri = new Uri(url); }
+                catch (Exception ex) { return new(false, $"Invalid URL: {ex.Message}", null); }
+
+                var layer = LayerFactory.Instance.CreateLayer(uri, map);
+                if (layer == null)
+                    return new(false, "CreateLayer returned null (service unreachable or unsupported)", null);
+
+                if (!string.IsNullOrWhiteSpace(layerName))
+                    layer.SetName(layerName);
+
+                return new(true, null, new
+                {
+                    name = layer.Name,
+                    url = url,
+                    layerType = layer.GetType().Name
+                });
+            });
+        }
+
+        // ─── Layout Handler Methods ──────────────────────────────────────────
+
+        private static async Task<IpcResponse> HandleListLayouts()
+        {
+            var layouts = await QueuedTask.Run(() =>
+                Project.Current?.GetItems<LayoutProjectItem>()
+                    .Select(i => new Dictionary<string, string>
+                    {
+                        ["name"] = i.Name,
+                        ["path"] = i.Path ?? ""
+                    }).ToList()
+                ?? new List<Dictionary<string, string>>());
+            return new(true, null, layouts);
+        }
+
+        private static async Task<IpcResponse> HandleOpenLayout(Dictionary<string, string>? args)
+        {
+            if (args == null ||
+                !args.TryGetValue("name", out string? name) ||
+                string.IsNullOrWhiteSpace(name))
+                return new(false, "arg 'name' required", null);
+
+            var result = await QueuedTask.Run(async () =>
+            {
+                var item = Project.Current?.GetItems<LayoutProjectItem>()
+                    .FirstOrDefault(i => i.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+                if (item == null) return (ok: false, err: $"Layout not found: {name}");
+                var layout = item.GetLayout();
+                if (layout == null) return (ok: false, err: $"Could not load layout: {name}");
+                await FrameworkApplication.Panes.CreateLayoutPaneAsync(layout);
+                return (ok: true, err: (string?)null);
+            });
+
+            if (!result.ok) return new(false, result.err, null);
+            return new(true, null, new { name, opened = true });
+        }
+
+        /// <summary>
+        /// Enumerates every Element on a layout — titles, scale bars, legends,
+        /// north arrows, map frames, etc. Each entry includes a short preview
+        /// of its text (for TextElements) so the caller can identify which
+        /// element to edit without a visual round-trip.
+        /// </summary>
+        private static async Task<IpcResponse> HandleListLayoutElements(Dictionary<string, string>? args)
+        {
+            if (args == null ||
+                !args.TryGetValue("name", out string? name) ||
+                string.IsNullOrWhiteSpace(name))
+                return new(false, "arg 'name' required", null);
+
+            return await QueuedTask.Run<IpcResponse>(() =>
+            {
+                var item = Project.Current?.GetItems<LayoutProjectItem>()
+                    .FirstOrDefault(i => i.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+                if (item == null) return new(false, $"Layout not found: {name}", null);
+                var layout = item.GetLayout();
+                if (layout == null) return new(false, $"Could not load layout: {name}", null);
+
+                var elements = layout.GetElements().Select(e =>
+                {
+                    string? textPreview = null;
+                    if (e is TextElement te)
+                    {
+                        textPreview = te.TextProperties?.Text;
+                        if (textPreview != null && textPreview.Length > 80)
+                            textPreview = textPreview[..80] + "…";
+                    }
+                    return new
+                    {
+                        name = e.Name,
+                        type = e.GetType().Name,
+                        visible = e.IsVisible,
+                        text = textPreview
+                    };
+                }).ToList();
+
+                return new(true, null, elements);
+            });
+        }
+
+        private static async Task<IpcResponse> HandleSetLayoutText(Dictionary<string, string>? args)
+        {
+            if (args == null ||
+                !args.TryGetValue("layoutName", out string? layoutName) ||
+                string.IsNullOrWhiteSpace(layoutName) ||
+                !args.TryGetValue("elementName", out string? elementName) ||
+                string.IsNullOrWhiteSpace(elementName) ||
+                !args.TryGetValue("text", out string? text))
+                return new(false, "args 'layoutName', 'elementName' & 'text' required", null);
+
+            return await QueuedTask.Run<IpcResponse>(() =>
+            {
+                var item = Project.Current?.GetItems<LayoutProjectItem>()
+                    .FirstOrDefault(i => i.Name.Equals(layoutName, StringComparison.OrdinalIgnoreCase));
+                if (item == null) return new(false, $"Layout not found: {layoutName}", null);
+                var layout = item.GetLayout();
+                if (layout == null) return new(false, $"Could not load layout: {layoutName}", null);
+
+                var element = layout.GetElements()
+                    .FirstOrDefault(e => e.Name.Equals(elementName, StringComparison.OrdinalIgnoreCase));
+                if (element == null)
+                    return new(false, $"Element not found on layout '{layoutName}': {elementName}", null);
+                if (element is not TextElement te)
+                    return new(false, $"Element '{elementName}' is {element.GetType().Name}, not a TextElement", null);
+
+                // Preserve the element's existing font / size / style; only change the text.
+                // TextProperties requires (text, font, size, fontStyle) — no single-arg ctor.
+                var tp = te.TextProperties;
+                var newTp = new TextProperties(text ?? "", tp.Font, tp.FontSize, tp.FontStyle);
+                te.SetTextProperties(newTp);
+                return new(true, null, new { layoutName, elementName, text });
+            });
+        }
+
+        /// <summary>
+        /// Exports a layout to PDF (default), PNG, JPG, TIFF, or SVG. The
+        /// output file extension selects the format unless 'format' is
+        /// explicit. Raster formats default to 300 DPI.
+        /// </summary>
+        private static async Task<IpcResponse> HandleExportLayout(Dictionary<string, string>? args)
+        {
+            if (args == null ||
+                !args.TryGetValue("name", out string? name) ||
+                string.IsNullOrWhiteSpace(name) ||
+                !args.TryGetValue("output", out string? output) ||
+                string.IsNullOrWhiteSpace(output))
+                return new(false, "args 'name' & 'output' required", null);
+
+            args.TryGetValue("format", out string? format);
+            int resolution = 300;
+            if (args.TryGetValue("resolution", out string? res) &&
+                int.TryParse(res, out var r) && r > 0)
+                resolution = r;
+
+            return await QueuedTask.Run<IpcResponse>(() =>
+            {
+                var item = Project.Current?.GetItems<LayoutProjectItem>()
+                    .FirstOrDefault(i => i.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+                if (item == null) return new(false, $"Layout not found: {name}", null);
+                var layout = item.GetLayout();
+                if (layout == null) return new(false, $"Could not load layout: {name}", null);
+
+                var fmt = !string.IsNullOrWhiteSpace(format)
+                    ? format.ToLowerInvariant()
+                    : Path.GetExtension(output).TrimStart('.').ToLowerInvariant();
+
+                ExportFormat ef = fmt switch
+                {
+                    "png"           => new PNGFormat  { OutputFileName = output, Resolution = resolution },
+                    "jpg" or "jpeg" => new JPEGFormat { OutputFileName = output, Resolution = resolution },
+                    "tif" or "tiff" => new TIFFFormat { OutputFileName = output, Resolution = resolution },
+                    "svg"           => new SVGFormat  { OutputFileName = output },
+                    _               => new PDFFormat  { OutputFileName = output, Resolution = resolution } // default
+                };
+
+                if (!ef.ValidateOutputFilePath())
+                    return new(false, $"Invalid output path: {output}", null);
+
+                layout.Export(ef);
+                return new(true, null, new
+                {
+                    layout = name,
+                    output = Path.GetFullPath(output),
+                    format = ef.GetType().Name,
+                    resolution = fmt == "svg" ? (int?)null : resolution
+                });
             });
         }
 

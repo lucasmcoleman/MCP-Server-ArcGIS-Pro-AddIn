@@ -106,6 +106,127 @@ namespace ArcGisMcpServer.Tools
             return $"echo: {text}";
         }
 
+        // ─── Project Tools ───────────────────────────────────────────────
+
+        [McpServerTool, Description(
+            "Create a new ArcGIS Pro project. The current project is saved first " +
+            "to avoid a modal 'save changes?' dialog that would hang the bridge. " +
+            "Returns the new project's name and .aprx path.")]
+        public static async Task<string> CreateProject(
+            [Description("Project name (used to name the .aprx file and project folder)")] string name,
+            [Description("Folder path where the project folder will be created (e.g., 'F:/ArcGIS/Projects')")] string location,
+            [Description("Optional: path to a .aptx project template")] string? template = null,
+            [Description("Optional: overwrite an existing project with the same name/location (default false)")] bool overwrite = false)
+        {
+            var args = new Dictionary<string, string>
+            {
+                ["name"] = name,
+                ["location"] = location,
+                ["overwrite"] = overwrite.ToString()
+            };
+            if (!string.IsNullOrWhiteSpace(template))
+                args["template"] = template;
+            var r = await _client!.OpAsync("pro.createProject", args);
+            return FormatResult(r, "pro.createProject");
+        }
+
+        [McpServerTool, Description(
+            "Open an existing ArcGIS Pro project. The current project is saved first " +
+            "to avoid a modal dialog.")]
+        public static async Task<string> OpenProject(
+            [Description("Full path to the .aprx project file")] string path)
+        {
+            var r = await _client!.OpAsync("pro.openProject", new() { ["path"] = path });
+            return FormatResult(r, "pro.openProject");
+        }
+
+        // ─── Layer Tools ─────────────────────────────────────────────────
+
+        [McpServerTool, Description(
+            "Add a layer to the active map from a URL — typically an ArcGIS feature service " +
+            "(e.g., 'https://services.arcgis.com/.../FeatureServer/0'). " +
+            "Also accepts image services, tile services, WMS, and other Pro-supported URI sources.")]
+        public static async Task<string> AddLayerFromUrl(
+            [Description("URL to the service or layer endpoint")] string url,
+            [Description("Optional: display name for the new layer in the TOC")] string? name = null)
+        {
+            var args = new Dictionary<string, string> { ["url"] = url };
+            if (!string.IsNullOrWhiteSpace(name))
+                args["name"] = name;
+            var r = await _client!.OpAsync("pro.addLayerFromUrl", args);
+            return FormatResult(r, "pro.addLayerFromUrl");
+        }
+
+        // ─── Layout Tools ────────────────────────────────────────────────
+
+        [McpServerTool, Description("List all layouts in the current project (name + item path).")]
+        public static async Task<string> ListLayouts()
+        {
+            var r = await _client!.OpAsync("pro.listLayouts");
+            return FormatResult(r, "pro.listLayouts");
+        }
+
+        [McpServerTool, Description(
+            "Open a layout in a new layout view pane in ArcGIS Pro. " +
+            "Use list_layouts first to see available layout names.")]
+        public static async Task<string> OpenLayout(
+            [Description("Name of the layout to open")] string name)
+        {
+            var r = await _client!.OpAsync("pro.openLayout", new() { ["name"] = name });
+            return FormatResult(r, "pro.openLayout");
+        }
+
+        [McpServerTool, Description(
+            "List all elements on a layout — titles, scale bars, legends, north arrows, map frames, etc. " +
+            "Returns element name, type, visibility, and (for text elements) a preview of the current text. " +
+            "Use this before set_layout_text to discover the correct element name.")]
+        public static async Task<string> ListLayoutElements(
+            [Description("Name of the layout")] string name)
+        {
+            var r = await _client!.OpAsync("pro.listLayoutElements", new() { ["name"] = name });
+            return FormatResult(r, "pro.listLayoutElements");
+        }
+
+        [McpServerTool, Description(
+            "Set the text content of a text element on a layout (title, subtitle, notes, date stamp, etc.). " +
+            "Use list_layout_elements first to find the element's exact name.")]
+        public static async Task<string> SetLayoutText(
+            [Description("Name of the layout containing the element")] string layoutName,
+            [Description("Name of the text element on the layout")] string elementName,
+            [Description("New text content (can include multiple lines)")] string text)
+        {
+            var r = await _client!.OpAsync("pro.setLayoutText", new()
+            {
+                ["layoutName"] = layoutName,
+                ["elementName"] = elementName,
+                ["text"] = text
+            });
+            return FormatResult(r, "pro.setLayoutText");
+        }
+
+        [McpServerTool, Description(
+            "Export a layout to PDF (default), PNG, JPG, TIFF, or SVG. " +
+            "Format is selected by the 'format' argument or by the output file's extension. " +
+            "Raster formats default to 300 DPI; pass 'resolution' to override.")]
+        public static async Task<string> ExportLayout(
+            [Description("Name of the layout to export")] string name,
+            [Description("Full output file path (e.g., 'C:/output/site_map.pdf')")] string output,
+            [Description("Optional: 'pdf', 'png', 'jpg', 'tiff', or 'svg' (else inferred from extension)")] string? format = null,
+            [Description("Optional: raster DPI for PNG/JPG/TIFF (default 300)")] int? resolution = null)
+        {
+            var args = new Dictionary<string, string>
+            {
+                ["name"] = name,
+                ["output"] = output
+            };
+            if (!string.IsNullOrWhiteSpace(format))
+                args["format"] = format;
+            if (resolution.HasValue)
+                args["resolution"] = resolution.Value.ToString();
+            var r = await _client!.OpAsync("pro.exportLayout", args);
+            return FormatResult(r, "pro.exportLayout");
+        }
+
         // ─── ModelBuilder Tools ──────────────────────────────────────────
 
         [McpServerTool, Description(
