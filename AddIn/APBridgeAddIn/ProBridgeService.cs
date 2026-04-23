@@ -180,6 +180,9 @@ namespace APBridgeAddIn
                 case "pro.getCurrentExtent":
                     return await HandleGetCurrentExtent();
 
+                case "pro.getViewDiagnostics":
+                    return await HandleGetViewDiagnostics();
+
                 case "pro.exportLayer":
                     return await HandleExportLayer(req.Args);
 
@@ -279,6 +282,72 @@ namespace APBridgeAddIn
             if (extent == null)
                 return new(false, "No active map view", null);
             return new(true, null, extent);
+        }
+
+        /// <summary>
+        /// Exposes raw view + map + camera state for diagnosing extent/projection issues.
+        /// Useful when get_current_extent returns values that don't match the reported SR.
+        /// </summary>
+        private static async Task<IpcResponse> HandleGetViewDiagnostics()
+        {
+            var diag = await QueuedTask.Run<object?>(() =>
+            {
+                var view = MapView.Active;
+                if (view == null) return null;
+
+                var map = view.Map;
+                var ext = view.Extent;
+                var camera = view.Camera;
+
+                Envelope? mapFullExtent = null;
+                try { mapFullExtent = map?.CalculateFullExtent(); } catch { /* some maps don't support */ }
+
+                return new
+                {
+                    viewingMode = view.ViewingMode.ToString(),
+                    map = map == null ? null : (object)new
+                    {
+                        name = map.Name,
+                        srWkid = map.SpatialReference?.Wkid ?? 0,
+                        srName = map.SpatialReference?.Name,
+                        srIsProjected = map.SpatialReference?.IsProjected ?? false,
+                    },
+                    extent = ext == null ? null : (object)new
+                    {
+                        xmin = ext.XMin,
+                        ymin = ext.YMin,
+                        xmax = ext.XMax,
+                        ymax = ext.YMax,
+                        width = ext.Width,
+                        height = ext.Height,
+                        srWkid = ext.SpatialReference?.Wkid ?? 0,
+                        srName = ext.SpatialReference?.Name,
+                        srIsProjected = ext.SpatialReference?.IsProjected ?? false,
+                    },
+                    camera = camera == null ? null : (object)new
+                    {
+                        x = camera.X,
+                        y = camera.Y,
+                        z = camera.Z,
+                        scale = camera.Scale,
+                        heading = camera.Heading,
+                        pitch = camera.Pitch,
+                        roll = camera.Roll,
+                    },
+                    mapFullExtent = mapFullExtent == null ? null : (object)new
+                    {
+                        xmin = mapFullExtent.XMin,
+                        ymin = mapFullExtent.YMin,
+                        xmax = mapFullExtent.XMax,
+                        ymax = mapFullExtent.YMax,
+                        srWkid = mapFullExtent.SpatialReference?.Wkid ?? 0,
+                        srName = mapFullExtent.SpatialReference?.Name,
+                    }
+                };
+            });
+
+            if (diag == null) return new(false, "No active map view", null);
+            return new(true, null, diag);
         }
 
         /// <summary>
