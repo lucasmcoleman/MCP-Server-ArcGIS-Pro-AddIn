@@ -8,15 +8,16 @@ using Microsoft.Extensions.Logging;
 //   1. If ARCGIS_MCP_PIPE_NAME is set, use it verbatim. This is the
 //      escape hatch for containers / non-standard deployments / anyone
 //      who knows exactly which pipe to hit.
-//   2. Otherwise, BridgeDiscovery.Discover() reads the per-PID registry
-//      at %LOCALAPPDATA%\ArcGisMcpBridge\ and picks a live bridge
-//      (honoring ARCGIS_PROJECT for project-specific routing), falling
-//      back to the legacy "ArcGisProBridgePipe" name when no Add-In has
-//      registered yet (back-compat with older Add-In builds).
+//   2. Otherwise, BridgeDiscovery.Discover is called on every request so the
+//      server follows Pro across restarts (new PID ⇒ new pipe name) without
+//      needing an MCP server restart. Discovery reads the per-PID registry
+//      at %LOCALAPPDATA%\ArcGisMcpBridge\ and picks a live bridge (honoring
+//      ARCGIS_PROJECT for project-specific routing), falling back to the
+//      legacy "ArcGisProBridgePipe" name when no Add-In has registered yet.
 var explicitPipe = Environment.GetEnvironmentVariable("ARCGIS_MCP_PIPE_NAME");
-var pipeName = string.IsNullOrWhiteSpace(explicitPipe)
-    ? BridgeDiscovery.Discover()
-    : explicitPipe;
+Func<string> pipeNameResolver = string.IsNullOrWhiteSpace(explicitPipe)
+    ? BridgeDiscovery.Discover
+    : () => explicitPipe!;
 
 await Host.CreateDefaultBuilder(args)
     .ConfigureLogging(logging =>
@@ -27,7 +28,7 @@ await Host.CreateDefaultBuilder(args)
     })
     .ConfigureServices(services =>
     {
-        services.AddSingleton(new BridgeClient(pipeName));
+        services.AddSingleton(new BridgeClient(pipeNameResolver));
         services.AddMcpServer()
             .WithStdioServerTransport()
             .WithToolsFromAssembly(typeof(ProTools).Assembly);

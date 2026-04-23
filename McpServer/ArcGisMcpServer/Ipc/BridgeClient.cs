@@ -46,15 +46,25 @@ namespace ArcGisMcpServer.Ipc
 
     public class BridgeClient
     {
-        private readonly string _pipeName;
+        // Resolver is called on every connection attempt so that when Pro restarts
+        // (new PID ⇒ new pipe name), subsequent requests pick up the fresh pipe
+        // without needing to restart the MCP server. Typical overhead per call is
+        // one small JSON read from %LOCALAPPDATA%\ArcGisMcpBridge\ via BridgeDiscovery.
+        private readonly Func<string> _pipeNameResolver;
         private readonly BridgeClientOptions _options;
 
         public BridgeClient(string pipeName)
-            : this(pipeName, BridgeClientOptions.FromEnvironment()) { }
+            : this(() => pipeName, BridgeClientOptions.FromEnvironment()) { }
 
         public BridgeClient(string pipeName, BridgeClientOptions options)
+            : this(() => pipeName, options) { }
+
+        public BridgeClient(Func<string> pipeNameResolver)
+            : this(pipeNameResolver, BridgeClientOptions.FromEnvironment()) { }
+
+        public BridgeClient(Func<string> pipeNameResolver, BridgeClientOptions options)
         {
-            _pipeName = pipeName;
+            _pipeNameResolver = pipeNameResolver;
             _options = options;
         }
 
@@ -104,7 +114,8 @@ namespace ArcGisMcpServer.Ipc
 
         private async Task<IpcResponse> SendOnceAsync(IpcRequest req, CancellationToken ct)
         {
-            using var client = new NamedPipeClientStream(".", _pipeName,
+            var pipeName = _pipeNameResolver();
+            using var client = new NamedPipeClientStream(".", pipeName,
                 PipeDirection.InOut, PipeOptions.Asynchronous);
             await client.ConnectAsync(_options.ConnectTimeoutMs, ct);
 
