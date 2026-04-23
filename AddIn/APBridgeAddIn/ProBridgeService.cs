@@ -193,6 +193,12 @@ namespace APBridgeAddIn
                 case "pro.getViewDiagnostics":
                     return await HandleGetViewDiagnostics();
 
+                case "pro.clearSelection":
+                    return await HandleClearSelection(req.Args);
+
+                case "pro.getProjectInfo":
+                    return await HandleGetProjectInfo();
+
                 case "pro.exportLayer":
                     return await HandleExportLayer(req.Args);
 
@@ -373,6 +379,89 @@ namespace APBridgeAddIn
 
             if (diag == null) return new(false, "No active map view", null);
             return new(true, null, diag);
+        }
+
+        /// <summary>
+        /// Clears feature selections. With no layer arg, clears selection on every
+        /// feature layer in the active map. With layer arg, clears just that one
+        /// (throws if the layer isn't found — F4 pattern for silent-failure avoidance).
+        /// Leftover selections from prior operations silently restrict subsequent GP
+        /// tool inputs when those tools accept layer names, which is a common source
+        /// of agent confusion; a first-class clear tool makes the pre-op reset explicit.
+        /// </summary>
+        private static async Task<IpcResponse> HandleClearSelection(Dictionary<string, string>? args)
+        {
+            string? layerName = null;
+            args?.TryGetValue("layer", out layerName);
+
+            var result = await QueuedTask.Run<(bool ok, string? error, int cleared, string? layerCleared)>(() =>
+            {
+                var map = MapView.Active?.Map;
+                if (map == null) return (false, "No active map view", 0, null);
+
+                if (!string.IsNullOrWhiteSpace(layerName))
+                {
+                    var fl = map.Layers
+                        .OfType<FeatureLayer>()
+                        .FirstOrDefault(l => l.Name.Equals(layerName, StringComparison.OrdinalIgnoreCase));
+                    if (fl == null)
+                        throw new InvalidOperationException($"Layer not found: {layerName}");
+                    fl.ClearSelection();
+                    return (true, null, 1, fl.Name);
+                }
+
+                var featureLayers = map.Layers.OfType<FeatureLayer>().ToList();
+                foreach (var fl in featureLayers)
+                    fl.ClearSelection();
+                return (true, null, featureLayers.Count, null);
+            });
+
+            if (!result.ok) return new(false, result.error, null);
+            return new(true, null, new { cleared = result.cleared, layer = result.layerCleared });
+        }
+
+        /// <summary>
+        /// Returns project-level metadata — name, aprx path, home folder, default
+        /// geodatabase + toolbox paths, map count, active map name and SR. Agents
+        /// use this for orientation before operations that depend on project context
+        /// (e.g., "am I in the right project? what's the map's SR?").
+        /// </summary>
+        private static async Task<IpcResponse> HandleGetProjectInfo()
+        {
+            var info = await QueuedTask.Run<object?>(() =>
+            {
+                var proj = Project.Current;
+                if (proj == null) return null;
+
+                var view = MapView.Active;
+                object? activeMap = null;
+                if (view?.Map != null)
+                {
+                    activeMap = new
+                    {
+                        name = view.Map.Name,
+                        srWkid = view.Map.SpatialReference?.Wkid ?? 0,
+                        srName = view.Map.SpatialReference?.Name
+                    };
+                }
+
+                return new
+                {
+                    name = proj.Name,
+                    aprxPath = proj.Path,
+                    homeFolder = proj.HomeFolderPath,
+                    defaultGeodatabase = proj.DefaultGeodatabasePath,
+                    defaultToolbox = proj.DefaultToolboxPath,
+                    mapCount = proj.GetItems<MapProjectItem>().Count(),
+                    layoutCount = proj.GetItems<LayoutProjectItem>().Count(),
+                    toolboxCount = proj.GetItems<GeoprocessingProjectItem>().Count(),
+                    activeMap
+                };
+            });
+
+            if (info == null)
+                return new(false, "No project currently open", null);
+            return new(true, null, info);
         }
 
         /// <summary>
