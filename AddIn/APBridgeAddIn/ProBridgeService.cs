@@ -377,26 +377,29 @@ namespace APBridgeAddIn
 
         private static async Task<IpcResponse> HandleOpenProject(Dictionary<string, string>? args)
         {
-            if (args == null ||
-                !args.TryGetValue("path", out string? path) ||
-                string.IsNullOrWhiteSpace(path))
-                return new(false, "arg 'path' required", null);
-
-            if (!File.Exists(path))
-                return new(false, $"Project file not found: {path}", null);
-
-            try { if (Project.Current != null) await Project.Current.SaveAsync(); }
-            catch { }
-
-            var project = await Project.OpenAsync(path);
-            if (project == null)
-                return new(false, $"Failed to open project: {path}", null);
-
-            return new(true, null, new
+            return await QueuedTask.Run<IpcResponse>(async () =>
             {
-                name = project.Name,
-                path = project.URI,
-                homeFolder = project.HomeFolderPath
+                if (args == null ||
+                    !args.TryGetValue("path", out string? path) ||
+                    string.IsNullOrWhiteSpace(path))
+                    return new(false, "arg 'path' required", null);
+
+                if (!File.Exists(path))
+                    return new(false, $"Project file not found: {path}", null);
+
+                try { if (Project.Current != null) await Project.Current.SaveAsync(); }
+                catch { }
+
+                var project = await Project.OpenAsync(path);
+                if (project == null)
+                    return new(false, $"Failed to open project: {path}", null);
+
+                return new(true, null, new
+                {
+                    name = project.Name,
+                    path = project.URI,
+                    homeFolder = project.HomeFolderPath
+                });
             });
         }
 
