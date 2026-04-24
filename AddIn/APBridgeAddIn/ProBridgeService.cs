@@ -199,6 +199,9 @@ namespace APBridgeAddIn
                 case "pro.getProjectInfo":
                     return await HandleGetProjectInfo();
 
+                case "pro.listMaps":
+                    return await HandleListMaps();
+
                 case "pro.exportLayer":
                     return await HandleExportLayer(req.Args);
 
@@ -209,13 +212,22 @@ namespace APBridgeAddIn
                 case "pro.openProject":
                     return await HandleOpenProject(req.Args);
 
-                // ─── Layer-from-URL ─────────────────────────────────────────
+                case "pro.saveProject":
+                    return await HandleSaveProject();
+
+                // ─── Layer-from-URL / File ──────────────────────────────────
                 case "pro.addLayerFromUrl":
                     return await HandleAddLayerFromUrl(req.Args);
+
+                case "pro.addLayerFromFile":
+                    return await HandleAddLayerFromFile(req.Args);
 
                 // ─── Layout Operations ──────────────────────────────────────
                 case "pro.listLayouts":
                     return await HandleListLayouts();
+
+                case "pro.createLayout":
+                    return await HandleCreateLayout(req.Args);
 
                 case "pro.openLayout":
                     return await HandleOpenLayout(req.Args);
@@ -225,6 +237,9 @@ namespace APBridgeAddIn
 
                 case "pro.setLayoutText":
                     return await HandleSetLayoutText(req.Args);
+
+                case "pro.addMapFrameToLayout":
+                    return await HandleAddMapFrameToLayout(req.Args);
 
                 case "pro.exportLayout":
                     return await HandleExportLayout(req.Args);
@@ -465,6 +480,51 @@ namespace APBridgeAddIn
         }
 
         /// <summary>
+        /// Lists all maps in the current project (name + item path). Complements
+        /// get_active_map_name which returns only the currently-active map — this
+        /// enumerates every map so agents can pick one by name before operations
+        /// that take a map name (e.g., add_map_frame_to_layout).
+        /// </summary>
+        private static async Task<IpcResponse> HandleListMaps()
+        {
+            var maps = await QueuedTask.Run(() =>
+                Project.Current?.GetItems<MapProjectItem>()
+                    .Select(i => new Dictionary<string, string>
+                    {
+                        ["name"] = i.Name,
+                        ["path"] = i.Path ?? ""
+                    }).ToList()
+                ?? new List<Dictionary<string, string>>());
+            return new(true, null, maps);
+        }
+
+        /// <summary>
+        /// Explicitly saves the current project. Most project-lifecycle ops already
+        /// save-first to avoid modal "save changes?" dialogs, but an explicit save
+        /// is useful as a pre-operation safety rail or after a batch of edits the
+        /// agent wants to persist.
+        /// </summary>
+        private static async Task<IpcResponse> HandleSaveProject()
+        {
+            if (Project.Current == null)
+                return new(false, "No project currently open", null);
+            try
+            {
+                await Project.Current.SaveAsync();
+                return new(true, null, new
+                {
+                    saved = true,
+                    path = Project.Current.URI,
+                    name = Project.Current.Name
+                });
+            }
+            catch (Exception ex)
+            {
+                return new(false, $"Save failed: {ex.Message}", null);
+            }
+        }
+
+        /// <summary>
         /// Exports a layer (by name) to an output feature class/shapefile.
         /// Uses the conversion.ExportFeatures GP tool so an optional SQL
         /// WHERE clause can filter the output. Output path determines format
@@ -641,6 +701,58 @@ namespace APBridgeAddIn
             });
         }
 
+        /// <summary>
+        /// Adds a layer to the active map from a file-system path. Supports shapefiles
+        /// (.shp), file geodatabase feature classes (path/to.gdb/FeatureClass), rasters,
+        /// and any other path LayerFactory can resolve. For .gdb feature classes the
+        /// path is a composite (folder.gdb + feature-class-name), which the Uri class
+        /// and Pro SDK handle natively.
+        /// </summary>
+        private static async Task<IpcResponse> HandleAddLayerFromFile(Dictionary<string, string>? args)
+        {
+            if (args == null ||
+                !args.TryGetValue("path", out string? path) ||
+                string.IsNullOrWhiteSpace(path))
+                return new(false, "arg 'path' required", null);
+
+            args.TryGetValue("name", out string? layerName);
+
+            return await QueuedTask.Run<IpcResponse>(() =>
+            {
+                var map = MapView.Active?.Map;
+                if (map == null)
+                    return new(false, "No active map view", null);
+
+                Uri uri;
+                try { uri = new Uri(path); }
+                catch (Exception ex) { return new(false, $"Invalid path (cannot build URI): {ex.Message}", null); }
+
+                try
+                {
+                    var layer = LayerFactory.Instance.CreateLayer(uri, map);
+                    if (layer == null)
+                        return new(false,
+                            $"CreateLayer returned null for '{path}' — source not found, unsupported format, or inaccessible. " +
+                            "For geodatabase feature classes, use path like 'C:/data/my.gdb/FeatureClassName'.",
+                            null);
+
+                    if (!string.IsNullOrWhiteSpace(layerName))
+                        layer.SetName(layerName);
+
+                    return new(true, null, new
+                    {
+                        name = layer.Name,
+                        path,
+                        layerType = layer.GetType().Name
+                    });
+                }
+                catch (Exception ex)
+                {
+                    return new(false, $"Failed to add layer from '{path}': {ex.Message}", null);
+                }
+            });
+        }
+
         // ─── Layout Handler Methods ──────────────────────────────────────────
 
         private static async Task<IpcResponse> HandleListLayouts()
@@ -654,6 +766,117 @@ namespace APBridgeAddIn
                     }).ToList()
                 ?? new List<Dictionary<string, string>>());
             return new(true, null, layouts);
+        }
+
+        /// <summary>
+        /// Creates a new blank layout with the given page size. Defaults to letter
+        /// landscape (11×8.5 in). Orientation (portrait/landscape) rotates the page
+        /// dims automatically if width/height disagree with the requested orientation.
+        /// The layout is empty — use add_map_frame_to_layout to attach a map and
+        /// set_layout_text to fill any text elements you add later.
+        /// </summary>
+        private static async Task<IpcResponse> HandleCreateLayout(Dictionary<string, string>? args)
+        {
+            if (args == null ||
+                !args.TryGetValue("name", out string? name) ||
+                string.IsNullOrWhiteSpace(name))
+                return new(false, "arg 'name' required", null);
+
+            double width = 11.0, height = 8.5;
+            if (args.TryGetValue("widthInches", out string? ws) && double.TryParse(ws, out var wd) && wd > 0)
+                width = wd;
+            if (args.TryGetValue("heightInches", out string? hs) && double.TryParse(hs, out var hd) && hd > 0)
+                height = hd;
+
+            string orientation = "landscape";
+            if (args.TryGetValue("orientation", out string? o) && !string.IsNullOrWhiteSpace(o))
+                orientation = o.ToLowerInvariant();
+
+            // Coerce dims to match requested orientation so callers who pass
+            // "portrait" with 11×8.5 still get a portrait layout.
+            if (orientation == "portrait" && width > height) (width, height) = (height, width);
+            else if (orientation == "landscape" && height > width) (width, height) = (height, width);
+
+            return await QueuedTask.Run<IpcResponse>(() =>
+            {
+                try
+                {
+                    var layout = LayoutFactory.Instance.CreateLayout(width, height, LinearUnit.Inches);
+                    if (layout == null)
+                        return new(false, "LayoutFactory.CreateLayout returned null", null);
+                    layout.SetName(name);
+                    return new(true, null, new
+                    {
+                        name = layout.Name,
+                        widthInches = width,
+                        heightInches = height,
+                        orientation
+                    });
+                }
+                catch (Exception ex)
+                {
+                    return new(false, $"Failed to create layout: {ex.Message}", null);
+                }
+            });
+        }
+
+        /// <summary>
+        /// Creates a map-frame element on an existing layout and binds it to a map.
+        /// Default frame position/size is 1" from top-left, 9"×6.5" — fits inside a
+        /// letter-landscape with 1" margins. Override via xInches/yInches/widthInches
+        /// /heightInches. This is the crucial step that turns an empty create_layout
+        /// output into a usable layout: without a map frame the layout renders blank.
+        /// </summary>
+        private static async Task<IpcResponse> HandleAddMapFrameToLayout(Dictionary<string, string>? args)
+        {
+            if (args == null ||
+                !args.TryGetValue("layoutName", out string? layoutName) || string.IsNullOrWhiteSpace(layoutName) ||
+                !args.TryGetValue("mapName", out string? mapName) || string.IsNullOrWhiteSpace(mapName))
+                return new(false, "args 'layoutName' & 'mapName' required", null);
+
+            double x = 1.0, y = 1.0, w = 9.0, h = 6.5;
+            if (args.TryGetValue("xInches", out string? xs) && double.TryParse(xs, out var xd)) x = xd;
+            if (args.TryGetValue("yInches", out string? ys) && double.TryParse(ys, out var yd)) y = yd;
+            if (args.TryGetValue("widthInches", out string? ws) && double.TryParse(ws, out var wd) && wd > 0) w = wd;
+            if (args.TryGetValue("heightInches", out string? hs) && double.TryParse(hs, out var hd) && hd > 0) h = hd;
+
+            return await QueuedTask.Run<IpcResponse>(() =>
+            {
+                var layoutItem = Project.Current?.GetItems<LayoutProjectItem>()
+                    .FirstOrDefault(i => i.Name.Equals(layoutName, StringComparison.OrdinalIgnoreCase));
+                if (layoutItem == null) return new(false, $"Layout not found: {layoutName}", null);
+                var layout = layoutItem.GetLayout();
+                if (layout == null) return new(false, $"Could not load layout: {layoutName}", null);
+
+                var mapItem = Project.Current?.GetItems<MapProjectItem>()
+                    .FirstOrDefault(i => i.Name.Equals(mapName, StringComparison.OrdinalIgnoreCase));
+                if (mapItem == null) return new(false, $"Map not found: {mapName}", null);
+                var map = mapItem.GetMap();
+                if (map == null) return new(false, $"Could not load map: {mapName}", null);
+
+                try
+                {
+                    var envelope = EnvelopeBuilderEx.CreateEnvelope(x, y, x + w, y + h);
+                    var mapFrame = ElementFactory.Instance.CreateMapFrameElement(layout, envelope, map);
+                    if (mapFrame == null)
+                        return new(false, "CreateMapFrameElement returned null", null);
+
+                    return new(true, null, new
+                    {
+                        layoutName,
+                        mapName,
+                        mapFrameName = mapFrame.Name,
+                        xInches = x,
+                        yInches = y,
+                        widthInches = w,
+                        heightInches = h
+                    });
+                }
+                catch (Exception ex)
+                {
+                    return new(false, $"Failed to add map frame: {ex.Message}", null);
+                }
+            });
         }
 
         private static async Task<IpcResponse> HandleOpenLayout(Dictionary<string, string>? args)
