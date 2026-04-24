@@ -29,6 +29,16 @@ namespace ArcGisMcpServer.Tools
             return FormatResult(r, "pro.getActiveMapName");
         }
 
+        [McpServerTool, Description(
+            "List all maps in the current project (name + item path). " +
+            "Use this to enumerate maps before operations that take a map name " +
+            "(e.g., add_map_frame_to_layout).")]
+        public static async Task<string> ListMaps()
+        {
+            var r = await _client!.OpAsync("pro.listMaps");
+            return FormatResult(r, "pro.listMaps");
+        }
+
         [McpServerTool, Description("List of layers in the active map")]
         public static async Task<string> ListLayers()
         {
@@ -173,6 +183,16 @@ namespace ArcGisMcpServer.Tools
             return FormatResult(r, "pro.openProject");
         }
 
+        [McpServerTool, Description(
+            "Explicitly save the currently-open project. Most project-lifecycle ops " +
+            "save-first automatically, but this is useful as a pre-operation safety " +
+            "rail or to persist a batch of edits the agent wants to commit to disk.")]
+        public static async Task<string> SaveProject()
+        {
+            var r = await _client!.OpAsync("pro.saveProject");
+            return FormatResult(r, "pro.saveProject");
+        }
+
         // ─── Layer Tools ─────────────────────────────────────────────────
 
         [McpServerTool, Description(
@@ -190,6 +210,23 @@ namespace ArcGisMcpServer.Tools
             return FormatResult(r, "pro.addLayerFromUrl");
         }
 
+        [McpServerTool, Description(
+            "Add a layer to the active map from a file-system path. Supports shapefiles " +
+            "(path/to/file.shp), file-geodatabase feature classes (path/to/my.gdb/FeatureClass), " +
+            "rasters, and any other path LayerFactory can resolve. For .gdb feature classes, " +
+            "use a composite path where the .gdb folder is followed by the feature-class name " +
+            "(e.g., 'F:/projects/my.gdb/Roads').")]
+        public static async Task<string> AddLayerFromFile(
+            [Description("Full file-system path to the data source")] string path,
+            [Description("Optional: display name for the new layer in the TOC")] string? name = null)
+        {
+            var args = new Dictionary<string, string> { ["path"] = path };
+            if (!string.IsNullOrWhiteSpace(name))
+                args["name"] = name;
+            var r = await _client!.OpAsync("pro.addLayerFromFile", args);
+            return FormatResult(r, "pro.addLayerFromFile");
+        }
+
         // ─── Layout Tools ────────────────────────────────────────────────
 
         [McpServerTool, Description("List all layouts in the current project (name + item path).")]
@@ -197,6 +234,51 @@ namespace ArcGisMcpServer.Tools
         {
             var r = await _client!.OpAsync("pro.listLayouts");
             return FormatResult(r, "pro.listLayouts");
+        }
+
+        [McpServerTool, Description(
+            "Create a new blank layout. Defaults to letter-landscape (11x8.5 in). " +
+            "The layout is empty — use add_map_frame_to_layout to attach a map, and " +
+            "add other elements before export. Use list_layouts to see result or " +
+            "open_layout to view it in Pro.")]
+        public static async Task<string> CreateLayout(
+            [Description("Name for the new layout (must be unique within the project)")] string name,
+            [Description("Optional: page width in inches (default 11)")] double? widthInches = null,
+            [Description("Optional: page height in inches (default 8.5)")] double? heightInches = null,
+            [Description("Optional: 'landscape' (default) or 'portrait' — coerces width/height order to match")] string? orientation = null)
+        {
+            var args = new Dictionary<string, string> { ["name"] = name };
+            if (widthInches.HasValue) args["widthInches"] = widthInches.Value.ToString();
+            if (heightInches.HasValue) args["heightInches"] = heightInches.Value.ToString();
+            if (!string.IsNullOrWhiteSpace(orientation)) args["orientation"] = orientation;
+            var r = await _client!.OpAsync("pro.createLayout", args);
+            return FormatResult(r, "pro.createLayout");
+        }
+
+        [McpServerTool, Description(
+            "Add a map-frame element to an existing layout and bind it to a map. " +
+            "This is the step that makes a layout actually renderable — without a " +
+            "map frame, create_layout's output is blank. Default placement is 1in " +
+            "from top-left, sized 9x6.5in (fits letter-landscape with 1in margins).")]
+        public static async Task<string> AddMapFrameToLayout(
+            [Description("Name of the existing layout to add the frame to")] string layoutName,
+            [Description("Name of an existing map to wire into the frame (use list_maps to discover)")] string mapName,
+            [Description("Optional: x-position of frame top-left in inches (default 1)")] double? xInches = null,
+            [Description("Optional: y-position of frame top-left in inches (default 1)")] double? yInches = null,
+            [Description("Optional: frame width in inches (default 9)")] double? widthInches = null,
+            [Description("Optional: frame height in inches (default 6.5)")] double? heightInches = null)
+        {
+            var args = new Dictionary<string, string>
+            {
+                ["layoutName"] = layoutName,
+                ["mapName"] = mapName
+            };
+            if (xInches.HasValue) args["xInches"] = xInches.Value.ToString();
+            if (yInches.HasValue) args["yInches"] = yInches.Value.ToString();
+            if (widthInches.HasValue) args["widthInches"] = widthInches.Value.ToString();
+            if (heightInches.HasValue) args["heightInches"] = heightInches.Value.ToString();
+            var r = await _client!.OpAsync("pro.addMapFrameToLayout", args);
+            return FormatResult(r, "pro.addMapFrameToLayout");
         }
 
         [McpServerTool, Description(
