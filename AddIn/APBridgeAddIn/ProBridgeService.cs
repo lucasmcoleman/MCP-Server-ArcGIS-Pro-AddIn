@@ -110,6 +110,12 @@ namespace APBridgeAddIn
         private static Task SendAsync(StreamWriter w, IpcResponse resp)
             => w.WriteLineAsync(JsonSerializer.Serialize(resp, _sendOpts));
 
+        /// <summary>
+        /// Main dispatcher: routes <see cref="IpcRequest.Op"/> strings to per-op handlers.
+        /// Errors from handlers are caught two layers up in <see cref="RunAsync"/> — this
+        /// method is intentionally thin so each case is one line of routing. New ops:
+        /// add a case here AND a wrapper in <c>McpServer/ArcGisMcpServer/Tools/ProTools.cs</c>.
+        /// </summary>
         private static async Task<IpcResponse> HandleAsync(IpcRequest req, CancellationToken ct)
         {
             switch (req.Op)
@@ -276,6 +282,13 @@ namespace APBridgeAddIn
 
         // ─── Map/Layer Handler Methods ───────────────────────────────────────
 
+        /// <summary>
+        /// Returns the active view's current extent. For geographic spatial references,
+        /// clamps bounds to the SR's valid domain (±180/±90) since <c>MapView.Extent</c>
+        /// returns the raw geometric viewport rectangle — which can exceed Earth's bounds
+        /// when the camera is zoomed out far enough that the rectangle is bigger than the
+        /// planet. <c>clampedToSrValidRange</c> indicates whether clamping fired.
+        /// </summary>
         private static async Task<IpcResponse> HandleGetCurrentExtent()
         {
             var extent = await QueuedTask.Run<object?>(() =>
@@ -632,6 +645,12 @@ namespace APBridgeAddIn
             });
         }
 
+        /// <summary>
+        /// Opens an existing .aprx. Same WPF-Dispatcher + nested-Task-unwrap pattern as
+        /// <see cref="HandleCreateProject"/> — <c>Project.OpenAsync</c> requires the GUI
+        /// thread, not the MCT, so QueuedTask.Run alone is insufficient. Saves the
+        /// current project first to suppress the modal "save changes?" dialog.
+        /// </summary>
         private static async Task<IpcResponse> HandleOpenProject(Dictionary<string, string>? args)
         {
             if (args == null ||
@@ -879,6 +898,12 @@ namespace APBridgeAddIn
             });
         }
 
+        /// <summary>
+        /// Opens a layout in a new pane. Layout-item lookup runs on the MCT via
+        /// QueuedTask.Run, but pane creation (<c>FrameworkApplication.Panes.Create
+        /// LayoutPaneAsync</c>) is GUI-thread-only — invoked via the WPF Dispatcher.
+        /// Mixing the two thread contexts in one method is the F3 fix pattern.
+        /// </summary>
         private static async Task<IpcResponse> HandleOpenLayout(Dictionary<string, string>? args)
         {
             if (args == null ||
@@ -1180,6 +1205,13 @@ namespace APBridgeAddIn
             return new(true, null, new { modelName, toolboxPath = path, updated = true });
         }
 
+        /// <summary>
+        /// Runs a ModelBuilder model with the given parameter dict. On failure, builds
+        /// a defensive error message — <c>result.Messages</c> can be empty when arcpy
+        /// fails before emitting any messages, so the response includes a fallback
+        /// "no messages" string instead of an empty <c>"Model execution failed: "</c>
+        /// (the original F5 bug).
+        /// </summary>
         private static async Task<IpcResponse> HandleRunModel(Dictionary<string, string>? args)
         {
             if (args == null ||
@@ -1241,6 +1273,15 @@ namespace APBridgeAddIn
         private static IReadOnlyList<KeyValuePair<string, string>> DefaultRunEnvironments() =>
             Geoprocessing.MakeEnvironmentArray(overwriteoutput: true);
 
+        /// <summary>
+        /// Runs an arbitrary geoprocessing tool by name (e.g., <c>analysis.Buffer</c>,
+        /// <c>management.AddField</c>). Parameters arrive as a JSON array; each element
+        /// passes through <see cref="FlattenGpParam"/>, which recursively flattens
+        /// two-level <see cref="JsonArray"/>s into arcpy's value-table string syntax
+        /// (<c>"f1 v1;f2 v2"</c>). That's the F7 fix that lets value-table-taking GP
+        /// tools (CalculateGeometryAttributes, JoinField, SpatialJoin field-map) work
+        /// over MCP without callers having to pre-stringify their inputs.
+        /// </summary>
         private static async Task<IpcResponse> HandleRunGPTool(Dictionary<string, string>? args)
         {
             if (args == null ||

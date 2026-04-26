@@ -42,11 +42,21 @@ FROM mcr.microsoft.com/dotnet/runtime:${DOTNET_VERSION} AS runtime
 WORKDIR /app
 COPY --from=build /app/publish ./
 
-# Tunables (override with `docker run -e`)
+# Tunables (override with `docker run -e`).
+#
+# Defaults track BridgeClientOptions defaults — see McpServer/ArcGisMcpServer/Ipc/BridgeClient.cs.
+# REQUEST_TIMEOUT_MS bumped to 120s (was 30s pre-G5) because slow Pro ops like
+# create_project on a fresh template can run 60+ seconds.
+#
+# PIPE_NAME defaults to the legacy hard-coded name because BridgeDiscovery's
+# per-PID registry lives at %LOCALAPPDATA% on the Pro host and isn't visible
+# from inside a container. For container deployments, either pin a specific
+# pipe via ARCGIS_MCP_PIPE_NAME, or run on a Windows container host that
+# shares the pipe namespace. See README "Container image" section.
 ENV ARCGIS_MCP_PIPE_NAME=ArcGisProBridgePipe \
     ARCGIS_MCP_MAX_RETRIES=3 \
     ARCGIS_MCP_CONNECT_TIMEOUT_MS=5000 \
-    ARCGIS_MCP_REQUEST_TIMEOUT_MS=30000 \
+    ARCGIS_MCP_REQUEST_TIMEOUT_MS=120000 \
     ARCGIS_MCP_INITIAL_BACKOFF_MS=250 \
     ARCGIS_MCP_MAX_BACKOFF_MS=4000 \
     DOTNET_NOLOGO=1 \
