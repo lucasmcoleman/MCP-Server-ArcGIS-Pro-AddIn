@@ -2,8 +2,6 @@
 
 An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that lets MCP clients — Claude Code, GitHub Copilot Agent Mode, Anthropic API integrations, anything that speaks MCP — drive **ArcGIS Pro** in real time. The server brokers calls over a named pipe to an in-process Pro Add-In, exposing 28 tools spanning map operations, project lifecycle, geoprocessing, ModelBuilder, and layout production.
 
-![MCP Server with ArcGIS Pro Add-In](MCPServer_ArcGISAddIn.gif)
-
 ---
 
 ## What it does
