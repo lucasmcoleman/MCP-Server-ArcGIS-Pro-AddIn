@@ -6,6 +6,22 @@ This project is a hardened fork/evolution of [nicogis/MCP-Server-ArcGIS-Pro-AddI
 
 ---
 
+## [Schema Completeness] — 2026-04-27
+
+Closes the remaining gap in the model-creation API: agents can now declare `GPComposite` parameter types with their accepted subtypes, matching what Pro's GUI writes when you drag-create a parameter from a composite slot (e.g., `CalculateField.in_table`, `AddJoin.in_layer_or_view`, `Sort.in_dataset`).
+
+### Added
+- **`compositeTypes` field on input parameter schema** — when paired with `type: "GPComposite"`, the writer emits a Pro-native composite datatype with the listed subtypes nested under `datatype.datatypes`. Example: `{"name": "InTable", "type": "GPComposite", "compositeTypes": ["GPTableView", "GPRasterLayer", "GPMosaicLayer"]}`. Without this, declaring a non-composite type (e.g., `GPFeatureLayer`) for a parameter that wires into a composite slot caused runtime validation mismatches (`ERROR 000840: The value is not a Table View`). With the schema extension, agents can express the slot-required composite directly. ([this commit])
+- **`describe_model` surfaces `compositeTypes` on round-trip** — when the underlying `tool.content` declares a `GPComposite` parameter with subtypes, `describe_model` now emits them as a `compositeTypes` string array, so an agent reading and re-writing the model preserves the structure. Falls back to reading from `tool.model` variable's datatype for explicit-typed params written by older clients.
+- **Tool description for `create_model` documents the full input parameter schema** — including `dependencies` and `compositeTypes`, with worked examples. Agents using the MCP tool now have the full schema in the description string (visible to LLM clients during tool selection), reducing the chance of fallback workarounds like declaring `GPString` for fields.
+- **README ModelBuilder section** documents the three input patterns (plain typed, Field with dependencies, GPComposite with subtypes) so users can author models programmatically without trial and error.
+
+### Internal
+- Extracted `BuildDataTypeJson(type, compositeTypes)` private helper in `AtbxManager`. Used at both write sites (`tool.model` variable + `tool.content` param) for symmetry. Composite expansion is no-op for non-`GPComposite` types — backward compatible by construction.
+- `GenerateModelFiles` now treats `GPComposite` as slot-derived (omits `datatype` from the `tool.model` variable, same convention as Field params with dependencies). Pro re-derives the composite at load time from the system_tool slot wiring.
+
+---
+
 ## [Post-Cycle-B Hardening] — 2026-04-27
 
 This round addressed real-world friction surfaced when an agent built a complex model (`FatalFlawScreening`, ~30 steps, 13 inputs) against the bridge. Several latent bugs in `run_model` parameter handling and ModelBuilder schema generation had been masked because the previous test models were simpler. Also closes a thread-affinity gap on `save_project` and locale/Y-coord issues that escaped earlier rounds.

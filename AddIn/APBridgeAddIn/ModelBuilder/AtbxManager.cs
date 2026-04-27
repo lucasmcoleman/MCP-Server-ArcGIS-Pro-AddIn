@@ -43,6 +43,34 @@ namespace APBridgeAddIn.ModelBuilder
             return null;
         }
 
+        /// <summary>
+        /// Builds a Pro-native datatype JSON object for a parameter. For most
+        /// types this is just <c>{"type": typeName}</c>. For GPComposite — when
+        /// the caller supplies the optional list of subtype names (matching
+        /// Pro's native pattern of GPComposite{GPTableView, GPRasterLayer,
+        /// GPMosaicLayer} for tools like CalculateField.in_table) — this also
+        /// writes the nested <c>datatypes</c> array so Pro's slot validator
+        /// accepts the right values at runtime.
+        /// </summary>
+        private static JsonObject BuildDataTypeJson(string type, JsonArray? compositeTypes)
+        {
+            var obj = new JsonObject { ["type"] = type };
+            if (string.Equals(type, "GPComposite", StringComparison.OrdinalIgnoreCase)
+                && compositeTypes != null)
+            {
+                var subtypes = new JsonArray();
+                foreach (var sub in compositeTypes)
+                {
+                    var s = TryGetString(sub);
+                    if (!string.IsNullOrEmpty(s))
+                        subtypes.Add(new JsonObject { ["type"] = s });
+                }
+                if (subtypes.Count > 0)
+                    obj["datatypes"] = subtypes;
+            }
+            return obj;
+        }
+
         #region Read Operations
 
         /// <summary>
@@ -167,19 +195,48 @@ namespace APBridgeAddIn.ModelBuilder
                     ["name"] = varNames[id]
                 };
 
-                // Only emit "type" when datatype is explicitly declared on the
-                // variable. Pro OMITS datatype on Parameter variables whose type
-                // is slot-derived (e.g., a Field parameter wired into
-                // CalculateField.field — Pro derives type+dependency from the
-                // system_tool's slot definition at load time). Previously we
-                // fell back to "GPString" when datatype was absent, which
-                // misrepresented slot-derived params as plain strings to agents.
-                // Agents then echoed "GPString" back via update_model, baking
-                // an explicit type that overrode Pro's slot inference and broke
-                // validation (ERROR 000860: "Zone field is not the type of Field").
-                var typeStr = TryGetString(v?["datatype"]?["type"]);
+                // Only emit "type" when datatype is explicitly declared. Pro
+                // OMITS datatype on Parameter variables whose type is slot-
+                // derived (e.g., a Field parameter wired into CalculateField.
+                // field — Pro derives type+dependency from the system_tool's
+                // slot definition at load time). Previously we fell back to
+                // "GPString" when datatype was absent, which misrepresented
+                // slot-derived params as plain strings to agents. Agents then
+                // echoed "GPString" back via update_model, baking an explicit
+                // type that overrode Pro's slot inference and broke validation
+                // (ERROR 000860: "Zone field is not the type of Field").
+                //
+                // Read tool.content first (Pro's authoritative public-interface
+                // declaration — has full datatype info even when slot-derived),
+                // fall back to the variable's datatype for explicit-typed
+                // params written by older clients.
+                var contentDatatypeNode = toolContent?["params"]?[varNames[id]]?["datatype"];
+                var datatypeNode = contentDatatypeNode ?? v?["datatype"];
+                var typeStr = TryGetString(datatypeNode?["type"]);
                 if (typeStr != null)
+                {
                     input["type"] = typeStr;
+
+                    // For GPComposite, surface the nested subtype list so
+                    // agents can round-trip it via update_model's
+                    // "compositeTypes" field without losing the structure.
+                    if (string.Equals(typeStr, "GPComposite", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var subs = datatypeNode?["datatypes"]?.AsArray();
+                        if (subs != null && subs.Count > 0)
+                        {
+                            var compositeArr = new JsonArray();
+                            foreach (var sub in subs)
+                            {
+                                var subType = TryGetString(sub?["type"]);
+                                if (!string.IsNullOrEmpty(subType))
+                                    compositeArr.Add(subType);
+                            }
+                            if (compositeArr.Count > 0)
+                                input["compositeTypes"] = compositeArr;
+                        }
+                    }
+                }
 
                 // Read parameter dependencies from tool.content. These declare
                 // which other input params a Field-like parameter validates
@@ -486,6 +543,7 @@ namespace APBridgeAddIn.ModelBuilder
                 var defaultVal = input?["default"]?.GetValue<string>();
                 var displayName = input?["displayName"]?.GetValue<string>() ?? name;
                 var dependencies = input?["dependencies"]?.AsArray();
+                var compositeTypes = input?["compositeTypes"]?.AsArray();
                 var id = nextId++.ToString();
 
                 nameToId[name] = id;
@@ -498,14 +556,23 @@ namespace APBridgeAddIn.ModelBuilder
                     ["connection_type"] = "Parameter",
                     ["param_name"] = name
                 };
-                // Datatype on the model-graph variable: only when explicit AND
-                // no dependencies declared. Pro omits datatype on graph
-                // variables for slot-derived params (Field, etc.) so the
-                // system_tool's slot definition resolves type+dependency at
-                // load time. Writing an explicit datatype overrides that
-                // resolution and breaks validation.
+
+                // Slot-derived params — Pro re-derives type+dependency at load
+                // time from the system_tool slot the variable wires into.
+                // Writing an explicit datatype on the variable overrides that
+                // resolution and breaks validation. Two kinds of slot-derived:
+                //   1. Field params declared via "dependencies" — Pro reads
+                //      "depends" from tool.content and pulls Field type from
+                //      the dependent input's table.
+                //   2. GPComposite slots (CalculateField.in_table etc.) —
+                //      Pro reads the full composite spec from tool.content
+                //      and validates incoming values against the slot's type
+                //      list at runtime.
                 bool hasDeps = dependencies != null && dependencies.Count > 0;
-                if (type != null && !hasDeps)
+                bool isComposite = string.Equals(type, "GPComposite", StringComparison.OrdinalIgnoreCase);
+                bool isSlotDerived = hasDeps || isComposite;
+
+                if (type != null && !isSlotDerived)
                     variable["datatype"] = new JsonObject { ["type"] = type };
                 if (defaultVal != null)
                     variable["value"] = defaultVal;
@@ -513,14 +580,14 @@ namespace APBridgeAddIn.ModelBuilder
                 variables.Add(variable);
                 rcMap[$"model.element{id}"] = displayName;
 
-                // tool.content params: write datatype only when we have
-                // grounds to set it. Defaulting to "GPString" silently breaks
-                // params that wire into typed slots (e.g., GPTableView,
-                // GPFeatureLayer) — the validator rejects "Test_TieLines" as
-                // "not a Table View" instead of resolving the layer reference.
-                // Omitting datatype lets Pro infer from the system_tool slot
-                // the variable wires into (the safest default).
-                //   - explicit type → write as given
+                // tool.content params: write datatype only when we have grounds
+                // to set it. Defaulting to "GPString" silently breaks params
+                // that wire into typed slots (e.g., GPTableView, GPFeatureLayer)
+                // — the validator rejects "Test_TieLines" as "not a Table View"
+                // instead of resolving the layer reference. Omitting datatype
+                // lets Pro infer from the system_tool slot (safest default).
+                //   - explicit type → write as given (composite expanded with
+                //     subtypes when "compositeTypes" is supplied)
                 //   - dependencies declared (no type) → assume Field param
                 //   - neither → omit, let Pro resolve from slot
                 var contentParam = new JsonObject
@@ -528,7 +595,7 @@ namespace APBridgeAddIn.ModelBuilder
                     ["displayname"] = $"$rc:{name.ToLowerInvariant()}.title"
                 };
                 if (type != null)
-                    contentParam["datatype"] = new JsonObject { ["type"] = type };
+                    contentParam["datatype"] = BuildDataTypeJson(type, compositeTypes);
                 else if (hasDeps)
                     contentParam["datatype"] = new JsonObject { ["type"] = "Field" };
                 if (defaultVal != null)

@@ -105,6 +105,30 @@ All tools return JSON strings. Success returns the operation's data payload; fai
 | `update_model` | Replace a model's definition |
 | `run_model` | Execute a model with parameters |
 
+#### Model input schema
+
+Each entry in a model definition's `inputs` array supports:
+
+```jsonc
+{
+  "name":           "ZoneField",          // required
+  "type":           "GPFeatureLayer",     // optional Pro datatype
+  "dependencies":   ["CorridorLayer"],    // optional: declare Field deps; auto-types as Field
+  "compositeTypes": ["GPTableView",       // optional: only when type == "GPComposite"
+                     "GPRasterLayer",
+                     "GPMosaicLayer"],
+  "default":        "TieLineID",          // optional default value
+  "displayName":    "Zone Field"          // optional GP-dialog label
+}
+```
+
+Three patterns cover most cases:
+- **Plain typed input** — `{name, type: "GPFeatureLayer"}` for a feature layer, `{name, type: "GPDouble", default: "50"}` for a numeric threshold, etc. Maps directly to Pro's datatype system.
+- **Field that depends on a layer** — `{name: "ZoneField", dependencies: ["LayerParam"]}`. Writer emits Pro-native `Field`-typed parameter with `depends` array, so the GP validator can resolve field names against the layer's actual schema.
+- **GPComposite slot input** (CalculateField.in_table, AddJoin.in_layer_or_view, Sort.in_dataset, etc.) — `{name, type: "GPComposite", compositeTypes: [...]}`. Required because Pro's composite slots have specific accepted-type lists; declaring `GPFeatureLayer` for a composite slot causes a runtime type mismatch.
+
+`describe_model` round-trips all three: omitted-type signals slot-derived, `dependencies` and `compositeTypes` are surfaced when present.
+
 ### Layouts
 | Tool | Purpose |
 |---|---|

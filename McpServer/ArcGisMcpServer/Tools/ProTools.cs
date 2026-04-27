@@ -417,7 +417,7 @@ namespace ArcGisMcpServer.Tools
             "The definition must include: " +
             "- 'name': string - the model name (no spaces, alphanumeric + underscores) " +
             "- 'description': string - what the model does " +
-            "- 'inputs': array of {name, type, description, default?} - model parameters " +
+            "- 'inputs': array of input parameter objects (see schema below) " +
             "- 'steps': array of processing steps, each with: " +
             "  - 'name': display name for the step " +
             "  - 'tool': geoprocessing tool name (e.g., 'analysis.Buffer', 'sa.Reclassify') " +
@@ -425,10 +425,27 @@ namespace ArcGisMcpServer.Tools
             "    - {\"ref\": \"InputName\"} to connect to an input or previous output " +
             "    - {\"output\": \"OutputName\", \"type\": \"DEFeatureClass\"} to declare an output " +
             "    - \"literal value\" for constant values " +
-            "Common GP tool categories: analysis (overlay, proximity), conversion, " +
-            "management (fields, joins), sa (spatial analyst - raster), na (network analyst). " +
-            "Common data types: GPFeatureLayer, DERasterDataset, DEFeatureClass, GPString, " +
-            "GPLong, GPDouble, GPLinearUnit, GPSQLExpression, Field.")]
+            "\n\nINPUT PARAMETER SCHEMA — each entry in 'inputs' supports: " +
+            "- 'name' (required): string — parameter name (no spaces). " +
+            "- 'type' (optional): string — Pro datatype (GPFeatureLayer, GPString, GPLong, " +
+            "  GPDouble, GPLinearUnit, GPSQLExpression, DERasterDataset, DEFeatureClass, " +
+            "  Field, GPComposite, etc.). Omit when the parameter is a Field that depends " +
+            "  on another input — declare 'dependencies' instead and the writer auto-types " +
+            "  it as Field. " +
+            "- 'dependencies' (optional): string[] — list of other input parameter names " +
+            "  this Field-typed parameter validates against. E.g., for a 'ZoneField' that " +
+            "  references fields on a 'CorridorLayer' input, write " +
+            "  {\"name\":\"ZoneField\",\"dependencies\":[\"CorridorLayer\"]}. " +
+            "- 'compositeTypes' (optional, only when type is 'GPComposite'): string[] — " +
+            "  the list of accepted subtypes when the parameter wires into a GPComposite " +
+            "  slot (e.g., CalculateField.in_table accepts " +
+            "  GPComposite{GPTableView, GPRasterLayer, GPMosaicLayer}). Example: " +
+            "  {\"name\":\"InTable\",\"type\":\"GPComposite\"," +
+            "  \"compositeTypes\":[\"GPTableView\",\"GPRasterLayer\",\"GPMosaicLayer\"]}. " +
+            "- 'default' (optional): string — the parameter's default value. " +
+            "- 'displayName' (optional): string — human-readable name for the GP dialog." +
+            "\n\nCommon GP tool categories: analysis (overlay, proximity), conversion, " +
+            "management (fields, joins), sa (spatial analyst - raster), na (network analyst).")]
         public static async Task<string> CreateModel(
             [Description("Full file path to the .atbx toolbox file")] string toolboxPath,
             [Description("JSON model definition with name, description, inputs, and steps")] string definition)
