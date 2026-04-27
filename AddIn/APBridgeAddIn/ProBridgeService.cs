@@ -10,6 +10,7 @@ using ArcGIS.Desktop.Mapping;
 using APBridgeAddIn.ModelBuilder;
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.IO.Pipes;
 using System.Linq;
@@ -835,10 +836,13 @@ namespace APBridgeAddIn
                 string.IsNullOrWhiteSpace(name))
                 return new(false, "arg 'name' required", null);
 
+            // InvariantCulture so "11.5" parses correctly on locales where the decimal
+            // separator is ',' rather than '.'. Default TryParse silently fails to parse
+            // and falls through to the default — wrong dimensions, no error visible.
             double width = 11.0, height = 8.5;
-            if (args.TryGetValue("widthInches", out string? ws) && double.TryParse(ws, out var wd) && wd > 0)
+            if (args.TryGetValue("widthInches", out string? ws) && double.TryParse(ws, NumberStyles.Float, CultureInfo.InvariantCulture, out var wd) && wd > 0)
                 width = wd;
-            if (args.TryGetValue("heightInches", out string? hs) && double.TryParse(hs, out var hd) && hd > 0)
+            if (args.TryGetValue("heightInches", out string? hs) && double.TryParse(hs, NumberStyles.Float, CultureInfo.InvariantCulture, out var hd) && hd > 0)
                 height = hd;
 
             string orientation = "landscape";
@@ -887,11 +891,12 @@ namespace APBridgeAddIn
                 !args.TryGetValue("mapName", out string? mapName) || string.IsNullOrWhiteSpace(mapName))
                 return new(false, "args 'layoutName' & 'mapName' required", null);
 
+            // InvariantCulture — see HandleCreateLayout for rationale.
             double x = 1.0, y = 1.0, w = 9.0, h = 6.5;
-            if (args.TryGetValue("xInches", out string? xs) && double.TryParse(xs, out var xd)) x = xd;
-            if (args.TryGetValue("yInches", out string? ys) && double.TryParse(ys, out var yd)) y = yd;
-            if (args.TryGetValue("widthInches", out string? ws) && double.TryParse(ws, out var wd) && wd > 0) w = wd;
-            if (args.TryGetValue("heightInches", out string? hs) && double.TryParse(hs, out var hd) && hd > 0) h = hd;
+            if (args.TryGetValue("xInches", out string? xs) && double.TryParse(xs, NumberStyles.Float, CultureInfo.InvariantCulture, out var xd)) x = xd;
+            if (args.TryGetValue("yInches", out string? ys) && double.TryParse(ys, NumberStyles.Float, CultureInfo.InvariantCulture, out var yd)) y = yd;
+            if (args.TryGetValue("widthInches", out string? ws) && double.TryParse(ws, NumberStyles.Float, CultureInfo.InvariantCulture, out var wd) && wd > 0) w = wd;
+            if (args.TryGetValue("heightInches", out string? hs) && double.TryParse(hs, NumberStyles.Float, CultureInfo.InvariantCulture, out var hd) && hd > 0) h = hd;
 
             return await QueuedTask.Run<IpcResponse>(() =>
             {
@@ -1081,7 +1086,7 @@ namespace APBridgeAddIn
             args.TryGetValue("format", out string? format);
             int resolution = 300;
             if (args.TryGetValue("resolution", out string? res) &&
-                int.TryParse(res, out var r) && r > 0)
+                int.TryParse(res, NumberStyles.Integer, CultureInfo.InvariantCulture, out var r) && r > 0)
                 resolution = r;
 
             return await QueuedTask.Run<IpcResponse>(() =>
