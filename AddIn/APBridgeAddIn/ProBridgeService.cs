@@ -1,3 +1,4 @@
+using ArcGIS.Core.CIM;
 using ArcGIS.Core.Geometry;
 using ArcGIS.Desktop.Core;
 using ArcGIS.Desktop.Core.Geoprocessing;
@@ -908,7 +909,18 @@ namespace APBridgeAddIn
 
                 try
                 {
-                    var envelope = EnvelopeBuilderEx.CreateEnvelope(x, y, x + w, y + h);
+                    // The MCP tool description tells agents that x/y are measured from
+                    // the page TOP-LEFT (the screen-coords convention everyone learns
+                    // from web/UI work). Pro SDK layout coords are bottom-up — y=0 is
+                    // the page bottom, increasing toward the top. Invert here so the
+                    // documented convention matches the actual placement; otherwise
+                    // any agent passing y>0 expecting "near the top" silently gets a
+                    // frame near the bottom.
+                    double pageHeight = layout.GetPage().Height;
+                    double sdkYmin = pageHeight - y - h;  // bottom edge in SDK coords
+                    double sdkYmax = pageHeight - y;       // top edge in SDK coords
+
+                    var envelope = EnvelopeBuilderEx.CreateEnvelope(x, sdkYmin, x + w, sdkYmax);
                     var mapFrame = ElementFactory.Instance.CreateMapFrameElement(layout, envelope, map);
                     if (mapFrame == null)
                         return new(false, "CreateMapFrameElement returned null", null);
