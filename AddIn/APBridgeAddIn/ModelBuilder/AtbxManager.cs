@@ -164,9 +164,41 @@ namespace APBridgeAddIn.ModelBuilder
 
                 var input = new JsonObject
                 {
-                    ["name"] = varNames[id],
-                    ["type"] = TryGetString(v?["datatype"]?["type"]) ?? "GPString"
+                    ["name"] = varNames[id]
                 };
+
+                // Only emit "type" when datatype is explicitly declared on the
+                // variable. Pro OMITS datatype on Parameter variables whose type
+                // is slot-derived (e.g., a Field parameter wired into
+                // CalculateField.field — Pro derives type+dependency from the
+                // system_tool's slot definition at load time). Previously we
+                // fell back to "GPString" when datatype was absent, which
+                // misrepresented slot-derived params as plain strings to agents.
+                // Agents then echoed "GPString" back via update_model, baking
+                // an explicit type that overrode Pro's slot inference and broke
+                // validation (ERROR 000860: "Zone field is not the type of Field").
+                var typeStr = TryGetString(v?["datatype"]?["type"]);
+                if (typeStr != null)
+                    input["type"] = typeStr;
+
+                // Read parameter dependencies from tool.content. These declare
+                // which other input params a Field-like parameter validates
+                // against (e.g., TieLine_ID_Field "depends" on TieLineCorridors).
+                // Surfacing this lets agents preserve dependencies on round-trip
+                // and create new Field params correctly.
+                var depsNode = toolContent?["params"]?[varNames[id]]?["depends"]?.AsArray();
+                if (depsNode != null && depsNode.Count > 0)
+                {
+                    var depsArr = new JsonArray();
+                    foreach (var dep in depsNode)
+                    {
+                        var depName = TryGetString(dep);
+                        if (!string.IsNullOrEmpty(depName))
+                            depsArr.Add(depName);
+                    }
+                    if (depsArr.Count > 0)
+                        input["dependencies"] = depsArr;
+                }
 
                 var value = TryGetString(v?["value"]);
                 if (value != null)
@@ -445,9 +477,15 @@ namespace APBridgeAddIn.ModelBuilder
             foreach (var input in inputs)
             {
                 var name = input?["name"]?.GetValue<string>() ?? $"Input{nextId}";
-                var type = input?["type"]?.GetValue<string>() ?? "GPString";
+                // type is OPTIONAL — when omitted, Pro derives the parameter's
+                // type from the system_tool slot it wires into. Writing an
+                // explicit datatype overrides slot inference and (for Field
+                // params) breaks validation. Only echo back what the caller
+                // sent. See DescribeModel for the matching read-side change.
+                var type = TryGetString(input?["type"]);
                 var defaultVal = input?["default"]?.GetValue<string>();
                 var displayName = input?["displayName"]?.GetValue<string>() ?? name;
+                var dependencies = input?["dependencies"]?.AsArray();
                 var id = nextId++.ToString();
 
                 nameToId[name] = id;
@@ -458,23 +496,63 @@ namespace APBridgeAddIn.ModelBuilder
                     ["title"] = $"$rc:model.element{id}",
                     ["altered"] = "true",
                     ["connection_type"] = "Parameter",
-                    ["param_name"] = name,
-                    ["datatype"] = new JsonObject { ["type"] = type }
+                    ["param_name"] = name
                 };
+                // Datatype on the model-graph variable: only when explicit AND
+                // no dependencies declared. Pro omits datatype on graph
+                // variables for slot-derived params (Field, etc.) so the
+                // system_tool's slot definition resolves type+dependency at
+                // load time. Writing an explicit datatype overrides that
+                // resolution and breaks validation.
+                bool hasDeps = dependencies != null && dependencies.Count > 0;
+                if (type != null && !hasDeps)
+                    variable["datatype"] = new JsonObject { ["type"] = type };
                 if (defaultVal != null)
                     variable["value"] = defaultVal;
 
                 variables.Add(variable);
                 rcMap[$"model.element{id}"] = displayName;
 
-                // Add to tool.content params
+                // tool.content params: write datatype only when we have
+                // grounds to set it. Defaulting to "GPString" silently breaks
+                // params that wire into typed slots (e.g., GPTableView,
+                // GPFeatureLayer) — the validator rejects "Test_TieLines" as
+                // "not a Table View" instead of resolving the layer reference.
+                // Omitting datatype lets Pro infer from the system_tool slot
+                // the variable wires into (the safest default).
+                //   - explicit type → write as given
+                //   - dependencies declared (no type) → assume Field param
+                //   - neither → omit, let Pro resolve from slot
                 var contentParam = new JsonObject
                 {
-                    ["displayname"] = $"$rc:{name.ToLowerInvariant()}.title",
-                    ["datatype"] = new JsonObject { ["type"] = type }
+                    ["displayname"] = $"$rc:{name.ToLowerInvariant()}.title"
                 };
+                if (type != null)
+                    contentParam["datatype"] = new JsonObject { ["type"] = type };
+                else if (hasDeps)
+                    contentParam["datatype"] = new JsonObject { ["type"] = "Field" };
                 if (defaultVal != null)
                     contentParam["value"] = defaultVal;
+
+                // Optional "depends" array — declares which other input params
+                // a Field-typed parameter resolves against. Pro infers this
+                // automatically when the variable wires into a system_tool's
+                // dependent slot (e.g., CalculateField.field implicitly depends
+                // on in_table), but emitting it explicitly when the caller asks
+                // produces output that round-trips identically through
+                // describe_model → update_model.
+                if (dependencies != null && dependencies.Count > 0)
+                {
+                    var depsArr = new JsonArray();
+                    foreach (var dep in dependencies)
+                    {
+                        var depName = TryGetString(dep);
+                        if (!string.IsNullOrEmpty(depName))
+                            depsArr.Add(depName);
+                    }
+                    if (depsArr.Count > 0)
+                        contentParam["depends"] = depsArr;
+                }
                 contentParams[name] = contentParam;
                 rcMap[$"{name.ToLowerInvariant()}.title"] = displayName;
 
