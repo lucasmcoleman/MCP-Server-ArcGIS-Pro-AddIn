@@ -103,6 +103,19 @@ namespace ArcGisMcpServer.Tools
         }
 
         [McpServerTool, Description(
+            "Diagnostic: returns raw Map.SpatialReference, Extent.SpatialReference, " +
+            "Camera (X/Y/Z/Scale/Heading/Pitch/Roll), and Map.CalculateFullExtent(). " +
+            "Use this when get_current_extent returns values that don't match the " +
+            "reported SR, or when an agent needs to introspect 2D-vs-3D view state. " +
+            "NaN/Infinity values (e.g., Camera.Z in 2D mode) appear as JSON string " +
+            "literals due to System.Text.Json's named-floating-point handling.")]
+        public static async Task<string> GetViewDiagnostics()
+        {
+            var r = await _client!.OpAsync("pro.getViewDiagnostics");
+            return FormatResult(r, "pro.getViewDiagnostics");
+        }
+
+        [McpServerTool, Description(
             "Export a layer's features to a feature class or shapefile. " +
             "The output path determines the format: use a '.shp' extension for shapefile " +
             "output, otherwise provide a path inside a file/enterprise geodatabase " +
