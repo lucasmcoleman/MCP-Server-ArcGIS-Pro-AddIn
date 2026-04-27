@@ -1239,11 +1239,21 @@ namespace APBridgeAddIn
         }
 
         /// <summary>
-        /// Runs a ModelBuilder model with the given parameter dict. On failure, builds
-        /// a defensive error message — <c>result.Messages</c> can be empty when arcpy
-        /// fails before emitting any messages, so the response includes a fallback
-        /// "no messages" string instead of an empty <c>"Model execution failed: "</c>
-        /// (the original F5 bug).
+        /// Runs a ModelBuilder model with the given parameter dict. ModelBuilder models
+        /// bind parameters by DECLARED ORDER (arcpy positional convention), but agents
+        /// pass by NAME via the JSON dict. We read the model's parameter declaration
+        /// order via <see cref="AtbxManager.DescribeModel"/> and remap the user's named
+        /// values to the correct positional slots — without that, dict insertion order
+        /// becomes the implicit positional order and any mismatch (especially if the
+        /// model has parameters the user didn't supply, like <c>Output_Workspace</c>)
+        /// shifts every subsequent value into the wrong slot. Symptom: an arcpy error
+        /// referencing a parameter NAME the user never typed, with a value that was
+        /// meant for a different parameter.
+        ///
+        /// On failure, builds a defensive error message — <c>result.Messages</c> can
+        /// be empty when arcpy fails before emitting any messages, so the response
+        /// includes a fallback "no messages" string instead of an empty
+        /// <c>"Model execution failed: "</c> (the F5 pattern).
         /// </summary>
         private static async Task<IpcResponse> HandleRunModel(Dictionary<string, string>? args)
         {
@@ -1257,19 +1267,59 @@ namespace APBridgeAddIn
             // Build the tool path: "toolboxPath\modelName"
             var toolPath = $"{path}\\{modelName}";
 
-            // Collect parameter values from args (everything except toolboxPath and modelName)
-            var paramValues = new List<string>();
+            // Read the model's declared parameter order so we can map the user's named
+            // dict to a positional array in the order arcpy expects. See class-level
+            // doc comment above for the symptom this prevents.
+            List<string> paramOrder;
+            try
+            {
+                var description = AtbxManager.DescribeModel(path, modelName);
+                var inputs = JsonNode.Parse(description)?["inputs"]?.AsArray();
+                paramOrder = inputs?
+                    .Select(i => i?["name"]?.GetValue<string>() ?? "")
+                    .Where(n => !string.IsNullOrEmpty(n))
+                    .ToList() ?? new List<string>();
+            }
+            catch (Exception ex)
+            {
+                return new(false, $"Failed to read model parameter order from '{path}': {ex.Message}", null);
+            }
+
+            // Collect user-supplied named values (case-insensitive matching against
+            // the model's declared names — arcpy is generally case-insensitive too).
+            var namedValues = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             if (args.TryGetValue("parameters", out string? paramsJson) && !string.IsNullOrWhiteSpace(paramsJson))
             {
                 var paramsNode = JsonNode.Parse(paramsJson)?.AsObject();
                 if (paramsNode != null)
                 {
                     foreach (var kv in paramsNode)
-                        paramValues.Add(kv.Value?.GetValue<string>() ?? "");
+                        namedValues[kv.Key] = kv.Value?.GetValue<string>() ?? "";
                 }
             }
 
-            var valueArray = Geoprocessing.MakeValueArray(paramValues.ToArray());
+            // Catch typos / stale param names early — surfacing the model's actual
+            // parameter list saves agents a describe_model round-trip.
+            var unknownKeys = namedValues.Keys
+                .Where(k => !paramOrder.Any(p => p.Equals(k, StringComparison.OrdinalIgnoreCase)))
+                .ToList();
+            if (unknownKeys.Any())
+            {
+                return new(false,
+                    $"Unknown model parameter(s): {string.Join(", ", unknownKeys)}. " +
+                    $"Model '{modelName}' expects: [{string.Join(", ", paramOrder)}]",
+                    null);
+            }
+
+            // Build positional array in the model's declared order. Missing values
+            // pass through as empty strings — arcpy uses the parameter's declared
+            // default in that case (or fails with a clear "required parameter X is
+            // missing" error, which is more useful than a silent shift).
+            var paramValues = paramOrder
+                .Select(name => namedValues.TryGetValue(name, out var v) ? v : "")
+                .ToArray();
+
+            var valueArray = Geoprocessing.MakeValueArray(paramValues);
             var result = await Geoprocessing.ExecuteToolAsync(toolPath, valueArray, DefaultRunEnvironments());
 
             if (result.IsFailed)
