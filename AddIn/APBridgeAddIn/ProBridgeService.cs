@@ -1328,12 +1328,16 @@ namespace APBridgeAddIn
                     null);
             }
 
-            // Build positional array in the model's declared order. Missing values
-            // pass through as empty strings — arcpy uses the parameter's declared
-            // default in that case (or fails with a clear "required parameter X is
-            // missing" error, which is more useful than a silent shift).
+            // Build positional array in the model's declared order. For parameters
+            // the user did NOT supply, send arcpy's "#" sentinel — this tells the
+            // GP engine "use the parameter's declared default". Empty string is
+            // NOT equivalent: arcpy reads "" as an explicit empty value and the
+            // validator emits ERROR 000735 ("Value is required") for required
+            // params or overrides the model's default for optional ones. If the
+            // user explicitly supplied an empty string, that intent is preserved
+            // (the dict contains the key with value "").
             var paramValues = paramOrder
-                .Select(name => namedValues.TryGetValue(name, out var v) ? v : "")
+                .Select(name => namedValues.TryGetValue(name, out var v) ? v : "#")
                 .ToArray();
 
             var valueArray = Geoprocessing.MakeValueArray(paramValues);
