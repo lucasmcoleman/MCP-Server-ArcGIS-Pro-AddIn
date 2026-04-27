@@ -523,7 +523,14 @@ namespace APBridgeAddIn
                 return new(false, "No project currently open", null);
             try
             {
-                await Project.Current.SaveAsync();
+                // Project.SaveAsync (like CreateAsync/OpenAsync — F1/F2) is GUI-thread-
+                // only. Calling it from the IPC thread raises "calling thread cannot
+                // access this object". Dispatch to the WPF UI thread and unwrap the
+                // nested Task the same way HandleCreateProject does.
+                var saveTask = await System.Windows.Application.Current.Dispatcher.InvokeAsync(
+                    () => Project.Current.SaveAsync());
+                await saveTask;
+
                 return new(true, null, new
                 {
                     saved = true,
@@ -606,7 +613,20 @@ namespace APBridgeAddIn
             bool overwrite = args.TryGetValue("overwrite", out string? ow)
                              && bool.TryParse(ow, out var b) && b;
 
-            try { if (Project.Current != null) await Project.Current.SaveAsync(); }
+            // Same GUI-thread requirement as the explicit pro.saveProject path.
+            // Without the Dispatcher wrap this silently throws and the catch
+            // swallows it, meaning save-first never actually fired and Pro's
+            // modal "save changes?" dialog could appear during the project
+            // switch below. See F1/F2 commit history.
+            try
+            {
+                if (Project.Current != null)
+                {
+                    var saveTask = await System.Windows.Application.Current.Dispatcher.InvokeAsync(
+                        () => Project.Current.SaveAsync());
+                    await saveTask;
+                }
+            }
             catch { }
 
             if (overwrite)
@@ -661,7 +681,20 @@ namespace APBridgeAddIn
             if (!File.Exists(path))
                 return new(false, $"Project file not found: {path}", null);
 
-            try { if (Project.Current != null) await Project.Current.SaveAsync(); }
+            // Same GUI-thread requirement as the explicit pro.saveProject path.
+            // Without the Dispatcher wrap this silently throws and the catch
+            // swallows it, meaning save-first never actually fired and Pro's
+            // modal "save changes?" dialog could appear during the project
+            // switch below. See F1/F2 commit history.
+            try
+            {
+                if (Project.Current != null)
+                {
+                    var saveTask = await System.Windows.Application.Current.Dispatcher.InvokeAsync(
+                        () => Project.Current.SaveAsync());
+                    await saveTask;
+                }
+            }
             catch { }
 
             var projectTask = await System.Windows.Application.Current.Dispatcher.InvokeAsync(
