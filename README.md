@@ -183,10 +183,18 @@ The GUID is the `AddInInfo id` from `Config.daml` — stable across builds. Pro 
 A single-file publish via the helper script:
 
 ```powershell
-pwsh ./build-mcp-server.ps1
+pwsh ./build-mcp-server.ps1                  # framework-dependent (default)
+pwsh ./build-mcp-server.ps1 -SelfContained   # bundles .NET 8 runtime
 ```
 
 This runs `dotnet publish ... -p:PublishSingleFile=true` to produce `McpServer/ArcGisMcpServer/publish/ArcGisMcpServer.exe`. The `.mcp.json` at the repo root points directly at this exe — no `dotnet run` wrapper, faster cold start.
+
+| Mode | Size | Requires on target machine |
+|---|---|---|
+| Default (framework-dependent) | ~3.7 MB | .NET 8 runtime installed |
+| `-SelfContained` | ~70 MB | Nothing — runtime bundled |
+
+Use the default for local dev (you already have the SDK). Use `-SelfContained` when shipping to a machine that doesn't have .NET 8, or for release artifacts intended for end users.
 
 The script refuses to run if `ArcGisMcpServer.exe` is currently running (any Claude Code session attached holds the file lock).
 
