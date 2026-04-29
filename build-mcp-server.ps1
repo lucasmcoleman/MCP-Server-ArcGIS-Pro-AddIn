@@ -10,6 +10,15 @@
 # Run this after any code change in McpServer/. If publish fails with
 # "file is locked", close all Claude Code sessions that have this MCP
 # server attached and retry.
+#
+# Pass -SelfContained to produce a ~70 MB exe that bundles the .NET 8
+# runtime — useful for distribution to machines without the runtime
+# installed. Default is framework-dependent (~3.7 MB, needs .NET 8).
+
+[CmdletBinding()]
+param(
+    [switch]$SelfContained
+)
 
 $ErrorActionPreference = 'Stop'
 $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -28,10 +37,13 @@ if ($running) {
     exit 1
 }
 
+$selfContainedFlag = if ($SelfContained) { 'true' } else { 'false' }
+Write-Host "Publishing (self-contained=$selfContainedFlag)..." -ForegroundColor Cyan
+
 dotnet publish $proj `
     -c Release `
     -r win-x64 `
-    --self-contained false `
+    --self-contained $selfContainedFlag `
     -p:PublishSingleFile=true `
     -o $output
 

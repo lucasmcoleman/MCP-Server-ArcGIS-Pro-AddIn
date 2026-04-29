@@ -9,6 +9,14 @@ on:
       tag:
         description: 'Release tag (e.g. v1.0.1)'
         required: true
+      self_contained:
+        description: 'Publish MCP exe self-contained (bundles .NET 8 runtime, ~70 MB)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
 
 permissions:
   contents: write
@@ -29,11 +37,13 @@ jobs:
       - name: Publish single-file exe
         id: publish
         shell: pwsh
+        env:
+          SELF_CONTAINED: ${{ github.event.inputs.self_contained || 'false' }}
         run: |
           dotnet publish McpServer/ArcGisMcpServer/ArcGisMcpServer.csproj `
             -c Release `
             -r win-x64 `
-            --self-contained false `
+            --self-contained $env:SELF_CONTAINED `
             -p:PublishSingleFile=true `
             -o McpServer/ArcGisMcpServer/publish
           $exe = "McpServer/ArcGisMcpServer/publish/ArcGisMcpServer.exe"
