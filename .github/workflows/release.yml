@@ -1,0 +1,129 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v1.0.1)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-mcp-server:
+    name: Build MCP server (win-x64)
+    runs-on: windows-latest
+    outputs:
+      exe-path: ${{ steps.publish.outputs.exe-path }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Publish single-file exe
+        id: publish
+        shell: pwsh
+        run: |
+          dotnet publish McpServer/ArcGisMcpServer/ArcGisMcpServer.csproj `
+            -c Release `
+            -r win-x64 `
+            --self-contained false `
+            -p:PublishSingleFile=true `
+            -o McpServer/ArcGisMcpServer/publish
+          $exe = "McpServer/ArcGisMcpServer/publish/ArcGisMcpServer.exe"
+          if (-not (Test-Path $exe)) { throw "Publish output missing: $exe" }
+          "exe-path=$exe" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Upload MCP server artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ArcGisMcpServer-win-x64
+          path: McpServer/ArcGisMcpServer/publish/ArcGisMcpServer.exe
+          if-no-files-found: error
+
+  build-addin:
+    name: Build ArcGIS Pro Add-In
+    # Requires a self-hosted Windows runner labelled "arcgis-pro" with
+    # ArcGIS Pro 3.6+ and the Pro SDK for .NET installed (the build needs
+    # ArcGIS.Desktop.*.dll under C:\Program Files\ArcGIS\Pro\bin\ and the
+    # Esri.ProApp.SDK.Desktop.targets file from the SDK's VS extension).
+    # GitHub-hosted runners don't ship ArcGIS Pro, so this job no-ops there.
+    runs-on: [self-hosted, windows, arcgis-pro]
+    if: ${{ vars.HAS_ARCGIS_RUNNER == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Locate MSBuild
+        id: msbuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build Add-In (Release)
+        shell: pwsh
+        run: |
+          & "${{ steps.msbuild.outputs.msbuildPath }}\MSBuild.exe" `
+            AddIn/APBridgeAddIn/APBridgeAddIn.csproj `
+            -p:Configuration=Release `
+            -restore
+
+      - name: Locate .esriAddinX bundle
+        id: bundle
+        shell: pwsh
+        run: |
+          $bundle = Get-ChildItem -Path AddIn/APBridgeAddIn/bin/Release -Recurse -Filter *.esriAddinX | Select-Object -First 1
+          if (-not $bundle) { throw "No .esriAddinX produced." }
+          "path=$($bundle.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Upload Add-In artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: APBridgeAddIn-esriAddinX
+          path: ${{ steps.bundle.outputs.path }}
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    needs: [build-mcp-server]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Stage release assets
+        shell: bash
+        run: |
+          mkdir -p release-assets
+          cp artifacts/ArcGisMcpServer-win-x64/ArcGisMcpServer.exe release-assets/
+          if [ -d artifacts/APBridgeAddIn-esriAddinX ]; then
+            cp artifacts/APBridgeAddIn-esriAddinX/*.esriAddinX release-assets/
+          fi
+          (cd release-assets && sha256sum * > SHA256SUMS.txt)
+          ls -la release-assets
+
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create or update release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.tag }}
+          draft: true
+          generate_release_notes: true
+          files: release-assets/*
