@@ -146,7 +146,14 @@ namespace APBridgeAddIn
                             .OfType<FeatureLayer>()
                             .FirstOrDefault(l => l.Name.Equals(layerName, StringComparison.OrdinalIgnoreCase));
                         if (fl == null) throw new InvalidOperationException($"Layer not found: {layerName}");
-                        using var fc = fl.GetFeatureClass();
+                        // Guard against layers whose underlying feature class can't
+                        // be resolved (broken data source, unloaded analysis output,
+                        // deleted gdb feature class). Without this, fc.GetDefinition()
+                        // a few lines down NREs and the caller sees a generic
+                        // "NullReferenceException" instead of an actionable message.
+                        using var fc = fl.GetFeatureClass()
+                            ?? throw new InvalidOperationException(
+                                $"Layer '{fl.Name}' has no resolved feature class — its data source may be missing or unloaded.");
                         return (int)fc.GetCount();
                     });
                     return new(true, null, new { count });
@@ -211,7 +218,14 @@ namespace APBridgeAddIn
                             .FirstOrDefault(l => l.Name.Equals(lfLayerName, StringComparison.OrdinalIgnoreCase))
                             ?? throw new InvalidOperationException($"Layer not found: {lfLayerName}");
 
-                        using var fc = fl.GetFeatureClass();
+                        // Guard against layers whose underlying feature class can't
+                        // be resolved (broken data source, unloaded analysis output,
+                        // deleted gdb feature class). Without this, fc.GetDefinition()
+                        // a few lines down NREs and the caller sees a generic
+                        // "NullReferenceException" instead of an actionable message.
+                        using var fc = fl.GetFeatureClass()
+                            ?? throw new InvalidOperationException(
+                                $"Layer '{fl.Name}' has no resolved feature class — its data source may be missing or unloaded.");
                         var fields = fc.GetDefinition().GetFields()
                             .Select(f => new
                             {
@@ -327,7 +341,14 @@ namespace APBridgeAddIn
                             .FirstOrDefault(l => l.Name.Equals(raLayerName, StringComparison.OrdinalIgnoreCase))
                             ?? throw new InvalidOperationException($"Layer not found: {raLayerName}");
 
-                        using var fc = fl.GetFeatureClass();
+                        // Guard against layers whose underlying feature class can't
+                        // be resolved (broken data source, unloaded analysis output,
+                        // deleted gdb feature class). Without this, fc.GetDefinition()
+                        // a few lines down NREs and the caller sees a generic
+                        // "NullReferenceException" instead of an actionable message.
+                        using var fc = fl.GetFeatureClass()
+                            ?? throw new InvalidOperationException(
+                                $"Layer '{fl.Name}' has no resolved feature class — its data source may be missing or unloaded.");
                         var fcDef = fc.GetDefinition();
                         var allFields = fcDef.GetFields();
                         var shapeFieldName = fcDef.GetShapeField();
@@ -430,7 +451,14 @@ namespace APBridgeAddIn
                             .FirstOrDefault(l => l.Name.Equals(gsfLayerName, StringComparison.OrdinalIgnoreCase))
                             ?? throw new InvalidOperationException($"Layer not found: {gsfLayerName}");
 
-                        using var fc = fl.GetFeatureClass();
+                        // Guard against layers whose underlying feature class can't
+                        // be resolved (broken data source, unloaded analysis output,
+                        // deleted gdb feature class). Without this, fc.GetDefinition()
+                        // a few lines down NREs and the caller sees a generic
+                        // "NullReferenceException" instead of an actionable message.
+                        using var fc = fl.GetFeatureClass()
+                            ?? throw new InvalidOperationException(
+                                $"Layer '{fl.Name}' has no resolved feature class — its data source may be missing or unloaded.");
                         var fcDef = fc.GetDefinition();
                         var allFields = fcDef.GetFields();
                         var shapeFieldName = fcDef.GetShapeField();
