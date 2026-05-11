@@ -6,6 +6,22 @@ This project is a hardened fork/evolution of [nicogis/MCP-Server-ArcGIS-Pro-AddI
 
 ---
 
+## [Layer Lifecycle Tools] — 2026-05-11
+
+Closes a small but meaningful gap surfaced by interactive Copilot Studio use: the original tool set had `add_layer_from_*` to bring data into the map, but no way to remove, rename, hide, or reorder layers after the fact. Easy to overlook in transactional stdio workflows; obvious when conversational agents want to iterate.
+
+### Added
+- **`remove_layer`** — removes a layer from the active map's Table of Contents by name. Removes the TOC reference only; the underlying feature class on disk is not deleted (use `run_gp_tool management.Delete` for that). Works on any layer type, not just feature layers.
+- **`rename_layer`** — renames a layer in the active map. If the new name conflicts with an existing layer, Pro auto-uniquifies (e.g., 'Foo' → 'Foo (2)') and the returned `to` value reflects the actual post-rename name.
+- **`set_layer_visibility`** — show or hide a layer without removing it from the TOC. Useful when staging a map for export.
+- **`move_layer`** — reorder a layer in the TOC. Position is 0-based (0 is topmost); out-of-range values clamp silently to the valid range. Operates on top-level layers only; nested layers inside group layers are not yet supported.
+
+### Internal
+- All four bridge handlers use `Map.Layers` directly (not `OfType<FeatureLayer>` like the older `count_features`/`zoom_to_layer` handlers) so they apply to raster layers, web layers, group layers, and basemap layers — not just feature layers.
+- Position clamping in `move_layer` is silent rather than erroring. Rationale: an LLM saying "move it to the top" passes 0 reliably, but "to the bottom" might count nodes wrong and pass `Count` instead of `Count-1`. Clamping turns these near-misses into the intended behavior rather than confusing errors.
+
+---
+
 ## [Release Pipeline + Remote MCP + Trimming] — 2026-05-11
 
 Wrapped a sequence of three releases (`v0.1.0` → `v0.2.0` → `v0.3.0`) that took the project from a "build locally and copy files" workflow to a published GitHub release pipeline serving a remote-reachable, trimmed self-contained MCP server. The motivating use case is wiring the MCP server up to M365 Copilot Studio (which requires HTTPS reachability and authentication).

@@ -204,6 +204,117 @@ namespace APBridgeAddIn
                 case "pro.clearSelection":
                     return await HandleClearSelection(req.Args);
 
+                case "pro.removeLayer":
+                {
+                    if (req.Args == null ||
+                        !req.Args.TryGetValue("layer", out string? layerName) ||
+                        string.IsNullOrWhiteSpace(layerName))
+                        return new(false, "arg 'layer' required", null);
+
+                    // Search Map.Layers (not OfType<FeatureLayer>) so we can
+                    // remove any layer type — raster, web, group, basemap, etc.
+                    var result = await QueuedTask.Run<object?>(() =>
+                    {
+                        var map = MapView.Active?.Map;
+                        if (map == null) return null;
+                        var layer = map.Layers
+                            .FirstOrDefault(l => l.Name.Equals(layerName, StringComparison.OrdinalIgnoreCase));
+                        if (layer == null) return null;
+                        var actualName = layer.Name;
+                        map.RemoveLayer(layer);
+                        return (object)new { removed = actualName };
+                    });
+
+                    if (result == null)
+                        return new(false, $"Layer not found: {layerName}", null);
+                    return new(true, null, result);
+                }
+
+                case "pro.renameLayer":
+                {
+                    if (req.Args == null ||
+                        !req.Args.TryGetValue("layer", out string? layerName) ||
+                        string.IsNullOrWhiteSpace(layerName) ||
+                        !req.Args.TryGetValue("newName", out string? newName) ||
+                        string.IsNullOrWhiteSpace(newName))
+                        return new(false, "args 'layer' and 'newName' required", null);
+
+                    var result = await QueuedTask.Run<object?>(() =>
+                    {
+                        var map = MapView.Active?.Map;
+                        if (map == null) return null;
+                        var layer = map.Layers
+                            .FirstOrDefault(l => l.Name.Equals(layerName, StringComparison.OrdinalIgnoreCase));
+                        if (layer == null) return null;
+                        var oldName = layer.Name;
+                        layer.SetName(newName);
+                        // Pro may auto-uniquify if newName conflicts (e.g. 'Foo' → 'Foo (2)');
+                        // surface the actual post-rename name so the agent sees ground truth.
+                        return (object)new { renamed = new { from = oldName, to = layer.Name } };
+                    });
+
+                    if (result == null)
+                        return new(false, $"Layer not found: {layerName}", null);
+                    return new(true, null, result);
+                }
+
+                case "pro.setLayerVisibility":
+                {
+                    if (req.Args == null ||
+                        !req.Args.TryGetValue("layer", out string? layerName) ||
+                        string.IsNullOrWhiteSpace(layerName) ||
+                        !req.Args.TryGetValue("visible", out string? visStr))
+                        return new(false, "args 'layer' and 'visible' required", null);
+                    if (!bool.TryParse(visStr, out bool visible))
+                        return new(false, $"arg 'visible' must be 'true' or 'false', got '{visStr}'", null);
+
+                    var result = await QueuedTask.Run<object?>(() =>
+                    {
+                        var map = MapView.Active?.Map;
+                        if (map == null) return null;
+                        var layer = map.Layers
+                            .FirstOrDefault(l => l.Name.Equals(layerName, StringComparison.OrdinalIgnoreCase));
+                        if (layer == null) return null;
+                        layer.SetVisibility(visible);
+                        return (object)new { layer = layer.Name, visible };
+                    });
+
+                    if (result == null)
+                        return new(false, $"Layer not found: {layerName}", null);
+                    return new(true, null, result);
+                }
+
+                case "pro.moveLayer":
+                {
+                    if (req.Args == null ||
+                        !req.Args.TryGetValue("layer", out string? layerName) ||
+                        string.IsNullOrWhiteSpace(layerName) ||
+                        !req.Args.TryGetValue("position", out string? posStr))
+                        return new(false, "args 'layer' and 'position' required", null);
+                    if (!int.TryParse(posStr, NumberStyles.Integer, CultureInfo.InvariantCulture, out int position))
+                        return new(false, $"arg 'position' must be an integer, got '{posStr}'", null);
+
+                    var result = await QueuedTask.Run<object?>(() =>
+                    {
+                        var map = MapView.Active?.Map;
+                        if (map == null) return null;
+                        var topLayers = map.Layers;
+                        var layer = topLayers
+                            .FirstOrDefault(l => l.Name.Equals(layerName, StringComparison.OrdinalIgnoreCase));
+                        if (layer == null) return null;
+                        // 0 = topmost. Clamp out-of-range silently rather than erroring;
+                        // an LLM saying "move it to the top" might pass 0 reliably but
+                        // "to the bottom" might miscount and pass Count or Count-1.
+                        int clamped = Math.Max(0, Math.Min(position, topLayers.Count - 1));
+                        map.MoveLayer(layer, clamped);
+                        return (object)new { moved = new { layer = layer.Name, position = clamped } };
+                    });
+
+                    if (result == null)
+                        return new(false, $"Layer not found: {layerName}", null);
+                    return new(true, null, result);
+                }
+
                 case "pro.getProjectInfo":
                     return await HandleGetProjectInfo();
 

@@ -1,6 +1,6 @@
 # ArcGIS Pro MCP Bridge
 
-An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that lets MCP clients — Claude Code, GitHub Copilot Agent Mode, M365 Copilot Studio, Anthropic API integrations, anything that speaks MCP — drive **ArcGIS Pro** in real time. The server brokers calls over a named pipe to an in-process Pro Add-In, exposing 33 tools spanning map operations, project lifecycle, geoprocessing, ModelBuilder, and layout production.
+An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that lets MCP clients — Claude Code, GitHub Copilot Agent Mode, M365 Copilot Studio, Anthropic API integrations, anything that speaks MCP — drive **ArcGIS Pro** in real time. The server brokers calls over a named pipe to an in-process Pro Add-In, exposing 37 tools spanning map operations, project lifecycle, geoprocessing, ModelBuilder, and layout production.
 
 Two transports are supported in the same binary:
 - **stdio** (default) — for local clients that spawn the server as a subprocess (`.mcp.json` in Claude Code, etc.)
@@ -83,6 +83,10 @@ All tools return JSON strings. Success returns the operation's data payload; fai
 | `clear_selection` | Clear selection on one layer or all layers |
 | `add_layer_from_url` | Add a layer from a service URL |
 | `add_layer_from_file` | Add a layer from a file path (.shp, .gdb FC, raster) |
+| `remove_layer` | Remove a layer from the TOC (does not delete underlying data) |
+| `rename_layer` | Rename a layer; Pro auto-uniquifies on conflict |
+| `set_layer_visibility` | Show or hide a layer without removing it |
+| `move_layer` | Move a layer to a new 0-based position in the TOC |
 | `export_layer` | Export to feature class or shapefile |
 
 ### Project lifecycle
