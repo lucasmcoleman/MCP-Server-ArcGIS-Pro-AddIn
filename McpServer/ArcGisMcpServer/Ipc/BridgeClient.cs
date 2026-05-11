@@ -135,12 +135,12 @@ namespace ArcGisMcpServer.Ipc
                 { AutoFlush = true };
 
             await writer.WriteLineAsync(
-                JsonSerializer.Serialize(req).AsMemory(), ct);
+                JsonSerializer.Serialize(req, McpJsonContext.Default.IpcRequest).AsMemory(), ct);
 
             var line = await reader.ReadLineAsync(ct);
             if (line is null) throw new IOException("bridge closed without response");
 
-            return JsonSerializer.Deserialize<IpcResponse>(line)
+            return JsonSerializer.Deserialize(line, McpJsonContext.Default.IpcResponse)
                 ?? new IpcResponse(false, "deserialize returned null", null);
         }
 
