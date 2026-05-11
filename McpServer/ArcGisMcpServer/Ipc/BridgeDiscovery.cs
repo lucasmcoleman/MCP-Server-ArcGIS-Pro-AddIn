@@ -66,7 +66,7 @@ namespace ArcGisMcpServer.Ipc
             foreach (var file in Directory.EnumerateFiles(Dir, "*.json"))
             {
                 BridgeEntry? entry = null;
-                try { entry = JsonSerializer.Deserialize<BridgeEntry>(File.ReadAllText(file)); }
+                try { entry = JsonSerializer.Deserialize(File.ReadAllText(file), McpJsonContext.Default.BridgeEntry); }
                 catch { /* corrupt file; skip */ }
                 if (entry == null || string.IsNullOrWhiteSpace(entry.PipeName)) continue;
 

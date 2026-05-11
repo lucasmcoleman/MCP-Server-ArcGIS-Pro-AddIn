@@ -6,8 +6,11 @@ using System.Text.Json;
 namespace ArcGisMcpServer.Tools
 {
 
+    // Class is non-static (despite all members being static) so MCP SDK's
+    // generic WithTools<T>() registration can take it as a type argument —
+    // that overload is trim-safe; WithToolsFromAssembly() is not.
     [McpServerToolType]
-    public static class ProTools
+    public class ProTools
     {
         private static BridgeClient? _client;
         public static void Configure(BridgeClient client) => _client = client;
@@ -516,18 +519,24 @@ namespace ArcGisMcpServer.Tools
 
         // ─── Helpers ─────────────────────────────────────────────────────
 
-        private static readonly JsonSerializerOptions _jsonOpts = new() { WriteIndented = true };
-
         /// <summary>
         /// Serializes a bridge response as a JSON string. On success returns the raw data;
         /// on failure returns a structured error payload so the model can see what went wrong
         /// (the MCP SDK swallows thrown exception messages, leaving only a generic wrapper).
         /// </summary>
-        private static string FormatResult(IpcResponse r, string op) =>
-            r.Ok
-                ? JsonSerializer.Serialize(r.Data, _jsonOpts)
-                : JsonSerializer.Serialize(
-                    new { success = false, op, error = r.Error ?? "<empty>" },
-                    _jsonOpts);
+        private static string FormatResult(IpcResponse r, string op)
+        {
+            if (!r.Ok)
+                return JsonSerializer.Serialize(
+                    new FormatErrorPayload(false, op, r.Error ?? "<empty>"),
+                    IndentedJsonContext.Default.FormatErrorPayload);
+
+            // r.Ok=true: bridge returned successfully. Data is normally a real
+            // JsonElement; null only occurs for side-effect-only ops that don't
+            // produce a payload, in which case we surface the literal "null".
+            return r.Data is JsonElement data
+                ? JsonSerializer.Serialize(data, IndentedJsonContext.Default.JsonElement)
+                : "null";
+        }
     }
 }
