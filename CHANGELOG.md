@@ -6,15 +6,19 @@ This project is a hardened fork/evolution of [nicogis/MCP-Server-ArcGIS-Pro-AddI
 
 ---
 
-## [Dev script: full close-restart cycle automated] — 2026-05-11
+## [Layer Lifecycle Tools] — 2026-05-11
+
+Closes a small but meaningful gap surfaced by interactive Copilot Studio use: the original tool set had `add_layer_from_*` to bring data into the map, but no way to remove, rename, hide, or reorder layers after the fact. Easy to overlook in transactional stdio workflows; obvious when conversational agents want to iterate.
 
 ### Added
-- **`restart-dev-cycle.ps1` now also builds and deploys the Pro Add-In.** Previously it wiped the AssemblyCache and rebuilt the MCP server, but users had to invoke MSBuild and copy the `.esriAddinX` into the AddIns folder by hand. This caused a silent failure mode: a fresh bundle could sit in `bin/Release` while Pro launched the cached old DLL because nothing deployed it. The script now: (1) verifies Pro and `ArcGisMcpServer.exe` are closed, (2) locates MSBuild via `vswhere` and rebuilds the Add-In, (3) wipes the AssemblyCache, (4) copies the freshly-built `.esriAddinX` into `%USERPROFILE%\Documents\ArcGIS\AddIns\ArcGISPro\{GUID}\`, (5) rebuilds the MCP server.
+- **`remove_layer`** — removes a layer from the active map's Table of Contents by name. Removes the TOC reference only; the underlying feature class on disk is not deleted (use `run_gp_tool management.Delete` for that). Works on any layer type, not just feature layers.
+- **`rename_layer`** — renames a layer in the active map. If the new name conflicts with an existing layer, Pro auto-uniquifies (e.g., 'Foo' → 'Foo (2)') and the returned `to` value reflects the actual post-rename name.
+- **`set_layer_visibility`** — show or hide a layer without removing it from the TOC. Useful when staging a map for export.
+- **`move_layer`** — reorder a layer in the TOC. Position is 0-based (0 is topmost); out-of-range values clamp silently to the valid range. Operates on top-level layers only; nested layers inside group layers are not yet supported.
 
 ### Internal
-- **Step ordering is build → wipe → deploy → MCP-rebuild** specifically so a build failure (step 2) bails before the cache wipe (step 3). The prior cache stays intact and the next Pro launch still works with the previously-deployed Add-In — failures don't degrade Pro's working state.
-- Uses `vswhere -latest -products * -requires Microsoft.Component.MSBuild -find 'MSBuild\**\Bin\MSBuild.exe'` to locate MSBuild rather than hard-coding the VS 2022 path; survives VS upgrades and edition swaps (Community/Professional/Build Tools).
-- README's "28 first-class tools" line corrected to "33" — leftover inconsistency from the trim-refactor doc pass that updated the intro paragraph but missed the "What it does" bullet.
+- All four bridge handlers use `Map.Layers` directly (not `OfType<FeatureLayer>` like the older `count_features`/`zoom_to_layer` handlers) so they apply to raster layers, web layers, group layers, and basemap layers — not just feature layers.
+- Position clamping in `move_layer` is silent rather than erroring. Rationale: an LLM saying "move it to the top" passes 0 reliably, but "to the bottom" might count nodes wrong and pass `Count` instead of `Count-1`. Clamping turns these near-misses into the intended behavior rather than confusing errors.
 
 ---
 

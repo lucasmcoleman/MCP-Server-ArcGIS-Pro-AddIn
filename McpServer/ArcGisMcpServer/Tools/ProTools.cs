@@ -97,6 +97,68 @@ namespace ArcGisMcpServer.Tools
         }
 
         [McpServerTool, Description(
+            "Remove a layer from the active map's Table of Contents by name. " +
+            "Removes the TOC reference only — the underlying feature class, raster, " +
+            "or service is NOT deleted from disk. To delete data, use run_gp_tool " +
+            "with management.Delete instead.")]
+        public static async Task<string> RemoveLayer(
+            [Description("Name of the layer to remove, matching what list_layers returns")] string layer)
+        {
+            var r = await _client!.OpAsync("pro.removeLayer", new() { ["layer"] = layer });
+            return FormatResult(r, "pro.removeLayer");
+        }
+
+        [McpServerTool, Description(
+            "Rename a layer in the active map. If the new name conflicts with an " +
+            "existing layer, ArcGIS Pro may auto-uniquify (e.g., 'Foo' becomes " +
+            "'Foo (2)') — the returned 'to' value reflects the actual post-rename name.")]
+        public static async Task<string> RenameLayer(
+            [Description("Current layer name, matching what list_layers returns")] string layer,
+            [Description("New name for the layer")] string newName)
+        {
+            var r = await _client!.OpAsync("pro.renameLayer", new()
+            {
+                ["layer"] = layer,
+                ["newName"] = newName
+            });
+            return FormatResult(r, "pro.renameLayer");
+        }
+
+        [McpServerTool, Description(
+            "Show or hide a layer in the active map without removing it from the TOC. " +
+            "Useful when staging a map for export: hide reference layers, show analysis " +
+            "outputs, export, then restore.")]
+        public static async Task<string> SetLayerVisibility(
+            [Description("Layer name, matching what list_layers returns")] string layer,
+            [Description("true to show the layer, false to hide it")] bool visible)
+        {
+            var r = await _client!.OpAsync("pro.setLayerVisibility", new()
+            {
+                ["layer"] = layer,
+                ["visible"] = visible.ToString().ToLowerInvariant()
+            });
+            return FormatResult(r, "pro.setLayerVisibility");
+        }
+
+        [McpServerTool, Description(
+            "Move a layer to a new position in the active map's Table of Contents. " +
+            "Position is 0-based: 0 is topmost, higher numbers are below. " +
+            "Out-of-range values are clamped silently to the valid range. " +
+            "Operates on top-level layers only; nested layers inside group layers " +
+            "are not supported in this version.")]
+        public static async Task<string> MoveLayer(
+            [Description("Layer name, matching what list_layers returns")] string layer,
+            [Description("Target 0-based position. 0 = topmost.")] int position)
+        {
+            var r = await _client!.OpAsync("pro.moveLayer", new()
+            {
+                ["layer"] = layer,
+                ["position"] = position.ToString(System.Globalization.CultureInfo.InvariantCulture)
+            });
+            return FormatResult(r, "pro.moveLayer");
+        }
+
+        [McpServerTool, Description(
             "Get the current extent (viewport) of the active map view. " +
             "Returns xmin/ymin/xmax/ymax, width/height, and the spatial reference WKID.")]
         public static async Task<string> GetCurrentExtent()
