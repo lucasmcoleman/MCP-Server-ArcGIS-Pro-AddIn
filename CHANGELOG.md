@@ -39,6 +39,19 @@ Closes a small but meaningful gap surfaced by interactive Copilot Studio use: th
 
 ---
 
+## [Dev script: full close-restart cycle automated] — 2026-05-11
+
+### Added
+- **`restart-dev-cycle.ps1` now handles the full close-restart cycle end-to-end.** Previously it wiped the AssemblyCache and rebuilt the MCP server, but users had to invoke MSBuild, copy the `.esriAddinX` into the AddIns folder, and (separately) keep the HTTP server's exe in sync — all by hand. The script now: (1) verifies Pro is closed, (2) stops the `ArcGisMcpServer-HTTP` scheduled task if running, (3) verifies no other `ArcGisMcpServer.exe` is held by Claude Code, (4) locates MSBuild via `vswhere` and rebuilds the Add-In, (5) wipes the AssemblyCache, (6) copies the freshly-built `.esriAddinX` into `%USERPROFILE%\Documents\ArcGIS\AddIns\ArcGISPro\{GUID}\`, (7) rebuilds the MCP server in `publish/`, (8) syncs `publish-http/` from `publish/` so the Copilot Studio path runs the same code, (9) restarts the HTTP scheduled task. Pro restart + Claude Code restart afterwards are the only remaining manual steps.
+
+### Internal
+- **Step ordering is build → wipe → deploy → MCP-rebuild → HTTP-sync** specifically so a build failure (step 4) bails before the cache wipe (step 5). The prior cache stays intact and the next Pro launch still works with the previously-deployed Add-In — failures don't degrade Pro's working state.
+- If the script bails between steps 2 (HTTP task stopped) and 9 (HTTP task restarted), it auto-restarts the task on the failure-exit path so Copilot Studio is never left in a worse state than before the script ran.
+- Uses `vswhere -latest -products * -requires Microsoft.Component.MSBuild -find 'MSBuild\**\Bin\MSBuild.exe'` to locate MSBuild rather than hard-coding the VS 2022 path; survives VS upgrades and edition swaps (Community/Professional/Build Tools).
+- README's "28 first-class tools" line corrected to "33" earlier in the day — leftover inconsistency from the trim-refactor doc pass that updated the intro paragraph but missed the "What it does" bullet.
+
+---
+
 ## [Release Pipeline + Remote MCP + Trimming] — 2026-05-11
 
 Wrapped a sequence of three releases (`v0.1.0` → `v0.2.0` → `v0.3.0`) that took the project from a "build locally and copy files" workflow to a published GitHub release pipeline serving a remote-reachable, trimmed self-contained MCP server. The motivating use case is wiring the MCP server up to M365 Copilot Studio (which requires HTTPS reachability and authentication).
