@@ -26,15 +26,16 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
-      - name: Publish single-file exe
+      - name: Publish single-file exe (self-contained, trimmed)
         id: publish
         shell: pwsh
         run: |
           dotnet publish McpServer/ArcGisMcpServer/ArcGisMcpServer.csproj `
             -c Release `
             -r win-x64 `
-            --self-contained false `
+            --self-contained true `
             -p:PublishSingleFile=true `
+            -p:PublishTrimmed=true `
             -o McpServer/ArcGisMcpServer/publish
           $exe = "McpServer/ArcGisMcpServer/publish/ArcGisMcpServer.exe"
           if (-not (Test-Path $exe)) { throw "Publish output missing: $exe" }
