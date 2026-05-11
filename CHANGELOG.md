@@ -6,6 +6,36 @@ This project is a hardened fork/evolution of [nicogis/MCP-Server-ArcGIS-Pro-AddI
 
 ---
 
+## [Release Pipeline + Remote MCP + Trimming] — 2026-05-11
+
+Wrapped a sequence of three releases (`v0.1.0` → `v0.2.0` → `v0.3.0`) that took the project from a "build locally and copy files" workflow to a published GitHub release pipeline serving a remote-reachable, trimmed self-contained MCP server. The motivating use case is wiring the MCP server up to M365 Copilot Studio (which requires HTTPS reachability and authentication).
+
+### Added — v0.1.0 (CI release pipeline)
+- **`.github/workflows/release.yml`** — tag-triggered (`v*`) workflow that publishes the MCP server exe and creates a draft GitHub release with auto-generated release notes + `SHA256SUMS.txt`. ([`6ab5537`](../../commit/6ab5537))
+- **Conditional Add-In build job** gated on a self-hosted Windows runner with the `arcgis-pro` label and `vars.HAS_ARCGIS_RUNNER == 'true'`. Skipped on GitHub-hosted runners (no Pro SDK installed); when a self-hosted runner is registered, this job adds the `.esriAddinX` to the release automatically. Until then, the bundle is built locally and uploaded with `gh release upload`.
+
+### Added — v0.2.0 (HTTP transport for M365 Copilot Studio)
+- **Streamable HTTP transport** alongside the existing stdio transport. Opt-in via `--http` flag or `MCP_TRANSPORT=http` env var; stdio remains the default so local clients (Claude Code, etc.) keep working unchanged. The server hosts MCP at `/mcp` on `0.0.0.0:5000` by default (override with `ASPNETCORE_URLS`). ([`5ba74d6`](../../commit/5ba74d6))
+- **`X-Api-Key` bearer-token auth middleware** — HTTP mode requires `MCP_AUTH_TOKEN` env var and refuses to start without it. Every request must carry a matching `X-Api-Key` header; comparison is constant-time. An unauthenticated request returns 401 before reaching the MCP transport.
+- **Deployment alongside existing SWAG/nginx reverse proxy** — published at `https://arcgis-mcp.lucascoleman.me` via the home server's existing wildcard cert. nginx config requires `proxy_buffering off` + generous `proxy_read_timeout` because Streamable HTTP can promote a response into a long-lived SSE stream during tool calls.
+
+### Added — v0.3.0 (Trim-safe build)
+- **Self-contained trimmed single-file publish** (`--self-contained true -p:PublishTrimmed=true`) shrinks the MCP server exe from 92.7 MB → 21.4 MB (~77% reduction) and removes the .NET 8 runtime install requirement on end-user machines. ([`b140ae1`](../../commit/b140ae1))
+- **Source-generated `System.Text.Json` contexts** — `McpJsonContext` (compact, for line-delimited IPC over named pipe) and `IndentedJsonContext` (pretty, for tool output). Both registered in `Ipc/IpcModels.cs`.
+- **`<IsTrimmable>true</IsTrimmable>` + `<EnableTrimAnalyzer>true</EnableTrimAnalyzer>`** in the csproj — trim warnings now surface during normal `dotnet build`, not just at publish time. Future code that introduces reflection-based JSON or other non-trim-safe patterns will be caught at edit time.
+- **`FormatErrorPayload` record** replaces the anonymous type previously used in `ProTools.FormatResult`'s failure branch (anonymous types are fundamentally incompatible with source-gen).
+- **`IpcResponse.Data`** changed from `object?` to `JsonElement?` — preserves any JSON shape from the bridge while being trim-safe (`JsonElement` has built-in trim-annotated serialization).
+- **`WithTools<ProTools>()`** replaces both `WithToolsFromAssembly(typeof(ProTools).Assembly)` calls in `Program.cs`. `ProTools` is no longer `static` (methods stay static) so the generic registration can take it as a type argument — the generic overload is trim-safe; assembly scanning is not.
+
+### Fixed
+- **Anonymous-type return shape change in `ProTools.FormatResult`** — the previous `new { success, op, error }` payload was structurally identical to the new `FormatErrorPayload` record on the wire (same JSON keys, same values), so this is binary-compatible with existing MCP clients that parse the JSON.
+
+### Notes
+- **End-user install simpler**: `ArcGisMcpServer.exe` now runs on a clean Windows box without requiring .NET 8 SDK or runtime to be installed.
+- **`get_active_map_name`** verified end-to-end against a live ArcGIS Pro session post-trim: MCP transport → `WithTools<ProTools>` invocation → BridgeClient `IpcRequest` source-gen serialization → named pipe round trip → `IpcResponse` deserialization with `JsonElement Data` → `IndentedJsonContext` output formatting all work under trim.
+
+---
+
 ## [Schema Completeness] — 2026-04-27
 
 Closes the remaining gap in the model-creation API: agents can now declare `GPComposite` parameter types with their accepted subtypes, matching what Pro's GUI writes when you drag-create a parameter from a composite slot (e.g., `CalculateField.in_table`, `AddJoin.in_layer_or_view`, `Sort.in_dataset`).

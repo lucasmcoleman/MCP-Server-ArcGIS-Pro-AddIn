@@ -1,6 +1,10 @@
 # ArcGIS Pro MCP Bridge
 
-An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that lets MCP clients — Claude Code, GitHub Copilot Agent Mode, Anthropic API integrations, anything that speaks MCP — drive **ArcGIS Pro** in real time. The server brokers calls over a named pipe to an in-process Pro Add-In, exposing 28 tools spanning map operations, project lifecycle, geoprocessing, ModelBuilder, and layout production.
+An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that lets MCP clients — Claude Code, GitHub Copilot Agent Mode, M365 Copilot Studio, Anthropic API integrations, anything that speaks MCP — drive **ArcGIS Pro** in real time. The server brokers calls over a named pipe to an in-process Pro Add-In, exposing 33 tools spanning map operations, project lifecycle, geoprocessing, ModelBuilder, and layout production.
+
+Two transports are supported in the same binary:
+- **stdio** (default) — for local clients that spawn the server as a subprocess (`.mcp.json` in Claude Code, etc.)
+- **Streamable HTTP** — opt-in via `--http` or `MCP_TRANSPORT=http`, for remote clients like M365 Copilot Studio that require an HTTPS endpoint. Includes constant-time `X-Api-Key` authentication.
 
 ---
 
@@ -144,14 +148,22 @@ Three patterns cover most cases:
 
 ## Prerequisites
 
+### To run the published exe (end users)
+
 | Component | Version | Notes |
 |---|---|---|
-| ArcGIS Pro | 3.6+ (`desktopVersion=3.6.59527` in `Config.daml`) | The Pro SDK targets the running Pro version |
+| Windows | 10/11 x64 | Published exe is self-contained; no .NET 8 runtime install needed |
+| ArcGIS Pro | 3.6+ | Bridge Add-In requires Pro 3.6+ (`desktopVersion=3.6.59527` in `Config.daml`) |
+| MCP client | Claude Code, Copilot Agent Mode, Claude Desktop, M365 Copilot Studio, etc. | Anything that speaks MCP stdio or Streamable HTTP |
+
+### To build from source (developers)
+
+| Component | Version | Notes |
+|---|---|---|
 | ArcGIS Pro SDK for .NET | matching Pro version | Installs as a VS extension |
 | Visual Studio 2022 | 17.14+ for MCP Agent Mode in Copilot, any 17.x for Add-In dev | MSBuild from VS is required for the Add-In (NOT `dotnet build`) |
-| .NET 8 SDK | 8.0+ | For the MCP server |
+| .NET 8 SDK | 8.0+ | For building the MCP server |
 | PowerShell | `pwsh` 7+ | For build scripts |
-| MCP client | Claude Code, Copilot Agent Mode, Claude Desktop, etc. | Anything that speaks MCP stdio |
 
 ---
 
@@ -180,15 +192,17 @@ The GUID is the `AddInInfo id` from `Config.daml` — stable across builds. Pro 
 
 ### 2. MCP Server (`McpServer/ArcGisMcpServer/`)
 
-A single-file publish via the helper script:
+A single-file, self-contained, trimmed publish via the helper script:
 
 ```powershell
 pwsh ./build-mcp-server.ps1
 ```
 
-This runs `dotnet publish ... -p:PublishSingleFile=true` to produce `McpServer/ArcGisMcpServer/publish/ArcGisMcpServer.exe`. The `.mcp.json` at the repo root points directly at this exe — no `dotnet run` wrapper, faster cold start.
+This runs `dotnet publish --self-contained true -p:PublishSingleFile=true -p:PublishTrimmed=true` to produce `McpServer/ArcGisMcpServer/publish/ArcGisMcpServer.exe` (~21 MB). The `.mcp.json` at the repo root points directly at this exe — no `dotnet run` wrapper, faster cold start. Because the build is self-contained, the resulting exe runs on Windows machines without any .NET install.
 
-The script refuses to run if `ArcGisMcpServer.exe` is currently running (any Claude Code session attached holds the file lock).
+The script refuses to run if `ArcGisMcpServer.exe` is currently running (any Claude Code session attached holds the file lock). Close attached MCP clients first.
+
+The csproj has `<EnableTrimAnalyzer>true</EnableTrimAnalyzer>`, so any new code that introduces reflection-based JSON serialization (or other non-trim-safe patterns) will surface as an `IL2026` warning during normal `dotnet build`. Keep warnings at zero; the patterns in `Ipc/IpcModels.cs` (`McpJsonContext`/`IndentedJsonContext` source-gen) show how to register new types.
 
 ### 3. The close-restart cycle
 
@@ -239,6 +253,9 @@ Tunable from the `env` block of `.mcp.json` or the parent shell:
 
 | Variable | Default | Purpose |
 |---|---|---|
+| `MCP_TRANSPORT` | _(unset)_ | Set to `http` (or pass `--http` flag) to bind Streamable HTTP at `/mcp`. Default is stdio. |
+| `MCP_AUTH_TOKEN` | _(required in HTTP mode)_ | Bearer token expected in the `X-Api-Key` header. Server refuses to start in HTTP mode without it. Use a 256-bit random string. |
+| `ASPNETCORE_URLS` | `http://0.0.0.0:5000` | HTTP listen URL(s). Override to bind loopback-only (`http://127.0.0.1:5000`) when running behind a same-host proxy. |
 | `ARCGIS_MCP_PIPE_NAME` | _(unset)_ | Hard-code the pipe name, bypassing discovery. Use only for containers / non-standard deployments. |
 | `ARCGIS_PROJECT` | _(unset)_ | When set, discovery prefers a bridge whose `projectName` matches (case-insensitive). Lets a Claude session pin to a specific .aprx. |
 | `ARCGIS_MCP_MAX_RETRIES` | `3` | Retries after the first attempt (for transient errors only — timeouts no longer retry, see below) |
@@ -273,6 +290,114 @@ The MCP server will pick a bridge whose live registry entry matches `MyProject.a
 "env": { "ARCGIS_MCP_PIPE_NAME": "ArcGisProBridge_12345" }
 ```
 Skips discovery entirely. Use sparingly; the per-request rediscovery is what makes Pro restarts transparent.
+
+---
+
+## Remote MCP (HTTP transport) for M365 Copilot Studio
+
+The MCP server can expose itself over Streamable HTTP for remote clients that can't spawn a local subprocess — most notably **M365 Copilot Studio**, whose connectors call out from Microsoft's cloud and need a public HTTPS endpoint.
+
+### Topology
+
+```
+M365 Copilot Studio (cloud)
+        ↓ HTTPS (X-Api-Key header)
+   yoursite.example.com  ← your reverse proxy (nginx/SWAG/Caddy)
+                          terminates TLS, holds the Let's Encrypt cert
+        ↓ HTTP (LAN)
+   <Pro-machine-IP>:5000  ← ArcGisMcpServer.exe --http
+        ↓ named pipe
+   ArcGIS Pro + APBridgeAddIn
+```
+
+The MCP server must stay on the same machine as ArcGIS Pro (the named-pipe IPC can't traverse hosts). Use a reverse proxy on a separate always-on box (or a tunnel like Cloudflare Tunnel / Azure Dev Tunnels) to give the LAN-bound MCP server a public HTTPS face.
+
+### Server side: starting in HTTP mode
+
+```powershell
+# Generate a strong token once, save in your password manager
+$bytes = New-Object byte[] 32
+[System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+$token = [Convert]::ToBase64String($bytes)
+Write-Output $token   # paste into password manager
+
+# Persist for future processes
+[Environment]::SetEnvironmentVariable("MCP_AUTH_TOKEN", $token, "User")
+
+# Launch (token is auto-inherited by new shells; older shells need a refresh)
+$env:MCP_AUTH_TOKEN = $token
+McpServer\ArcGisMcpServer\publish\ArcGisMcpServer.exe --http
+```
+
+The server will refuse to start if `MCP_AUTH_TOKEN` is unset. Default bind is `http://0.0.0.0:5000`; override with `ASPNETCORE_URLS=http://127.0.0.1:5000` to bind loopback-only when the proxy is on the same host.
+
+### Windows Firewall
+
+Open inbound TCP 5000 only from the reverse-proxy host's IP:
+
+```powershell
+New-NetFirewallRule `
+    -DisplayName "ArcGIS MCP Server (proxy inbound)" `
+    -Direction Inbound -Action Allow `
+    -Protocol TCP -LocalPort 5000 `
+    -RemoteAddress <proxy-host-ip> `
+    -Profile Any
+```
+
+Defense in depth: the `-RemoteAddress` constraint silently drops packets from any other source. Only your reverse-proxy host can reach the MCP listener.
+
+### nginx (SWAG) example
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name arcgis-mcp.example.com;
+    include /config/nginx/ssl.conf;
+
+    # MCP Streamable HTTP can promote any POST response into a long-lived SSE
+    # stream for server-to-client push. Buffering off + generous timeout are
+    # both required — without them, the connection appears frozen until tool
+    # calls complete, breaking the client's expectation of incremental responses.
+    proxy_buffering off;
+    proxy_request_buffering off;
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+    client_max_body_size 0;
+
+    location / {
+        include /config/nginx/proxy.conf;
+        proxy_pass http://<pro-machine-lan-ip>:5000;
+    }
+}
+```
+
+`proxy_buffering off` is mandatory, not optional — Streamable HTTP responses can stay open for the duration of a tool call.
+
+### Copilot Studio wizard
+
+In Copilot Studio: **agent → Tools → Add a tool → Model Context Protocol** (the onboarding wizard, *not* the Power Apps custom connector path):
+
+- **Server URL**: `https://your-subdomain.example.com/mcp`
+- **Authentication**: API key
+  - **Type**: Header
+  - **Header name**: `X-Api-Key`
+  - **Value**: paste the token you generated above
+
+The wizard verifies the connection by issuing a real `initialize` handshake against your endpoint. If it succeeds you'll see your tool list populate. **Generative orchestration must be enabled on the agent** — classic dialog flows can't call MCP tools.
+
+### Smoke test
+
+From any machine with the token:
+
+```bash
+curl --max-time 15 -X POST https://your-subdomain.example.com/mcp \
+  -H "X-Api-Key: <token>" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  --data '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"smoketest","version":"0.0.1"}}}'
+```
+
+Expected: HTTP 200, SSE body containing `"serverInfo":{"name":"ArcGisMcpServer"...}`. Verify auth is enforced by sending the same request without the `X-Api-Key` header — expect 401.
 
 ---
 
