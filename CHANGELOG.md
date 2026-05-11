@@ -6,6 +6,23 @@ This project is a hardened fork/evolution of [nicogis/MCP-Server-ArcGIS-Pro-AddI
 
 ---
 
+## [Layer Introspection Primitives] — 2026-05-11
+
+Adds four read-side primitives the agent was missing: ways to inspect a layer's schema, properties, attribute values, and current selection from a chat reply. Surfaced as a gap when reviewing the Network Analyst Route tutorial — the agent could compute a shortest route via `run_gp_tool('na.Solve', …)` but had no way to return the turn-by-turn `DirectionPoints` to the user. The four new tools generalize beyond that case: any "what fields exist on this layer," "tell me about this layer," "show me the first N rows," or "what's currently selected" question now has a direct answer.
+
+### Added
+- **`list_fields(layer)`** — returns each field's name, alias, type, length, isNullable, isEditable. Use before crafting `select_by_attribute` WHERE clauses or `run_gp_tool` calls that take field-name parameters.
+- **`get_layer_properties(layer)`** — returns layer type (FeatureLayer/RasterLayer/etc.), data source path, spatial reference (wkid + name), extent, visibility, geometry type, and feature count. Useful as a first-look "tell me about this layer" query before deciding what operations apply.
+- **`read_layer_attributes(layer, fields?, where?, orderBy?, limit?)`** — returns up to `limit` rows as JSON; each row is a field-name → value map. Geometry, Blob, and Raster fields are excluded from output. Default `limit` is 50, hard cap 1000. Response includes a `limited: true` flag when more rows exist than were returned.
+- **`get_selected_features(layer, fields?, limit?)`** — same JSON shape as `read_layer_attributes` but auto-scoped to the layer's current `Selection` (uses `Selection.Search()` rather than `FeatureClass.Search`). Closes the loop on `select_by_attribute`: previously the agent knew *how many* features got selected but couldn't see *which* ones without re-querying. Returns empty rows + `selectedTotal: 0` (not an error) when nothing is selected.
+
+### Internal
+- All four handlers use the throw-`InvalidOperationException`-from-QueuedTask pattern (matching `count_features`) so layer-not-found and field-not-found errors surface as structured `{success:false, error: "..."}` responses rather than generic MCP error wrappers.
+- `read_layer_attributes` and `get_selected_features` coerce `DateTime` to ISO 8601 strings and `Guid` to lowercase hex strings before serialization — both have JSON conversion issues if left as-is.
+- Tool count: 37 → 41. New "Layer introspection" domain added to the README's domain count (6 → 7).
+
+---
+
 ## [Layer Lifecycle Tools] — 2026-05-11
 
 Closes a small but meaningful gap surfaced by interactive Copilot Studio use: the original tool set had `add_layer_from_*` to bring data into the map, but no way to remove, rename, hide, or reorder layers after the fact. Easy to overlook in transactional stdio workflows; obvious when conversational agents want to iterate.
