@@ -1,6 +1,6 @@
 # ArcGIS Pro MCP Bridge
 
-An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that lets MCP clients — Claude Code, GitHub Copilot Agent Mode, M365 Copilot Studio, Anthropic API integrations, anything that speaks MCP — drive **ArcGIS Pro** in real time. The server brokers calls over a named pipe to an in-process Pro Add-In, exposing 37 tools spanning map operations, project lifecycle, geoprocessing, ModelBuilder, and layout production.
+An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that lets MCP clients — Claude Code, GitHub Copilot Agent Mode, M365 Copilot Studio, Anthropic API integrations, anything that speaks MCP — drive **ArcGIS Pro** in real time. The server brokers calls over a named pipe to an in-process Pro Add-In, exposing 41 tools spanning layer introspection, map operations, project lifecycle, geoprocessing, ModelBuilder, and layout production.
 
 Two transports are supported in the same binary:
 - **stdio** (default) — for local clients that spawn the server as a subprocess (`.mcp.json` in Claude Code, etc.)
@@ -11,7 +11,7 @@ Two transports are supported in the same binary:
 ## What it does
 
 - **Drive Pro from natural language.** Ask the agent to "buffer the West Coast states by 50 miles, dissolve, calculate area in square miles, then export a PDF" and it chains the right MCP tools together.
-- **33 first-class tools** across 6 domains (full list below). All return structured JSON, not opaque strings — agents can introspect errors and chain operations programmatically.
+- **41 first-class tools** across 7 domains (full list below). All return structured JSON, not opaque strings — agents can introspect errors and chain operations programmatically.
 - **Multi-Pro routing.** Each Pro instance binds a per-PID pipe and writes a registry entry; the MCP server picks the right one (most-recent-started, or by `ARCGIS_PROJECT` env var).
 - **Survives Pro restarts mid-session.** The MCP server re-discovers the live pipe on every request, so closing and reopening Pro doesn't require restarting your MCP client.
 - **Robust error handling.** Silent failures fail loud (`Layer not found: X` instead of `0`); slow operations don't time out prematurely (default 120s); typed-return tools surface bridge errors as structured JSON instead of getting swallowed by the MCP SDK's generic-error wrapper.
@@ -71,6 +71,14 @@ All tools return JSON strings. Success returns the operation's data payload; fai
 | `get_active_map_name` | Name of the active map view |
 | `get_current_extent` | Viewport extent + SR (clamped to ±180/±90 for geographic SRs) |
 | `get_view_diagnostics` | Raw Map/Extent/Camera state — for debugging projection/extent oddities |
+
+### Layer introspection
+| Tool | Purpose |
+|---|---|
+| `list_fields` | Schema of a feature layer: name, alias, type, length, nullable/editable flags |
+| `get_layer_properties` | Layer metadata: type, source path, spatial reference, extent, visibility, feature count, geometry type |
+| `read_layer_attributes` | Read up to N rows of attribute values as JSON; supports `fields`, `where`, `orderBy`, `limit`. Geometry/Blob/Raster fields excluded |
+| `get_selected_features` | Read attribute values of currently-selected features only; same JSON shape as `read_layer_attributes` with added `selectedTotal` count |
 
 ### Map operations
 | Tool | Purpose |

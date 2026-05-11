@@ -195,6 +195,314 @@ namespace APBridgeAddIn
                     return new(true, null, selectionInfo);
                 }
 
+                case "pro.listFields":
+                {
+                    if (req.Args == null ||
+                        !req.Args.TryGetValue("layer", out string? lfLayerName) ||
+                        string.IsNullOrWhiteSpace(lfLayerName))
+                        return new(false, "arg 'layer' required", null);
+
+                    var data = await QueuedTask.Run<object>(() =>
+                    {
+                        var map = MapView.Active?.Map
+                            ?? throw new InvalidOperationException("No active map");
+                        var fl = map.Layers
+                            .OfType<FeatureLayer>()
+                            .FirstOrDefault(l => l.Name.Equals(lfLayerName, StringComparison.OrdinalIgnoreCase))
+                            ?? throw new InvalidOperationException($"Layer not found: {lfLayerName}");
+
+                        using var fc = fl.GetFeatureClass();
+                        var fields = fc.GetDefinition().GetFields()
+                            .Select(f => new
+                            {
+                                name = f.Name,
+                                alias = f.AliasName,
+                                type = f.FieldType.ToString(),
+                                length = f.Length,
+                                isNullable = f.IsNullable,
+                                isEditable = f.IsEditable
+                            })
+                            .ToList();
+
+                        return new { layer = fl.Name, fields };
+                    });
+                    return new(true, null, data);
+                }
+
+                case "pro.getLayerProperties":
+                {
+                    if (req.Args == null ||
+                        !req.Args.TryGetValue("layer", out string? lpLayerName) ||
+                        string.IsNullOrWhiteSpace(lpLayerName))
+                        return new(false, "arg 'layer' required", null);
+
+                    var data = await QueuedTask.Run<object>(() =>
+                    {
+                        var map = MapView.Active?.Map
+                            ?? throw new InvalidOperationException("No active map");
+                        var layer = map.Layers
+                            .FirstOrDefault(l => l.Name.Equals(lpLayerName, StringComparison.OrdinalIgnoreCase))
+                            ?? throw new InvalidOperationException($"Layer not found: {lpLayerName}");
+
+                        // Build properties dict incrementally — different layer types
+                        // expose different things; wrap each accessor in try/catch so
+                        // a missing property (e.g., SR on a basemap) doesn't blow up
+                        // the whole response.
+                        var props = new Dictionary<string, object?>
+                        {
+                            ["name"] = layer.Name,
+                            ["type"] = layer.GetType().Name,
+                            ["isVisible"] = layer.IsVisible
+                        };
+
+                        try
+                        {
+                            var sr = layer.GetSpatialReference();
+                            if (sr != null)
+                                props["spatialReference"] = new { wkid = sr.Wkid, name = sr.Name };
+                        }
+                        catch { }
+
+                        try
+                        {
+                            var extent = layer.QueryExtent();
+                            if (extent != null)
+                                props["extent"] = new
+                                {
+                                    xmin = extent.XMin,
+                                    ymin = extent.YMin,
+                                    xmax = extent.XMax,
+                                    ymax = extent.YMax
+                                };
+                        }
+                        catch { }
+
+                        if (layer is FeatureLayer flProps)
+                        {
+                            try
+                            {
+                                props["geometryType"] = flProps.ShapeType.ToString();
+                                using var fc = flProps.GetFeatureClass();
+                                props["featureCount"] = (int)fc.GetCount();
+                                props["dataSource"] = fc.GetPath()?.ToString();
+                            }
+                            catch { }
+                        }
+
+                        return (object)props;
+                    });
+                    return new(true, null, data);
+                }
+
+                case "pro.readLayerAttributes":
+                {
+                    if (req.Args == null ||
+                        !req.Args.TryGetValue("layer", out string? raLayerName) ||
+                        string.IsNullOrWhiteSpace(raLayerName))
+                        return new(false, "arg 'layer' required", null);
+
+                    req.Args.TryGetValue("fields", out string? fieldsStr);
+                    req.Args.TryGetValue("where", out string? whereClause);
+                    req.Args.TryGetValue("orderBy", out string? orderBy);
+                    int limit = 50;
+                    if (req.Args.TryGetValue("limit", out string? limitStr) &&
+                        int.TryParse(limitStr, NumberStyles.Integer, CultureInfo.InvariantCulture, out int parsedLimit))
+                    {
+                        // Clamp to [1, 1000] to keep responses tractable. Agents
+                        // hitting the upper bound get `limited: true` and can
+                        // narrow with `where` or paginate by ORDER BY + OID range.
+                        limit = Math.Max(1, Math.Min(1000, parsedLimit));
+                    }
+
+                    var requestedFields = string.IsNullOrWhiteSpace(fieldsStr)
+                        ? null
+                        : fieldsStr.Split(',').Select(f => f.Trim()).Where(f => f.Length > 0).ToList();
+
+                    var data = await QueuedTask.Run<object>(() =>
+                    {
+                        var map = MapView.Active?.Map
+                            ?? throw new InvalidOperationException("No active map");
+                        var fl = map.Layers
+                            .OfType<FeatureLayer>()
+                            .FirstOrDefault(l => l.Name.Equals(raLayerName, StringComparison.OrdinalIgnoreCase))
+                            ?? throw new InvalidOperationException($"Layer not found: {raLayerName}");
+
+                        using var fc = fl.GetFeatureClass();
+                        var fcDef = fc.GetDefinition();
+                        var allFields = fcDef.GetFields();
+                        var shapeFieldName = fcDef.GetShapeField();
+
+                        // Output field set: requested fields verbatim (validate
+                        // each exists), or all non-geometry/blob/raster fields.
+                        List<ArcGIS.Core.Data.Field> outputFields;
+                        if (requestedFields == null)
+                        {
+                            outputFields = allFields
+                                .Where(f => !string.Equals(f.Name, shapeFieldName, StringComparison.OrdinalIgnoreCase))
+                                .Where(f => f.FieldType != ArcGIS.Core.Data.FieldType.Blob &&
+                                            f.FieldType != ArcGIS.Core.Data.FieldType.Raster &&
+                                            f.FieldType != ArcGIS.Core.Data.FieldType.Geometry)
+                                .ToList();
+                        }
+                        else
+                        {
+                            outputFields = new List<ArcGIS.Core.Data.Field>();
+                            foreach (var name in requestedFields)
+                            {
+                                var match = allFields.FirstOrDefault(f =>
+                                    f.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+                                if (match == null)
+                                    throw new InvalidOperationException($"Field not found: {name}");
+                                outputFields.Add(match);
+                            }
+                        }
+
+                        var queryFilter = new ArcGIS.Core.Data.QueryFilter
+                        {
+                            WhereClause = whereClause ?? string.Empty,
+                            PostfixClause = string.IsNullOrWhiteSpace(orderBy) ? string.Empty : $"ORDER BY {orderBy}"
+                        };
+
+                        var rows = new List<Dictionary<string, object?>>();
+                        bool limited = false;
+                        using (var cursor = fc.Search(queryFilter, false))
+                        {
+                            while (cursor.MoveNext())
+                            {
+                                if (rows.Count >= limit) { limited = true; break; }
+                                using var row = cursor.Current;
+                                var rowDict = new Dictionary<string, object?>();
+                                foreach (var field in outputFields)
+                                {
+                                    var val = row[field.Name];
+                                    // Coerce types that aren't JSON-native into
+                                    // strings so the bridge's reflection-based
+                                    // serializer doesn't choke.
+                                    rowDict[field.Name] = val switch
+                                    {
+                                        null => null,
+                                        DateTime dt => (object)dt.ToString("o", CultureInfo.InvariantCulture),
+                                        Guid g => (object)g.ToString(),
+                                        _ => val
+                                    };
+                                }
+                                rows.Add(rowDict);
+                            }
+                        }
+
+                        return (object)new
+                        {
+                            layer = fl.Name,
+                            fieldNames = outputFields.Select(f => f.Name).ToList(),
+                            rows,
+                            returned = rows.Count,
+                            limited
+                        };
+                    });
+                    return new(true, null, data);
+                }
+
+                case "pro.getSelectedFeatures":
+                {
+                    if (req.Args == null ||
+                        !req.Args.TryGetValue("layer", out string? gsfLayerName) ||
+                        string.IsNullOrWhiteSpace(gsfLayerName))
+                        return new(false, "arg 'layer' required", null);
+
+                    req.Args.TryGetValue("fields", out string? gsfFieldsStr);
+                    int gsfLimit = 50;
+                    if (req.Args.TryGetValue("limit", out string? gsfLimitStr) &&
+                        int.TryParse(gsfLimitStr, NumberStyles.Integer, CultureInfo.InvariantCulture, out int gsfParsedLimit))
+                    {
+                        gsfLimit = Math.Max(1, Math.Min(1000, gsfParsedLimit));
+                    }
+
+                    var gsfRequestedFields = string.IsNullOrWhiteSpace(gsfFieldsStr)
+                        ? null
+                        : gsfFieldsStr.Split(',').Select(f => f.Trim()).Where(f => f.Length > 0).ToList();
+
+                    var data = await QueuedTask.Run<object>(() =>
+                    {
+                        var map = MapView.Active?.Map
+                            ?? throw new InvalidOperationException("No active map");
+                        var fl = map.Layers
+                            .OfType<FeatureLayer>()
+                            .FirstOrDefault(l => l.Name.Equals(gsfLayerName, StringComparison.OrdinalIgnoreCase))
+                            ?? throw new InvalidOperationException($"Layer not found: {gsfLayerName}");
+
+                        using var fc = fl.GetFeatureClass();
+                        var fcDef = fc.GetDefinition();
+                        var allFields = fcDef.GetFields();
+                        var shapeFieldName = fcDef.GetShapeField();
+
+                        // Output field resolution — same logic as read_layer_attributes
+                        List<ArcGIS.Core.Data.Field> outputFields;
+                        if (gsfRequestedFields == null)
+                        {
+                            outputFields = allFields
+                                .Where(f => !string.Equals(f.Name, shapeFieldName, StringComparison.OrdinalIgnoreCase))
+                                .Where(f => f.FieldType != ArcGIS.Core.Data.FieldType.Blob &&
+                                            f.FieldType != ArcGIS.Core.Data.FieldType.Raster &&
+                                            f.FieldType != ArcGIS.Core.Data.FieldType.Geometry)
+                                .ToList();
+                        }
+                        else
+                        {
+                            outputFields = new List<ArcGIS.Core.Data.Field>();
+                            foreach (var name in gsfRequestedFields)
+                            {
+                                var match = allFields.FirstOrDefault(f =>
+                                    f.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+                                if (match == null)
+                                    throw new InvalidOperationException($"Field not found: {name}");
+                                outputFields.Add(match);
+                            }
+                        }
+
+                        // Read from the layer's current Selection (not the
+                        // underlying feature class). Empty selection returns an
+                        // empty rows list and selectedTotal=0 rather than an error.
+                        using var selection = fl.GetSelection();
+                        long selectedTotal = selection.GetCount();
+
+                        var rows = new List<Dictionary<string, object?>>();
+                        bool limited = false;
+                        if (selectedTotal > 0)
+                        {
+                            using var cursor = selection.Search(null, false);
+                            while (cursor.MoveNext())
+                            {
+                                if (rows.Count >= gsfLimit) { limited = true; break; }
+                                using var row = cursor.Current;
+                                var rowDict = new Dictionary<string, object?>();
+                                foreach (var field in outputFields)
+                                {
+                                    var val = row[field.Name];
+                                    rowDict[field.Name] = val switch
+                                    {
+                                        null => null,
+                                        DateTime dt => (object)dt.ToString("o", CultureInfo.InvariantCulture),
+                                        Guid g => (object)g.ToString(),
+                                        _ => val
+                                    };
+                                }
+                                rows.Add(rowDict);
+                            }
+                        }
+
+                        return (object)new
+                        {
+                            layer = fl.Name,
+                            fieldNames = outputFields.Select(f => f.Name).ToList(),
+                            rows,
+                            returned = rows.Count,
+                            selectedTotal,
+                            limited
+                        };
+                    });
+                    return new(true, null, data);
+                }
+
                 case "pro.getCurrentExtent":
                     return await HandleGetCurrentExtent();
 

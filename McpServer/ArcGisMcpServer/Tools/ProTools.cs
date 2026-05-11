@@ -80,6 +80,75 @@ namespace ArcGisMcpServer.Tools
         }
 
         [McpServerTool, Description(
+            "List the field schema of a feature layer: name, alias, type, length, " +
+            "isNullable, isEditable for each field. Use before select_by_attribute, " +
+            "read_layer_attributes, or run_gp_tool calls that take field names so the " +
+            "agent can verify fields exist and check types before crafting a query.")]
+        public static async Task<string> ListFields(
+            [Description("Layer name, matching what list_layers returns")] string layer)
+        {
+            var r = await _client!.OpAsync("pro.listFields", new() { ["layer"] = layer });
+            return FormatResult(r, "pro.listFields");
+        }
+
+        [McpServerTool, Description(
+            "Get general properties of a layer: type (FeatureLayer, RasterLayer, etc.), " +
+            "data source path, spatial reference (wkid + name), extent, visibility, " +
+            "feature count, and geometry type. Useful as a 'tell me about this layer' " +
+            "query before deciding what operations apply (e.g., GP tools that only work " +
+            "on point layers vs polygon layers).")]
+        public static async Task<string> GetLayerProperties(
+            [Description("Layer name, matching what list_layers returns")] string layer)
+        {
+            var r = await _client!.OpAsync("pro.getLayerProperties", new() { ["layer"] = layer });
+            return FormatResult(r, "pro.getLayerProperties");
+        }
+
+        [McpServerTool, Description(
+            "Read feature attribute values from a layer in the active map. Returns " +
+            "JSON with field names and up to 'limit' rows. Geometry/Shape/Blob/Raster " +
+            "fields are excluded from output. Useful for surfacing attribute data in " +
+            "chat replies — e.g., turn-by-turn directions from a Network Analyst " +
+            "Route\\DirectionPoints sublayer, top-N records by some field, or sampled " +
+            "rows for exploratory analysis. Use 'where' to filter, 'orderBy' to sort, " +
+            "and 'limit' to cap response size. If 'limited' is true in the response, " +
+            "more rows exist than were returned — narrow with 'where' to see them.")]
+        public static async Task<string> ReadLayerAttributes(
+            [Description("Layer name, matching what list_layers returns")] string layer,
+            [Description("Optional: comma-separated field names. Omit for all non-geometry fields.")] string? fields = null,
+            [Description("Optional: SQL WHERE clause to filter rows.")] string? where = null,
+            [Description("Optional: ORDER BY clause without the 'ORDER BY' keyword (e.g., 'Population DESC').")] string? orderBy = null,
+            [Description("Optional: max rows to return. Default 50, max 1000.")] int limit = 50)
+        {
+            var args = new Dictionary<string, string> { ["layer"] = layer };
+            if (!string.IsNullOrWhiteSpace(fields)) args["fields"] = fields;
+            if (!string.IsNullOrWhiteSpace(where)) args["where"] = where;
+            if (!string.IsNullOrWhiteSpace(orderBy)) args["orderBy"] = orderBy;
+            args["limit"] = limit.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            var r = await _client!.OpAsync("pro.readLayerAttributes", args);
+            return FormatResult(r, "pro.readLayerAttributes");
+        }
+
+        [McpServerTool, Description(
+            "Read attribute values from the layer's currently-selected features. " +
+            "Useful after select_by_attribute to inspect exactly which features matched " +
+            "the WHERE clause, or to read attributes of features the user selected " +
+            "interactively in Pro. Returns the same JSON shape as read_layer_attributes " +
+            "with an additional 'selectedTotal' count. If nothing is selected, returns " +
+            "an empty rows list and selectedTotal=0 (not an error).")]
+        public static async Task<string> GetSelectedFeatures(
+            [Description("Layer name, matching what list_layers returns")] string layer,
+            [Description("Optional: comma-separated field names. Omit for all non-geometry fields.")] string? fields = null,
+            [Description("Optional: max rows to return. Default 50, max 1000.")] int limit = 50)
+        {
+            var args = new Dictionary<string, string> { ["layer"] = layer };
+            if (!string.IsNullOrWhiteSpace(fields)) args["fields"] = fields;
+            args["limit"] = limit.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            var r = await _client!.OpAsync("pro.getSelectedFeatures", args);
+            return FormatResult(r, "pro.getSelectedFeatures");
+        }
+
+        [McpServerTool, Description(
             "Clear feature selections in the active map. If 'layer' is specified, " +
             "clears selection only on that layer (errors if the layer is not found). " +
             "If omitted, clears selections across every feature layer in the active map. " +
