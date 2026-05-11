@@ -229,15 +229,19 @@ pwsh ./restart-dev-cycle.ps1
 ```
 
 `restart-dev-cycle.ps1`:
-1. Verifies Pro and `ArcGisMcpServer.exe` are closed (refuses to run if not).
-2. Locates MSBuild via `vswhere` and rebuilds the Pro Add-In to produce a fresh `.esriAddinX` bundle.
-3. Wipes the per-user AssemblyCache for the Add-In GUID — Pro caches the extracted DLL there and may not re-extract on next launch if the cache is fresh.
-4. Deploys the freshly-built `.esriAddinX` into the AddIns folder (`%USERPROFILE%\Documents\ArcGIS\AddIns\ArcGISPro\{GUID}\`).
-5. Invokes `build-mcp-server.ps1` to publish a fresh single-file MCP server exe.
+1. Verifies Pro is closed.
+2. Stops the `ArcGisMcpServer-HTTP` scheduled task if running (releases the file lock on `publish-http/` for step 8). Skipped if no HTTP task is registered.
+3. Verifies no other `ArcGisMcpServer.exe` is running (it would be held by a Claude Code session).
+4. Locates MSBuild via `vswhere` and rebuilds the Pro Add-In to produce a fresh `.esriAddinX` bundle.
+5. Wipes the per-user AssemblyCache for the Add-In GUID — Pro caches the extracted DLL there and may not re-extract on next launch if the cache is fresh.
+6. Deploys the freshly-built `.esriAddinX` into the AddIns folder (`%USERPROFILE%\Documents\ArcGIS\AddIns\ArcGISPro\{GUID}\`).
+7. Invokes `build-mcp-server.ps1` to publish a fresh single-file MCP server exe into `publish/`.
+8. Copies the fresh exe to `publish-http/` so the HTTP server (Copilot Studio path) runs the same code as the stdio server.
+9. Restarts the `ArcGisMcpServer-HTTP` scheduled task if it was running before.
 
-Steps are ordered so a build failure (step 2) bails before the cache wipe (step 3), leaving the prior cache intact so the next Pro launch still works with the previously-deployed Add-In.
+Steps are ordered so a build failure (step 4) bails before the cache wipe (step 5), leaving the prior cache intact so the next Pro launch still works with the previously-deployed Add-In. If the script bails between steps 2 and 9 with the HTTP task stopped, it auto-restarts the task on exit so Copilot Studio is never left worse off than before the script ran.
 
-After it finishes, reopen Claude Code (loads the new MCP exe), then reopen Pro (re-extracts the deployed `.esriAddinX`).
+After it finishes, reopen Claude Code (loads the new MCP exe), then reopen Pro (re-extracts the deployed `.esriAddinX`). The HTTP task is already restarted, so Copilot Studio sees the new tools immediately.
 
 ---
 
