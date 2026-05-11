@@ -782,7 +782,13 @@ namespace APBridgeAddIn
                         var editOp = new EditOperation
                         {
                             Name = $"Add {apfFeaturesArray.Count} point feature(s) to {fl.Name}",
-                            ShowProgressor = false
+                            ShowProgressor = false,
+                            // Programmatic edits should never show user-facing modal
+                            // dialogs — Pro's default true blocks automation flows
+                            // on benign post-edit messages. Errors still surface via
+                            // editOp.ErrorMessage, which the catch arm below already
+                            // captures and propagates to the agent.
+                            ShowModalMessageAfterFailure = false
                         };
 
                         editOp.Callback(context =>
@@ -876,7 +882,13 @@ namespace APBridgeAddIn
                         var editOp = new EditOperation
                         {
                             Name = $"Add {apgFeaturesArray.Count} polygon feature(s) to {fl.Name}",
-                            ShowProgressor = false
+                            ShowProgressor = false,
+                            // Programmatic edits should never show user-facing modal
+                            // dialogs — Pro's default true blocks automation flows
+                            // on benign post-edit messages. Errors still surface via
+                            // editOp.ErrorMessage, which the catch arm below already
+                            // captures and propagates to the agent.
+                            ShowModalMessageAfterFailure = false
                         };
 
                         editOp.Callback(context =>
