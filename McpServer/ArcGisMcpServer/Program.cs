@@ -42,7 +42,7 @@ if (httpMode)
     builder.Services.AddSingleton(new BridgeClient(pipeNameResolver));
     builder.Services.AddMcpServer()
         .WithHttpTransport()
-        .WithToolsFromAssembly(typeof(ProTools).Assembly);
+        .WithTools<ProTools>();
     builder.Services.AddHostedService<StartupConfigurator>();
 
     var app = builder.Build();
@@ -98,7 +98,7 @@ else
             services.AddSingleton(new BridgeClient(pipeNameResolver));
             services.AddMcpServer()
                 .WithStdioServerTransport()
-                .WithToolsFromAssembly(typeof(ProTools).Assembly);
+                .WithTools<ProTools>();
             services.AddHostedService<StartupConfigurator>();
         })
         .RunConsoleAsync();
