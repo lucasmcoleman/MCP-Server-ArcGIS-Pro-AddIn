@@ -11,7 +11,7 @@ Two transports are supported in the same binary:
 ## What it does
 
 - **Drive Pro from natural language.** Ask the agent to "buffer the West Coast states by 50 miles, dissolve, calculate area in square miles, then export a PDF" and it chains the right MCP tools together.
-- **28 first-class tools** across 6 domains (full list below). All return structured JSON, not opaque strings — agents can introspect errors and chain operations programmatically.
+- **33 first-class tools** across 6 domains (full list below). All return structured JSON, not opaque strings — agents can introspect errors and chain operations programmatically.
 - **Multi-Pro routing.** Each Pro instance binds a per-PID pipe and writes a registry entry; the MCP server picks the right one (most-recent-started, or by `ARCGIS_PROJECT` env var).
 - **Survives Pro restarts mid-session.** The MCP server re-discovers the live pipe on every request, so closing and reopening Pro doesn't require restarting your MCP client.
 - **Robust error handling.** Silent failures fail loud (`Layer not found: X` instead of `0`); slow operations don't time out prematurely (default 120s); typed-return tools surface bridge errors as structured JSON instead of getting swallowed by the MCP SDK's generic-error wrapper.
@@ -222,8 +222,12 @@ pwsh ./restart-dev-cycle.ps1
 
 `restart-dev-cycle.ps1`:
 1. Verifies Pro and `ArcGisMcpServer.exe` are closed (refuses to run if not).
-2. Wipes the per-user AssemblyCache for the Add-In GUID — Pro caches the extracted DLL there and may not re-extract on next launch if the cache is fresh.
-3. Invokes `build-mcp-server.ps1`.
+2. Locates MSBuild via `vswhere` and rebuilds the Pro Add-In to produce a fresh `.esriAddinX` bundle.
+3. Wipes the per-user AssemblyCache for the Add-In GUID — Pro caches the extracted DLL there and may not re-extract on next launch if the cache is fresh.
+4. Deploys the freshly-built `.esriAddinX` into the AddIns folder (`%USERPROFILE%\Documents\ArcGIS\AddIns\ArcGISPro\{GUID}\`).
+5. Invokes `build-mcp-server.ps1` to publish a fresh single-file MCP server exe.
+
+Steps are ordered so a build failure (step 2) bails before the cache wipe (step 3), leaving the prior cache intact so the next Pro launch still works with the previously-deployed Add-In.
 
 After it finishes, reopen Claude Code (loads the new MCP exe), then reopen Pro (re-extracts the deployed `.esriAddinX`).
 
