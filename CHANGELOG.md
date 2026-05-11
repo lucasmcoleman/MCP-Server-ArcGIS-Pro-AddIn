@@ -6,6 +6,18 @@ This project is a hardened fork/evolution of [nicogis/MCP-Server-ArcGIS-Pro-AddI
 
 ---
 
+## [Dev script: full close-restart cycle automated] — 2026-05-11
+
+### Added
+- **`restart-dev-cycle.ps1` now also builds and deploys the Pro Add-In.** Previously it wiped the AssemblyCache and rebuilt the MCP server, but users had to invoke MSBuild and copy the `.esriAddinX` into the AddIns folder by hand. This caused a silent failure mode: a fresh bundle could sit in `bin/Release` while Pro launched the cached old DLL because nothing deployed it. The script now: (1) verifies Pro and `ArcGisMcpServer.exe` are closed, (2) locates MSBuild via `vswhere` and rebuilds the Add-In, (3) wipes the AssemblyCache, (4) copies the freshly-built `.esriAddinX` into `%USERPROFILE%\Documents\ArcGIS\AddIns\ArcGISPro\{GUID}\`, (5) rebuilds the MCP server.
+
+### Internal
+- **Step ordering is build → wipe → deploy → MCP-rebuild** specifically so a build failure (step 2) bails before the cache wipe (step 3). The prior cache stays intact and the next Pro launch still works with the previously-deployed Add-In — failures don't degrade Pro's working state.
+- Uses `vswhere -latest -products * -requires Microsoft.Component.MSBuild -find 'MSBuild\**\Bin\MSBuild.exe'` to locate MSBuild rather than hard-coding the VS 2022 path; survives VS upgrades and edition swaps (Community/Professional/Build Tools).
+- README's "28 first-class tools" line corrected to "33" — leftover inconsistency from the trim-refactor doc pass that updated the intro paragraph but missed the "What it does" bullet.
+
+---
+
 ## [Release Pipeline + Remote MCP + Trimming] — 2026-05-11
 
 Wrapped a sequence of three releases (`v0.1.0` → `v0.2.0` → `v0.3.0`) that took the project from a "build locally and copy files" workflow to a published GitHub release pipeline serving a remote-reachable, trimmed self-contained MCP server. The motivating use case is wiring the MCP server up to M365 Copilot Studio (which requires HTTPS reachability and authentication).
