@@ -6,6 +6,22 @@ This project is a hardened fork/evolution of [nicogis/MCP-Server-ArcGIS-Pro-AddI
 
 ---
 
+## [Feature Creation Primitives] — 2026-05-11
+
+Closes the "I have coordinates, I need features" gap that blocked the agent during a Network Analyst route attempt. Previously the only way to materialize features from coordinates was a CSV-on-disk + `XYTableToPoint` workflow, or hacks like `CalculateField` with an embedded `InsertCursor` (which hung Pro). Now the agent can write points or polygons directly via two trim-safe primitives.
+
+### Added
+- **`add_point_features(layer, features)`** — inserts point features into an existing point layer. `features` is a JSON array of `{x, y, attributes?}`. Coordinates are interpreted in the *layer's* spatial reference (no automatic reprojection). All inserts run in a single `EditOperation` — if any feature fails, none are committed. Returns `{added: N, oids: [...]}` for the freshly-inserted features.
+- **`add_polygon_features(layer, features)`** — same shape, polygon geometry. Each feature has a `vertices` array of `[x, y]` pairs (minimum 3); `PolygonBuilderEx` auto-closes the ring, so callers don't repeat the first vertex. Useful for Network Analyst polygon barriers, custom AOIs, and any single-ring polygon use case. Multi-ring polygons and polygons-with-holes are out of scope; for those, generate the feature via `run_gp_tool` with `JSONToFeatures`.
+
+### Internal
+- Both handlers share a `SetAttributesOnBuffer` private helper that does case-insensitive field lookup and type-aware coercion of JSON values to ArcGIS field types (String, Integer, SmallInteger, Single, Double, Date, GUID, GlobalID). Date values arrive as ISO 8601 strings; GUIDs as standard hex strings. Geometry/OID/Blob/Raster fields are blocked — those are managed by the row's geometry or identity, not the caller's attributes.
+- Errors specify the failing feature's index ("feature[2].attributes references field 'Foo' which does not exist") so the agent can pinpoint which entry in its features array is bad. Particularly useful when the agent submits a batch of, say, 20 stop points and one has a typo.
+- `EditOperation.ExecuteAsync()` (not the synchronous Execute) so the QueuedTask runs the edit asynchronously, matching Pro SDK conventions and the existing `pro.zoomToLayer` pattern. Failure surfaces via `editOp.ErrorMessage` rather than a generic exception.
+- Tool count: 41 → 43. Both tools live in the README's "Map operations" section (they're feature-mutating operations, same conceptual neighborhood as `add_layer_from_*` and `export_layer`).
+
+---
+
 ## [Layer Introspection Primitives] — 2026-05-11
 
 Adds four read-side primitives the agent was missing: ways to inspect a layer's schema, properties, attribute values, and current selection from a chat reply. Surfaced as a gap when reviewing the Network Analyst Route tutorial — the agent could compute a shortest route via `run_gp_tool('na.Solve', …)` but had no way to return the turn-by-turn `DirectionPoints` to the user. The four new tools generalize beyond that case: any "what fields exist on this layer," "tell me about this layer," "show me the first N rows," or "what's currently selected" question now has a direct answer.
