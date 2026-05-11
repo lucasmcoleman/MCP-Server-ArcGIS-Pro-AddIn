@@ -648,6 +648,59 @@ namespace ArcGisMcpServer.Tools
             return FormatResult(r, "pro.runGPTool");
         }
 
+        [McpServerTool, Description(
+            "Add point features to an existing point layer in the active map. " +
+            "The 'features' parameter is a JSON array of point definitions; each " +
+            "point has x and y coordinates IN THE LAYER'S SPATIAL REFERENCE (no " +
+            "automatic reprojection) and an optional attributes map for other " +
+            "fields. Coordinates use X (longitude) first, Y (latitude) second. " +
+            "Inserts run in a single transactional edit operation — if any feature " +
+            "fails, none are committed. Errors specify the failing feature's index. " +
+            "Returns the count of added features and their ObjectIDs. " +
+            "Example features value: " +
+            "[{\"x\": -78.7073, \"y\": 35.7345, \"attributes\": {\"Name\": \"Home\"}}, " +
+            "{\"x\": -78.7819, \"y\": 35.7312, \"attributes\": {\"Name\": \"Work\"}}]. " +
+            "Use list_fields to discover the layer's field names and types first; " +
+            "use get_layer_properties to confirm the layer's spatial reference.")]
+        public static async Task<string> AddPointFeatures(
+            [Description("Point layer name, matching what list_layers returns")] string layer,
+            [Description("JSON array of point feature definitions — each has x, y, and optional attributes")] string features)
+        {
+            var r = await _client!.OpAsync("pro.addPointFeatures", new()
+            {
+                ["layer"] = layer,
+                ["features"] = features
+            });
+            return FormatResult(r, "pro.addPointFeatures");
+        }
+
+        [McpServerTool, Description(
+            "Add polygon features to an existing polygon layer in the active map. " +
+            "The 'features' parameter is a JSON array of polygon definitions; each " +
+            "polygon has a 'vertices' array of [x, y] coordinate pairs IN THE " +
+            "LAYER'S SPATIAL REFERENCE (no automatic reprojection) and an optional " +
+            "attributes map. Vertices must include at least 3 points; the ring is " +
+            "auto-closed if the first and last vertex differ, so don't repeat the " +
+            "first vertex. Inserts run in a single transactional edit operation. " +
+            "Returns the count of added features and their ObjectIDs. " +
+            "Example features value: [{\"vertices\": [[-78.71, 35.74], [-78.70, 35.74], " +
+            "[-78.70, 35.73], [-78.71, 35.73]], \"attributes\": {\"Name\": \"Barrier1\"}}]. " +
+            "Useful for Network Analyst polygon barriers, custom AOIs, and any " +
+            "polygon-creation-from-coordinates workflow. For complex shapes with " +
+            "holes or multiple rings, generate the feature via run_gp_tool " +
+            "(e.g., management.CreateFeatureclass + JSONToFeatures) instead.")]
+        public static async Task<string> AddPolygonFeatures(
+            [Description("Polygon layer name, matching what list_layers returns")] string layer,
+            [Description("JSON array of polygon feature definitions — each has vertices ([x,y] pairs) and optional attributes")] string features)
+        {
+            var r = await _client!.OpAsync("pro.addPolygonFeatures", new()
+            {
+                ["layer"] = layer,
+                ["features"] = features
+            });
+            return FormatResult(r, "pro.addPolygonFeatures");
+        }
+
         // ─── Helpers ─────────────────────────────────────────────────────
 
         /// <summary>
