@@ -31,8 +31,9 @@ if ($running) {
 dotnet publish $proj `
     -c Release `
     -r win-x64 `
-    --self-contained false `
+    --self-contained true `
     -p:PublishSingleFile=true `
+    -p:PublishTrimmed=true `
     -o $output
 
 if ($LASTEXITCODE -eq 0) {
