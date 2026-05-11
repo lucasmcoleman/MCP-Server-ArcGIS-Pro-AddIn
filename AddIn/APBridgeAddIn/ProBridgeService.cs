@@ -2,6 +2,7 @@ using ArcGIS.Core.CIM;
 using ArcGIS.Core.Geometry;
 using ArcGIS.Desktop.Core;
 using ArcGIS.Desktop.Core.Geoprocessing;
+using ArcGIS.Desktop.Editing;
 using ArcGIS.Desktop.Framework;
 using ArcGIS.Desktop.Framework.Threading.Tasks;
 using ArcGIS.Desktop.GeoProcessing;
@@ -724,6 +725,213 @@ namespace APBridgeAddIn
                 case "pro.runGPTool":
                     return await HandleRunGPTool(req.Args);
 
+                case "pro.addPointFeatures":
+                {
+                    if (req.Args == null ||
+                        !req.Args.TryGetValue("layer", out string? apfLayerName) ||
+                        string.IsNullOrWhiteSpace(apfLayerName) ||
+                        !req.Args.TryGetValue("features", out string? apfFeaturesJson) ||
+                        string.IsNullOrWhiteSpace(apfFeaturesJson))
+                        return new(false, "args 'layer' and 'features' required", null);
+
+                    // Parse features JSON outside QueuedTask — no Pro APIs needed
+                    // for parsing, and bad JSON should surface as a friendly error
+                    // rather than crashing the QueuedTask.
+                    JsonArray apfFeaturesArray;
+                    try
+                    {
+                        var node = JsonNode.Parse(apfFeaturesJson)
+                            ?? throw new InvalidOperationException("features must be a JSON array (was null)");
+                        if (node is not JsonArray arr)
+                            return new(false, "features must be a JSON array", null);
+                        apfFeaturesArray = arr;
+                    }
+                    catch (JsonException ex)
+                    {
+                        return new(false, $"Invalid features JSON: {ex.Message}", null);
+                    }
+
+                    var apfAddedOids = new List<long>();
+                    string apfActualName = string.Empty;
+
+                    await QueuedTask.Run(async () =>
+                    {
+                        var map = MapView.Active?.Map
+                            ?? throw new InvalidOperationException("No active map");
+                        var fl = map.Layers
+                            .OfType<FeatureLayer>()
+                            .FirstOrDefault(l => l.Name.Equals(apfLayerName, StringComparison.OrdinalIgnoreCase))
+                            ?? throw new InvalidOperationException($"Layer not found: {apfLayerName}");
+                        apfActualName = fl.Name;
+
+                        if (fl.ShapeType != esriGeometryType.esriGeometryPoint)
+                            throw new InvalidOperationException(
+                                $"Layer '{fl.Name}' is not a point layer (geometry type: {fl.ShapeType}). Use add_polygon_features for polygons.");
+
+                        using var fc = fl.GetFeatureClass()
+                            ?? throw new InvalidOperationException(
+                                $"Layer '{fl.Name}' has no resolved feature class — its data source may be missing or unloaded.");
+                        var fcDef = fc.GetDefinition();
+                        var sr = fcDef.GetSpatialReference();
+                        var shapeFieldName = fcDef.GetShapeField();
+                        var allFields = fcDef.GetFields();
+
+                        // EditOperation wraps inserts in a proper edit session with
+                        // undo/redo support and transactional commit/rollback. If any
+                        // single feature fails, the whole operation rolls back.
+                        var editOp = new EditOperation
+                        {
+                            Name = $"Add {apfFeaturesArray.Count} point feature(s) to {fl.Name}",
+                            ShowProgressor = false
+                        };
+
+                        editOp.Callback(context =>
+                        {
+                            for (int i = 0; i < apfFeaturesArray.Count; i++)
+                            {
+                                if (apfFeaturesArray[i] is not JsonObject obj)
+                                    throw new InvalidOperationException($"feature[{i}] is not a JSON object");
+
+                                if (!obj.TryGetPropertyValue("x", out var xNode) || xNode is null ||
+                                    !obj.TryGetPropertyValue("y", out var yNode) || yNode is null)
+                                    throw new InvalidOperationException($"feature[{i}] missing required 'x' and/or 'y' coordinates");
+
+                                double x = xNode.GetValue<double>();
+                                double y = yNode.GetValue<double>();
+
+                                using var rowBuffer = fc.CreateRowBuffer();
+                                rowBuffer[shapeFieldName] = MapPointBuilderEx.CreateMapPoint(x, y, sr);
+
+                                if (obj.TryGetPropertyValue("attributes", out var attrsNode) && attrsNode is JsonObject attrs)
+                                {
+                                    SetAttributesOnBuffer(rowBuffer, attrs, allFields, i);
+                                }
+
+                                using var feature = fc.CreateRow(rowBuffer);
+                                apfAddedOids.Add(feature.GetObjectID());
+                                context.Invalidate(feature);
+                            }
+                        }, fc);
+
+                        if (!await editOp.ExecuteAsync())
+                            throw new InvalidOperationException($"Edit operation failed: {editOp.ErrorMessage}");
+                    });
+
+                    return new(true, null, new
+                    {
+                        layer = apfActualName,
+                        added = apfAddedOids.Count,
+                        oids = apfAddedOids
+                    });
+                }
+
+                case "pro.addPolygonFeatures":
+                {
+                    if (req.Args == null ||
+                        !req.Args.TryGetValue("layer", out string? apgLayerName) ||
+                        string.IsNullOrWhiteSpace(apgLayerName) ||
+                        !req.Args.TryGetValue("features", out string? apgFeaturesJson) ||
+                        string.IsNullOrWhiteSpace(apgFeaturesJson))
+                        return new(false, "args 'layer' and 'features' required", null);
+
+                    JsonArray apgFeaturesArray;
+                    try
+                    {
+                        var node = JsonNode.Parse(apgFeaturesJson)
+                            ?? throw new InvalidOperationException("features must be a JSON array (was null)");
+                        if (node is not JsonArray arr)
+                            return new(false, "features must be a JSON array", null);
+                        apgFeaturesArray = arr;
+                    }
+                    catch (JsonException ex)
+                    {
+                        return new(false, $"Invalid features JSON: {ex.Message}", null);
+                    }
+
+                    var apgAddedOids = new List<long>();
+                    string apgActualName = string.Empty;
+
+                    await QueuedTask.Run(async () =>
+                    {
+                        var map = MapView.Active?.Map
+                            ?? throw new InvalidOperationException("No active map");
+                        var fl = map.Layers
+                            .OfType<FeatureLayer>()
+                            .FirstOrDefault(l => l.Name.Equals(apgLayerName, StringComparison.OrdinalIgnoreCase))
+                            ?? throw new InvalidOperationException($"Layer not found: {apgLayerName}");
+                        apgActualName = fl.Name;
+
+                        if (fl.ShapeType != esriGeometryType.esriGeometryPolygon)
+                            throw new InvalidOperationException(
+                                $"Layer '{fl.Name}' is not a polygon layer (geometry type: {fl.ShapeType}). Use add_point_features for points.");
+
+                        using var fc = fl.GetFeatureClass()
+                            ?? throw new InvalidOperationException(
+                                $"Layer '{fl.Name}' has no resolved feature class — its data source may be missing or unloaded.");
+                        var fcDef = fc.GetDefinition();
+                        var sr = fcDef.GetSpatialReference();
+                        var shapeFieldName = fcDef.GetShapeField();
+                        var allFields = fcDef.GetFields();
+
+                        var editOp = new EditOperation
+                        {
+                            Name = $"Add {apgFeaturesArray.Count} polygon feature(s) to {fl.Name}",
+                            ShowProgressor = false
+                        };
+
+                        editOp.Callback(context =>
+                        {
+                            for (int i = 0; i < apgFeaturesArray.Count; i++)
+                            {
+                                if (apgFeaturesArray[i] is not JsonObject obj)
+                                    throw new InvalidOperationException($"feature[{i}] is not a JSON object");
+
+                                if (!obj.TryGetPropertyValue("vertices", out var vertsNode) ||
+                                    vertsNode is not JsonArray vertsArr || vertsArr.Count < 3)
+                                    throw new InvalidOperationException(
+                                        $"feature[{i}] requires 'vertices': a JSON array of at least 3 [x,y] coordinate pairs");
+
+                                // Parse vertex pairs into MapPoints. PolygonBuilderEx
+                                // auto-closes the ring if the first/last points differ,
+                                // so callers don't need to repeat the first vertex.
+                                var points = new List<MapPoint>(vertsArr.Count);
+                                for (int v = 0; v < vertsArr.Count; v++)
+                                {
+                                    if (vertsArr[v] is not JsonArray pair || pair.Count < 2 || pair[0] is null || pair[1] is null)
+                                        throw new InvalidOperationException(
+                                            $"feature[{i}].vertices[{v}] must be a [x, y] number pair");
+                                    points.Add(MapPointBuilderEx.CreateMapPoint(
+                                        pair[0]!.GetValue<double>(),
+                                        pair[1]!.GetValue<double>(),
+                                        sr));
+                                }
+
+                                using var rowBuffer = fc.CreateRowBuffer();
+                                rowBuffer[shapeFieldName] = PolygonBuilderEx.CreatePolygon(points, sr);
+
+                                if (obj.TryGetPropertyValue("attributes", out var attrsNode) && attrsNode is JsonObject attrs)
+                                {
+                                    SetAttributesOnBuffer(rowBuffer, attrs, allFields, i);
+                                }
+
+                                using var feature = fc.CreateRow(rowBuffer);
+                                apgAddedOids.Add(feature.GetObjectID());
+                                context.Invalidate(feature);
+                            }
+                        }, fc);
+
+                        if (!await editOp.ExecuteAsync())
+                            throw new InvalidOperationException($"Edit operation failed: {editOp.ErrorMessage}");
+                    });
+
+                    return new(true, null, new
+                    {
+                        layer = apgActualName,
+                        added = apgAddedOids.Count,
+                        oids = apgAddedOids
+                    });
+                }
+
                 default:
                     return new(false, $"op not found: {req.Op}", null);
             }
@@ -738,6 +946,74 @@ namespace APBridgeAddIn
         /// when the camera is zoomed out far enough that the rectangle is bigger than the
         /// planet. <c>clampedToSrValidRange</c> indicates whether clamping fired.
         /// </summary>
+        /// <summary>
+        /// Shared attribute-setter for the add_*_features handlers. Walks each
+        /// key in the supplied JSON object, looks up the matching field (case-
+        /// insensitive) in the feature class definition, coerces the JSON value
+        /// to the field's type, and writes it to the row buffer. Throws with a
+        /// feature-index-tagged message on unknown fields, non-settable fields
+        /// (geometry/OID/blob/raster), or type-incompatible values.
+        /// </summary>
+        private static void SetAttributesOnBuffer(
+            ArcGIS.Core.Data.RowBuffer rowBuffer,
+            JsonObject attrs,
+            IReadOnlyList<ArcGIS.Core.Data.Field> allFields,
+            int featureIndex)
+        {
+            foreach (var kvp in attrs)
+            {
+                var fieldName = kvp.Key;
+                var valueNode = kvp.Value;
+
+                var field = allFields.FirstOrDefault(f =>
+                    f.Name.Equals(fieldName, StringComparison.OrdinalIgnoreCase));
+                if (field == null)
+                    throw new InvalidOperationException(
+                        $"feature[{featureIndex}].attributes references field '{fieldName}' which does not exist in the layer");
+
+                // Block fields whose values are managed by the row's geometry or
+                // identity rather than by the caller's attribute payload.
+                if (field.FieldType == ArcGIS.Core.Data.FieldType.OID ||
+                    field.FieldType == ArcGIS.Core.Data.FieldType.Geometry ||
+                    field.FieldType == ArcGIS.Core.Data.FieldType.Blob ||
+                    field.FieldType == ArcGIS.Core.Data.FieldType.Raster)
+                    throw new InvalidOperationException(
+                        $"feature[{featureIndex}].attributes cannot set field '{field.Name}' (type {field.FieldType}) — it's managed by the row's identity or geometry");
+
+                if (valueNode == null)
+                {
+                    rowBuffer[field.Name] = null;
+                    continue;
+                }
+
+                try
+                {
+                    rowBuffer[field.Name] = field.FieldType switch
+                    {
+                        ArcGIS.Core.Data.FieldType.String => valueNode.GetValue<string>(),
+                        ArcGIS.Core.Data.FieldType.Integer => valueNode.GetValue<int>(),
+                        ArcGIS.Core.Data.FieldType.SmallInteger => (short)valueNode.GetValue<int>(),
+                        ArcGIS.Core.Data.FieldType.Single => valueNode.GetValue<float>(),
+                        ArcGIS.Core.Data.FieldType.Double => valueNode.GetValue<double>(),
+                        ArcGIS.Core.Data.FieldType.Date => DateTime.Parse(
+                            valueNode.GetValue<string>(),
+                            CultureInfo.InvariantCulture,
+                            DateTimeStyles.RoundtripKind),
+                        ArcGIS.Core.Data.FieldType.GUID or ArcGIS.Core.Data.FieldType.GlobalID =>
+                            Guid.Parse(valueNode.GetValue<string>()),
+                        _ => throw new InvalidOperationException(
+                            $"feature[{featureIndex}].attributes field '{field.Name}' has unsupported type {field.FieldType}")
+                    };
+                }
+                catch (Exception ex) when (ex is FormatException or InvalidOperationException or InvalidCastException)
+                {
+                    if (ex is InvalidOperationException) throw;
+                    throw new InvalidOperationException(
+                        $"feature[{featureIndex}].attributes field '{field.Name}' (type {field.FieldType}) could not coerce value: {ex.Message}");
+                }
+            }
+        }
+
         private static async Task<IpcResponse> HandleGetCurrentExtent()
         {
             var extent = await QueuedTask.Run<object?>(() =>
