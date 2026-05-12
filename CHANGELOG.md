@@ -6,6 +6,18 @@ This project is a hardened fork/evolution of [nicogis/MCP-Server-ArcGIS-Pro-AddI
 
 ---
 
+## [Nested-layer support for layer-name handlers] — 2026-05-12
+
+### Fixed
+- **Layer-name-based handlers now find nested layers inside group layers.** Previously `count_features`, `zoom_to_layer`, `select_by_attribute`, `clear_selection`, `list_fields`, `get_layer_properties`, `read_layer_attributes`, `get_selected_features`, `remove_layer`, `rename_layer`, `set_layer_visibility`, `add_point_features`, `add_polygon_features`, and `list_layers` all searched `Map.Layers`, which returns *only* top-level layers — children of group layers were invisible. An agent looking for a layer nested inside a group got `"Layer not found"` even though the layer was right there in the TOC. Fixed by switching every find-by-name site from `Map.Layers` to `Map.GetLayersAsFlattenedList()`, which descends the layer tree depth-first and returns all layers in TOC order.
+- **`list_layers` now includes group layer children.** A map with `Group1` containing `Parcels` and `Roads` previously returned `["Group1"]`; now it returns `["Group1", "Parcels", "Roads"]`. Group layers themselves are still in the list (their name is still a valid target for `remove_layer`, `set_layer_visibility`, etc.).
+
+### Internal
+- `move_layer` is the one handler that intentionally still uses `Map.Layers` (top-level only). Reordering a layer "to position N" only makes sense at the top level — moving in/out of a group is a different operation conceptually, not yet supported. This is documented in a comment at the call site.
+- The duplicate-name limitation (multiple layers with the same name in different groups) remains: find-by-name picks the first match in TOC order. Pro's long-path notation (`Group1\Parcels`) would resolve this; that's a future enhancement, not blocking the current fix.
+
+---
+
 ## [Feature Creation Primitives] — 2026-05-11
 
 Closes the "I have coordinates, I need features" gap that blocked the agent during a Network Analyst route attempt. Previously the only way to materialize features from coordinates was a CSV-on-disk + `XYTableToPoint` workflow, or hacks like `CalculateField` with an embedded `InsertCursor` (which hung Pro). Now the agent can write points or polygons directly via two trim-safe primitives.
