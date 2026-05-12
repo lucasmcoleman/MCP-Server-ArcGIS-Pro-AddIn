@@ -129,10 +129,23 @@ namespace APBridgeAddIn
                     return new(true, null, new { name });
 
                 case "pro.listLayers":
-                    var layers = await QueuedTask.Run(() =>
-                        MapView.Active?.Map?.GetLayersAsFlattenedList().Select(l => l.Name).ToList()
-                        ?? new List<string>());
-                    return new(true, null, layers);
+                {
+                    string? mapName = null;
+                    req.Args?.TryGetValue("map", out mapName);
+
+                    var allNames = await QueuedTask.Run(() =>
+                    {
+                        var map = ResolveMap(mapName);
+                        var names = new List<string>();
+                        // Layers first (flattened tree, group layers + their children),
+                        // then standalone tables. Both contribute to the response so
+                        // the agent sees the full set of addressable map members.
+                        names.AddRange(map.GetLayersAsFlattenedList().Select(l => l.Name));
+                        names.AddRange(map.StandaloneTables.Select(t => t.Name));
+                        return names;
+                    });
+                    return new(true, null, allNames);
+                }
 
                 case "pro.countFeatures":
                 {
@@ -140,22 +153,21 @@ namespace APBridgeAddIn
                         !req.Args.TryGetValue("layer", out string? layerName) ||
                         string.IsNullOrWhiteSpace(layerName))
                         return new(false, "arg 'layer' required", null);
+                    req.Args.TryGetValue("map", out string? mapName);
 
                     int count = await QueuedTask.Run(() =>
                     {
-                        var fl = MapView.Active?.Map?.GetLayersAsFlattenedList()
-                            .OfType<FeatureLayer>()
-                            .FirstOrDefault(l => l.Name.Equals(layerName, StringComparison.OrdinalIgnoreCase));
-                        if (fl == null) throw new InvalidOperationException($"Layer not found: {layerName}");
-                        // Guard against layers whose underlying feature class can't
-                        // be resolved (broken data source, unloaded analysis output,
-                        // deleted gdb feature class). Without this, fc.GetDefinition()
-                        // a few lines down NREs and the caller sees a generic
-                        // "NullReferenceException" instead of an actionable message.
-                        using var fc = fl.GetFeatureClass()
+                        var map = ResolveMap(mapName);
+                        var member = FindMapMemberByName(map, layerName)
+                            ?? throw new InvalidOperationException($"Layer or table not found: {layerName}");
+                        // Both FeatureClass (for FeatureLayer) and Table (for
+                        // StandaloneTable) expose GetCount(); FeatureClass inherits
+                        // from Table, so the count_features semantics extend
+                        // naturally to standalone tables ("count rows").
+                        using var table = GetTableFromMember(member)
                             ?? throw new InvalidOperationException(
-                                $"Layer '{fl.Name}' has no resolved feature class — its data source may be missing or unloaded.");
-                        return (int)fc.GetCount();
+                                $"'{member.Name}' is a {member.GetType().Name} with no attribute table — count_features works on feature layers and standalone tables.");
+                        return (int)table.GetCount();
                     });
                     return new(true, null, new { count });
                 }
@@ -187,19 +199,26 @@ namespace APBridgeAddIn
                         !req.Args.TryGetValue("where", out string? where) ||
                         string.IsNullOrWhiteSpace(where))
                         return new(false, "args 'layer' & 'where' required", null);
+                    req.Args.TryGetValue("map", out string? sbaMapName);
 
-                    var selectionInfo = await QueuedTask.Run<object?>(() =>
+                    var selectionInfo = await QueuedTask.Run<object>(() =>
                     {
-                        var fl = MapView.Active?.Map?.GetLayersAsFlattenedList()
-                            .OfType<FeatureLayer>()
-                            .FirstOrDefault(l => l.Name.Equals(layerName, StringComparison.OrdinalIgnoreCase));
-                        if (fl == null) return null;
-                        var sel = fl.Select(new ArcGIS.Core.Data.QueryFilter { WhereClause = where });
-                        return new { layer = fl.Name, selectedCount = sel?.GetCount() ?? 0 };
+                        var map = ResolveMap(sbaMapName);
+                        var member = FindMapMemberByName(map, layerName)
+                            ?? throw new InvalidOperationException($"Layer or table not found: {layerName}");
+                        // Both FeatureLayer and StandaloneTable expose Select(QueryFilter),
+                        // but the methods are declared on the subclasses (not on MapMember),
+                        // so dispatch explicitly. Returns a Selection on either path.
+                        var qf = new ArcGIS.Core.Data.QueryFilter { WhereClause = where };
+                        var sel = member switch
+                        {
+                            FeatureLayer flSba => flSba.Select(qf),
+                            ArcGIS.Desktop.Mapping.StandaloneTable stSba => stSba.Select(qf),
+                            _ => throw new InvalidOperationException(
+                                $"'{member.Name}' is a {member.GetType().Name} which doesn't support selection — select_by_attribute works on feature layers and standalone tables.")
+                        };
+                        return (object)new { layer = member.Name, selectedCount = sel?.GetCount() ?? 0 };
                     });
-
-                    if (selectionInfo == null)
-                        return new(false, $"Layer not found: {layerName}", null);
                     return new(true, null, selectionInfo);
                 }
 
@@ -209,25 +228,21 @@ namespace APBridgeAddIn
                         !req.Args.TryGetValue("layer", out string? lfLayerName) ||
                         string.IsNullOrWhiteSpace(lfLayerName))
                         return new(false, "arg 'layer' required", null);
+                    req.Args.TryGetValue("map", out string? lfMapName);
 
                     var data = await QueuedTask.Run<object>(() =>
                     {
-                        var map = MapView.Active?.Map
-                            ?? throw new InvalidOperationException("No active map");
-                        var fl = map.GetLayersAsFlattenedList()
-                            .OfType<FeatureLayer>()
-                            .FirstOrDefault(l => l.Name.Equals(lfLayerName, StringComparison.OrdinalIgnoreCase))
-                            ?? throw new InvalidOperationException($"Layer not found: {lfLayerName}");
+                        var map = ResolveMap(lfMapName);
+                        var member = FindMapMemberByName(map, lfLayerName)
+                            ?? throw new InvalidOperationException($"Layer or table not found: {lfLayerName}");
 
-                        // Guard against layers whose underlying feature class can't
-                        // be resolved (broken data source, unloaded analysis output,
-                        // deleted gdb feature class). Without this, fc.GetDefinition()
-                        // a few lines down NREs and the caller sees a generic
-                        // "NullReferenceException" instead of an actionable message.
-                        using var fc = fl.GetFeatureClass()
+                        // FeatureClass.GetDefinition() returns FeatureClassDefinition;
+                        // Table.GetDefinition() returns TableDefinition. The former
+                        // inherits from the latter, so GetFields() works uniformly.
+                        using var table = GetTableFromMember(member)
                             ?? throw new InvalidOperationException(
-                                $"Layer '{fl.Name}' has no resolved feature class — its data source may be missing or unloaded.");
-                        var fields = fc.GetDefinition().GetFields()
+                                $"'{member.Name}' is a {member.GetType().Name} with no attribute table — list_fields works on feature layers and standalone tables.");
+                        var fields = table.GetDefinition().GetFields()
                             .Select(f => new
                             {
                                 name = f.Name,
@@ -239,7 +254,7 @@ namespace APBridgeAddIn
                             })
                             .ToList();
 
-                        return new { layer = fl.Name, fields };
+                        return new { layer = member.Name, fields };
                     });
                     return new(true, null, data);
                 }
@@ -250,56 +265,79 @@ namespace APBridgeAddIn
                         !req.Args.TryGetValue("layer", out string? lpLayerName) ||
                         string.IsNullOrWhiteSpace(lpLayerName))
                         return new(false, "arg 'layer' required", null);
+                    req.Args.TryGetValue("map", out string? lpMapName);
 
                     var data = await QueuedTask.Run<object>(() =>
                     {
-                        var map = MapView.Active?.Map
-                            ?? throw new InvalidOperationException("No active map");
-                        var layer = map.GetLayersAsFlattenedList()
-                            .FirstOrDefault(l => l.Name.Equals(lpLayerName, StringComparison.OrdinalIgnoreCase))
-                            ?? throw new InvalidOperationException($"Layer not found: {lpLayerName}");
+                        var map = ResolveMap(lpMapName);
+                        var member = FindMapMemberByName(map, lpLayerName)
+                            ?? throw new InvalidOperationException($"Layer or table not found: {lpLayerName}");
 
-                        // Build properties dict incrementally — different layer types
+                        // Build properties dict incrementally — different member types
                         // expose different things; wrap each accessor in try/catch so
-                        // a missing property (e.g., SR on a basemap) doesn't blow up
-                        // the whole response.
+                        // a missing property (e.g., SR on a basemap, or extent on a
+                        // standalone table) doesn't blow up the whole response.
                         var props = new Dictionary<string, object?>
                         {
-                            ["name"] = layer.Name,
-                            ["type"] = layer.GetType().Name,
-                            ["isVisible"] = layer.IsVisible
+                            ["name"] = member.Name,
+                            ["type"] = member.GetType().Name
                         };
 
-                        try
+                        if (member is Layer layer)
                         {
-                            var sr = layer.GetSpatialReference();
-                            if (sr != null)
-                                props["spatialReference"] = new { wkid = sr.Wkid, name = sr.Name };
-                        }
-                        catch { }
+                            // Spatial-member properties: visibility, SR, extent, and
+                            // (for FeatureLayer) geometry type, feature count, source path.
+                            props["isVisible"] = layer.IsVisible;
 
-                        try
-                        {
-                            var extent = layer.QueryExtent();
-                            if (extent != null)
-                                props["extent"] = new
-                                {
-                                    xmin = extent.XMin,
-                                    ymin = extent.YMin,
-                                    xmax = extent.XMax,
-                                    ymax = extent.YMax
-                                };
-                        }
-                        catch { }
-
-                        if (layer is FeatureLayer flProps)
-                        {
                             try
                             {
-                                props["geometryType"] = flProps.ShapeType.ToString();
-                                using var fc = flProps.GetFeatureClass();
-                                props["featureCount"] = (int)fc.GetCount();
-                                props["dataSource"] = fc.GetPath()?.ToString();
+                                var sr = layer.GetSpatialReference();
+                                if (sr != null)
+                                    props["spatialReference"] = new { wkid = sr.Wkid, name = sr.Name };
+                            }
+                            catch { }
+
+                            try
+                            {
+                                var extent = layer.QueryExtent();
+                                if (extent != null)
+                                    props["extent"] = new
+                                    {
+                                        xmin = extent.XMin,
+                                        ymin = extent.YMin,
+                                        xmax = extent.XMax,
+                                        ymax = extent.YMax
+                                    };
+                            }
+                            catch { }
+
+                            if (layer is FeatureLayer flProps)
+                            {
+                                try
+                                {
+                                    props["geometryType"] = flProps.ShapeType.ToString();
+                                    using var fc = flProps.GetFeatureClass();
+                                    if (fc != null)
+                                    {
+                                        props["featureCount"] = (int)fc.GetCount();
+                                        props["dataSource"] = fc.GetPath()?.ToString();
+                                    }
+                                }
+                                catch { }
+                            }
+                        }
+                        else if (member is ArcGIS.Desktop.Mapping.StandaloneTable st)
+                        {
+                            // Standalone tables have no geometry or spatial reference;
+                            // surface what they DO have: row count + source path.
+                            try
+                            {
+                                using var table = st.GetTable();
+                                if (table != null)
+                                {
+                                    props["rowCount"] = (int)table.GetCount();
+                                    props["dataSource"] = table.GetPath()?.ToString();
+                                }
                             }
                             catch { }
                         }
@@ -315,6 +353,7 @@ namespace APBridgeAddIn
                         !req.Args.TryGetValue("layer", out string? raLayerName) ||
                         string.IsNullOrWhiteSpace(raLayerName))
                         return new(false, "arg 'layer' required", null);
+                    req.Args.TryGetValue("map", out string? raMapName);
 
                     req.Args.TryGetValue("fields", out string? fieldsStr);
                     req.Args.TryGetValue("where", out string? whereClause);
@@ -335,24 +374,21 @@ namespace APBridgeAddIn
 
                     var data = await QueuedTask.Run<object>(() =>
                     {
-                        var map = MapView.Active?.Map
-                            ?? throw new InvalidOperationException("No active map");
-                        var fl = map.GetLayersAsFlattenedList()
-                            .OfType<FeatureLayer>()
-                            .FirstOrDefault(l => l.Name.Equals(raLayerName, StringComparison.OrdinalIgnoreCase))
-                            ?? throw new InvalidOperationException($"Layer not found: {raLayerName}");
+                        var map = ResolveMap(raMapName);
+                        var member = FindMapMemberByName(map, raLayerName)
+                            ?? throw new InvalidOperationException($"Layer or table not found: {raLayerName}");
 
-                        // Guard against layers whose underlying feature class can't
-                        // be resolved (broken data source, unloaded analysis output,
-                        // deleted gdb feature class). Without this, fc.GetDefinition()
-                        // a few lines down NREs and the caller sees a generic
-                        // "NullReferenceException" instead of an actionable message.
-                        using var fc = fl.GetFeatureClass()
+                        // FeatureClass for feature layers, Table for standalone tables.
+                        // Both share GetDefinition()/GetFields() via TableDefinition;
+                        // GetShapeField is on FeatureClassDefinition only, so we narrow.
+                        using var table = GetTableFromMember(member)
                             ?? throw new InvalidOperationException(
-                                $"Layer '{fl.Name}' has no resolved feature class — its data source may be missing or unloaded.");
-                        var fcDef = fc.GetDefinition();
-                        var allFields = fcDef.GetFields();
-                        var shapeFieldName = fcDef.GetShapeField();
+                                $"'{member.Name}' is a {member.GetType().Name} with no attribute table — read_layer_attributes works on feature layers and standalone tables.");
+                        var tableDef = table.GetDefinition();
+                        var allFields = tableDef.GetFields();
+                        var shapeFieldName = (tableDef is ArcGIS.Core.Data.FeatureClassDefinition fcd)
+                            ? fcd.GetShapeField()
+                            : null;
 
                         // Output field set: requested fields verbatim (validate
                         // each exists), or all non-geometry/blob/raster fields.
@@ -387,7 +423,7 @@ namespace APBridgeAddIn
 
                         var rows = new List<Dictionary<string, object?>>();
                         bool limited = false;
-                        using (var cursor = fc.Search(queryFilter, false))
+                        using (var cursor = table.Search(queryFilter, false))
                         {
                             while (cursor.MoveNext())
                             {
@@ -414,7 +450,7 @@ namespace APBridgeAddIn
 
                         return (object)new
                         {
-                            layer = fl.Name,
+                            layer = member.Name,
                             fieldNames = outputFields.Select(f => f.Name).ToList(),
                             rows,
                             returned = rows.Count,
@@ -430,6 +466,7 @@ namespace APBridgeAddIn
                         !req.Args.TryGetValue("layer", out string? gsfLayerName) ||
                         string.IsNullOrWhiteSpace(gsfLayerName))
                         return new(false, "arg 'layer' required", null);
+                    req.Args.TryGetValue("map", out string? gsfMapName);
 
                     req.Args.TryGetValue("fields", out string? gsfFieldsStr);
                     int gsfLimit = 50;
@@ -445,24 +482,18 @@ namespace APBridgeAddIn
 
                     var data = await QueuedTask.Run<object>(() =>
                     {
-                        var map = MapView.Active?.Map
-                            ?? throw new InvalidOperationException("No active map");
-                        var fl = map.GetLayersAsFlattenedList()
-                            .OfType<FeatureLayer>()
-                            .FirstOrDefault(l => l.Name.Equals(gsfLayerName, StringComparison.OrdinalIgnoreCase))
-                            ?? throw new InvalidOperationException($"Layer not found: {gsfLayerName}");
+                        var map = ResolveMap(gsfMapName);
+                        var member = FindMapMemberByName(map, gsfLayerName)
+                            ?? throw new InvalidOperationException($"Layer or table not found: {gsfLayerName}");
 
-                        // Guard against layers whose underlying feature class can't
-                        // be resolved (broken data source, unloaded analysis output,
-                        // deleted gdb feature class). Without this, fc.GetDefinition()
-                        // a few lines down NREs and the caller sees a generic
-                        // "NullReferenceException" instead of an actionable message.
-                        using var fc = fl.GetFeatureClass()
+                        using var table = GetTableFromMember(member)
                             ?? throw new InvalidOperationException(
-                                $"Layer '{fl.Name}' has no resolved feature class — its data source may be missing or unloaded.");
-                        var fcDef = fc.GetDefinition();
-                        var allFields = fcDef.GetFields();
-                        var shapeFieldName = fcDef.GetShapeField();
+                                $"'{member.Name}' is a {member.GetType().Name} with no attribute table — get_selected_features works on feature layers and standalone tables.");
+                        var tableDef = table.GetDefinition();
+                        var allFields = tableDef.GetFields();
+                        var shapeFieldName = (tableDef is ArcGIS.Core.Data.FeatureClassDefinition fcdGsf)
+                            ? fcdGsf.GetShapeField()
+                            : null;
 
                         // Output field resolution — same logic as read_layer_attributes
                         List<ArcGIS.Core.Data.Field> outputFields;
@@ -488,10 +519,19 @@ namespace APBridgeAddIn
                             }
                         }
 
-                        // Read from the layer's current Selection (not the
-                        // underlying feature class). Empty selection returns an
-                        // empty rows list and selectedTotal=0 rather than an error.
-                        using var selection = fl.GetSelection();
+                        // Read from the member's current Selection (not the underlying
+                        // table). Empty selection returns an empty rows list and
+                        // selectedTotal=0 rather than an error. FeatureLayer and
+                        // StandaloneTable both expose GetSelection() returning a
+                        // common Selection type — but the methods themselves are
+                        // declared on the subclasses, not on MapMember, so we dispatch.
+                        using var selection = member switch
+                        {
+                            FeatureLayer flGsf => flGsf.GetSelection(),
+                            ArcGIS.Desktop.Mapping.StandaloneTable stGsf => stGsf.GetSelection(),
+                            _ => throw new InvalidOperationException(
+                                $"'{member.Name}' is a {member.GetType().Name} which doesn't support selection.")
+                        };
                         long selectedTotal = selection.GetCount();
 
                         var rows = new List<Dictionary<string, object?>>();
@@ -521,7 +561,7 @@ namespace APBridgeAddIn
 
                         return (object)new
                         {
-                            layer = fl.Name,
+                            layer = member.Name,
                             fieldNames = outputFields.Select(f => f.Name).ToList(),
                             rows,
                             returned = rows.Count,
@@ -963,6 +1003,69 @@ namespace APBridgeAddIn
         /// planet. <c>clampedToSrValidRange</c> indicates whether clamping fired.
         /// </summary>
         /// <summary>
+        /// Resolve a Map by name from the current project, or the active MapView's
+        /// map if mapName is null/whitespace. Throws InvalidOperationException with
+        /// a clear message if the named map doesn't exist or no map is active.
+        /// Wraps the Project.Current/MapView.Active access points so every handler
+        /// can accept an optional 'map' parameter without duplicating boilerplate.
+        /// Must be called from within a QueuedTask (Project.Current and MapProjectItem.GetMap
+        /// have thread-affinity requirements).
+        /// </summary>
+        private static ArcGIS.Desktop.Mapping.Map ResolveMap(string? mapName)
+        {
+            if (string.IsNullOrWhiteSpace(mapName))
+            {
+                return MapView.Active?.Map
+                    ?? throw new InvalidOperationException(
+                        "No active map and no 'map' parameter provided. Open a map view in Pro or specify 'map' explicitly.");
+            }
+            var mapItem = Project.Current.GetItems<MapProjectItem>()
+                .FirstOrDefault(m => m.Name.Equals(mapName, StringComparison.OrdinalIgnoreCase))
+                ?? throw new InvalidOperationException($"Map not found: {mapName}");
+            return mapItem.GetMap();
+        }
+
+        /// <summary>
+        /// Find a MapMember (Layer or StandaloneTable) by name in a Map. Searches
+        /// flattened layer tree (descending into group layers) AND standalone
+        /// tables. Returns null if not found. Case-insensitive name match.
+        /// First match wins — for duplicate names across groups, layer order in
+        /// the TOC determines priority.
+        /// </summary>
+        private static ArcGIS.Desktop.Mapping.MapMember? FindMapMemberByName(
+            ArcGIS.Desktop.Mapping.Map map, string name)
+        {
+            foreach (var layer in map.GetLayersAsFlattenedList())
+            {
+                if (layer.Name.Equals(name, StringComparison.OrdinalIgnoreCase))
+                    return layer;
+            }
+            foreach (var table in map.StandaloneTables)
+            {
+                if (table.Name.Equals(name, StringComparison.OrdinalIgnoreCase))
+                    return table;
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// Resolve the underlying ArcGIS.Core.Data.Table for a MapMember that has
+        /// row-providing data. Returns FeatureClass for FeatureLayers (FeatureClass
+        /// inherits from Table) and Table for StandaloneTables. Returns null for
+        /// member types without an attribute table (GroupLayer, RasterLayer, etc.).
+        /// </summary>
+        private static ArcGIS.Core.Data.Table? GetTableFromMember(
+            ArcGIS.Desktop.Mapping.MapMember member)
+        {
+            return member switch
+            {
+                FeatureLayer fl => fl.GetFeatureClass(),
+                ArcGIS.Desktop.Mapping.StandaloneTable st => st.GetTable(),
+                _ => null
+            };
+        }
+
+        /// <summary>
         /// Shared attribute-setter for the add_*_features handlers. Walks each
         /// key in the supplied JSON object, looks up the matching field (case-
         /// insensitive) in the feature class definition, coerces the JSON value
@@ -1161,28 +1264,49 @@ namespace APBridgeAddIn
         private static async Task<IpcResponse> HandleClearSelection(Dictionary<string, string>? args)
         {
             string? layerName = null;
+            string? mapName = null;
             args?.TryGetValue("layer", out layerName);
+            args?.TryGetValue("map", out mapName);
 
             var result = await QueuedTask.Run<(bool ok, string? error, int cleared, string? layerCleared)>(() =>
             {
-                var map = MapView.Active?.Map;
-                if (map == null) return (false, "No active map view", 0, null);
+                ArcGIS.Desktop.Mapping.Map map;
+                try { map = ResolveMap(mapName); }
+                catch (InvalidOperationException ex) { return (false, ex.Message, 0, null); }
 
                 if (!string.IsNullOrWhiteSpace(layerName))
                 {
-                    var fl = map.GetLayersAsFlattenedList()
-                        .OfType<FeatureLayer>()
-                        .FirstOrDefault(l => l.Name.Equals(layerName, StringComparison.OrdinalIgnoreCase));
-                    if (fl == null)
-                        throw new InvalidOperationException($"Layer not found: {layerName}");
-                    fl.ClearSelection();
-                    return (true, null, 1, fl.Name);
+                    // Single-target mode: clear selection on the named feature layer
+                    // OR standalone table. Both expose ClearSelection() on their
+                    // subclasses (not on MapMember), so dispatch.
+                    var member = FindMapMemberByName(map, layerName)
+                        ?? throw new InvalidOperationException($"Layer or table not found: {layerName}");
+                    switch (member)
+                    {
+                        case FeatureLayer flCs: flCs.ClearSelection(); break;
+                        case ArcGIS.Desktop.Mapping.StandaloneTable stCs: stCs.ClearSelection(); break;
+                        default:
+                            throw new InvalidOperationException(
+                                $"'{member.Name}' is a {member.GetType().Name} which doesn't support selection.");
+                    }
+                    return (true, null, 1, member.Name);
                 }
 
-                var featureLayers = map.GetLayersAsFlattenedList().OfType<FeatureLayer>().ToList();
-                foreach (var fl in featureLayers)
+                // All-targets mode: clear every feature layer AND every standalone
+                // table. Both contribute selection state that would silently restrict
+                // downstream GP tool inputs; clearing both makes the reset uniform.
+                int clearedCount = 0;
+                foreach (var fl in map.GetLayersAsFlattenedList().OfType<FeatureLayer>())
+                {
                     fl.ClearSelection();
-                return (true, null, featureLayers.Count, null);
+                    clearedCount++;
+                }
+                foreach (var st in map.StandaloneTables)
+                {
+                    st.ClearSelection();
+                    clearedCount++;
+                }
+                return (true, null, clearedCount, null);
             });
 
             if (!result.ok) return new(false, result.error, null);

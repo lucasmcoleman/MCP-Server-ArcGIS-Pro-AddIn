@@ -6,6 +6,27 @@ This project is a hardened fork/evolution of [nicogis/MCP-Server-ArcGIS-Pro-AddI
 
 ---
 
+## [Standalone tables + optional map parameter on read-side handlers] — 2026-05-12
+
+Closes two more layer-finding gaps surfaced during agent audit (alongside the nested-layer fix). Both affect the same 8 read-side handlers; both add optional behavior without changing existing call sites' semantics.
+
+### Added
+- **Standalone tables are now first-class addressable members.** Previously every handler searched only `Map.GetLayersAsFlattenedList()`, which excludes non-spatial standalone tables. An agent calling `read_layer_attributes("MyAttributeTable")` or `list_fields("LookupTable")` got `"Layer not found"` even when the table was right there in the TOC. Eight read-side handlers now search BOTH `GetLayersAsFlattenedList()` AND `Map.StandaloneTables`: `list_layers`, `list_fields`, `get_layer_properties`, `read_layer_attributes`, `get_selected_features`, `select_by_attribute`, `count_features`, `clear_selection`.
+- **Optional `map` parameter on each of the 8 handlers** lets the agent target a non-active map by name. Default behavior unchanged: omit `map` to use the active map view's map. Useful when an agent wants to inspect a layer in a different map without switching views first.
+
+### Internal
+- Added three private helpers in `ProBridgeService` to centralize the new logic:
+  - `ResolveMap(string? mapName)` — returns the named map or the active map's map; throws structured error if neither is available.
+  - `FindMapMemberByName(Map, string)` — searches flattened layers + standalone tables, returns the first match. Case-insensitive.
+  - `GetTableFromMember(MapMember)` — returns the underlying `Table` for both `FeatureLayer` (via `GetFeatureClass()`, which inherits from `Table`) and `StandaloneTable` (via `GetTable()`). Returns null for member types without an attribute table (group layers, raster layers, etc.) so callers can throw a member-type-aware error.
+- `list_layers` response now includes standalone table names alongside layer names in a flat array. Group-layer hierarchy was already flattened (from yesterday's fix); now the table dimension is too. Agents can use `get_layer_properties` on a returned name to distinguish a layer from a table.
+- `get_layer_properties` returns reduced metadata for standalone tables: `type=StandaloneTable`, `dataSource`, `rowCount`. No `spatialReference`, `extent`, `geometryType`, or `featureCount` (they don't apply to non-spatial tables). Existing layer paths return the same shape as before.
+- `select_by_attribute`, `get_selected_features`, and `clear_selection` dispatch their `Select()` / `GetSelection()` / `ClearSelection()` calls between `FeatureLayer` and `StandaloneTable` because those methods are declared on subclasses, not on a common interface.
+- `clear_selection` in all-targets mode (no `layer` arg) now also clears every standalone table's selection in addition to feature layers. Same conceptual rationale as the original: leftover selection state silently restricts downstream operations.
+- Handlers NOT changed by this batch (still feature-layer-only, reject standalone tables explicitly): `zoom_to_layer`, `set_layer_visibility`, `move_layer`, `add_point_features`, `add_polygon_features`, `export_layer`, `rename_layer`, `remove_layer`. These are operations that either don't apply to non-spatial tables (zoom, geometry-creation) or have layer-specific semantics (TOC ordering). Future work if those workflows surface real needs.
+
+---
+
 ## [Nested-layer support for layer-name handlers] — 2026-05-12
 
 ### Fixed
