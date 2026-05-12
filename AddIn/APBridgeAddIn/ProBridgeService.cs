@@ -130,7 +130,7 @@ namespace APBridgeAddIn
 
                 case "pro.listLayers":
                     var layers = await QueuedTask.Run(() =>
-                        MapView.Active?.Map?.Layers.Select(l => l.Name).ToList()
+                        MapView.Active?.Map?.GetLayersAsFlattenedList().Select(l => l.Name).ToList()
                         ?? new List<string>());
                     return new(true, null, layers);
 
@@ -143,7 +143,7 @@ namespace APBridgeAddIn
 
                     int count = await QueuedTask.Run(() =>
                     {
-                        var fl = MapView.Active?.Map?.Layers
+                        var fl = MapView.Active?.Map?.GetLayersAsFlattenedList()
                             .OfType<FeatureLayer>()
                             .FirstOrDefault(l => l.Name.Equals(layerName, StringComparison.OrdinalIgnoreCase));
                         if (fl == null) throw new InvalidOperationException($"Layer not found: {layerName}");
@@ -169,7 +169,7 @@ namespace APBridgeAddIn
 
                     await QueuedTask.Run(async () =>
                     {
-                        var fl = MapView.Active?.Map?.Layers
+                        var fl = MapView.Active?.Map?.GetLayersAsFlattenedList()
                             .OfType<FeatureLayer>()
                             .FirstOrDefault(l => l.Name.Equals(layerName, StringComparison.OrdinalIgnoreCase));
                         if (fl == null)
@@ -190,7 +190,7 @@ namespace APBridgeAddIn
 
                     var selectionInfo = await QueuedTask.Run<object?>(() =>
                     {
-                        var fl = MapView.Active?.Map?.Layers
+                        var fl = MapView.Active?.Map?.GetLayersAsFlattenedList()
                             .OfType<FeatureLayer>()
                             .FirstOrDefault(l => l.Name.Equals(layerName, StringComparison.OrdinalIgnoreCase));
                         if (fl == null) return null;
@@ -214,7 +214,7 @@ namespace APBridgeAddIn
                     {
                         var map = MapView.Active?.Map
                             ?? throw new InvalidOperationException("No active map");
-                        var fl = map.Layers
+                        var fl = map.GetLayersAsFlattenedList()
                             .OfType<FeatureLayer>()
                             .FirstOrDefault(l => l.Name.Equals(lfLayerName, StringComparison.OrdinalIgnoreCase))
                             ?? throw new InvalidOperationException($"Layer not found: {lfLayerName}");
@@ -255,7 +255,7 @@ namespace APBridgeAddIn
                     {
                         var map = MapView.Active?.Map
                             ?? throw new InvalidOperationException("No active map");
-                        var layer = map.Layers
+                        var layer = map.GetLayersAsFlattenedList()
                             .FirstOrDefault(l => l.Name.Equals(lpLayerName, StringComparison.OrdinalIgnoreCase))
                             ?? throw new InvalidOperationException($"Layer not found: {lpLayerName}");
 
@@ -337,7 +337,7 @@ namespace APBridgeAddIn
                     {
                         var map = MapView.Active?.Map
                             ?? throw new InvalidOperationException("No active map");
-                        var fl = map.Layers
+                        var fl = map.GetLayersAsFlattenedList()
                             .OfType<FeatureLayer>()
                             .FirstOrDefault(l => l.Name.Equals(raLayerName, StringComparison.OrdinalIgnoreCase))
                             ?? throw new InvalidOperationException($"Layer not found: {raLayerName}");
@@ -447,7 +447,7 @@ namespace APBridgeAddIn
                     {
                         var map = MapView.Active?.Map
                             ?? throw new InvalidOperationException("No active map");
-                        var fl = map.Layers
+                        var fl = map.GetLayersAsFlattenedList()
                             .OfType<FeatureLayer>()
                             .FirstOrDefault(l => l.Name.Equals(gsfLayerName, StringComparison.OrdinalIgnoreCase))
                             ?? throw new InvalidOperationException($"Layer not found: {gsfLayerName}");
@@ -554,7 +554,7 @@ namespace APBridgeAddIn
                     {
                         var map = MapView.Active?.Map;
                         if (map == null) return null;
-                        var layer = map.Layers
+                        var layer = map.GetLayersAsFlattenedList()
                             .FirstOrDefault(l => l.Name.Equals(layerName, StringComparison.OrdinalIgnoreCase));
                         if (layer == null) return null;
                         var actualName = layer.Name;
@@ -580,7 +580,7 @@ namespace APBridgeAddIn
                     {
                         var map = MapView.Active?.Map;
                         if (map == null) return null;
-                        var layer = map.Layers
+                        var layer = map.GetLayersAsFlattenedList()
                             .FirstOrDefault(l => l.Name.Equals(layerName, StringComparison.OrdinalIgnoreCase));
                         if (layer == null) return null;
                         var oldName = layer.Name;
@@ -609,7 +609,7 @@ namespace APBridgeAddIn
                     {
                         var map = MapView.Active?.Map;
                         if (map == null) return null;
-                        var layer = map.Layers
+                        var layer = map.GetLayersAsFlattenedList()
                             .FirstOrDefault(l => l.Name.Equals(layerName, StringComparison.OrdinalIgnoreCase));
                         if (layer == null) return null;
                         layer.SetVisibility(visible);
@@ -635,6 +635,10 @@ namespace APBridgeAddIn
                     {
                         var map = MapView.Active?.Map;
                         if (map == null) return null;
+                        // move_layer operates on the top-level TOC ordering only —
+                        // reordering within or out of a group is a different op
+                        // semantically, so this handler uses map.Layers (top-level)
+                        // rather than the flattened tree the other handlers use.
                         var topLayers = map.Layers;
                         var layer = topLayers
                             .FirstOrDefault(l => l.Name.Equals(layerName, StringComparison.OrdinalIgnoreCase));
@@ -758,7 +762,7 @@ namespace APBridgeAddIn
                     {
                         var map = MapView.Active?.Map
                             ?? throw new InvalidOperationException("No active map");
-                        var fl = map.Layers
+                        var fl = map.GetLayersAsFlattenedList()
                             .OfType<FeatureLayer>()
                             .FirstOrDefault(l => l.Name.Equals(apfLayerName, StringComparison.OrdinalIgnoreCase))
                             ?? throw new InvalidOperationException($"Layer not found: {apfLayerName}");
@@ -861,7 +865,7 @@ namespace APBridgeAddIn
                     {
                         var map = MapView.Active?.Map
                             ?? throw new InvalidOperationException("No active map");
-                        var fl = map.Layers
+                        var fl = map.GetLayersAsFlattenedList()
                             .OfType<FeatureLayer>()
                             .FirstOrDefault(l => l.Name.Equals(apgLayerName, StringComparison.OrdinalIgnoreCase))
                             ?? throw new InvalidOperationException($"Layer not found: {apgLayerName}");
@@ -1166,7 +1170,7 @@ namespace APBridgeAddIn
 
                 if (!string.IsNullOrWhiteSpace(layerName))
                 {
-                    var fl = map.Layers
+                    var fl = map.GetLayersAsFlattenedList()
                         .OfType<FeatureLayer>()
                         .FirstOrDefault(l => l.Name.Equals(layerName, StringComparison.OrdinalIgnoreCase));
                     if (fl == null)
@@ -1175,7 +1179,7 @@ namespace APBridgeAddIn
                     return (true, null, 1, fl.Name);
                 }
 
-                var featureLayers = map.Layers.OfType<FeatureLayer>().ToList();
+                var featureLayers = map.GetLayersAsFlattenedList().OfType<FeatureLayer>().ToList();
                 foreach (var fl in featureLayers)
                     fl.ClearSelection();
                 return (true, null, featureLayers.Count, null);
@@ -1300,7 +1304,7 @@ namespace APBridgeAddIn
 
             // Resolve the layer so we return a clear error before invoking GP.
             var resolved = await QueuedTask.Run(() =>
-                MapView.Active?.Map?.Layers
+                MapView.Active?.Map?.GetLayersAsFlattenedList()
                     .OfType<FeatureLayer>()
                     .FirstOrDefault(l => l.Name.Equals(layerName, StringComparison.OrdinalIgnoreCase))
                     ?.Name);
