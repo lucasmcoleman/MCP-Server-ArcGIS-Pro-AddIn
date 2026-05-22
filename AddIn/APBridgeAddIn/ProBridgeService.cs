@@ -2144,29 +2144,38 @@ namespace APBridgeAddIn
                 string.IsNullOrWhiteSpace(modelName))
                 return new(false, "args 'toolboxPath' & 'modelName' required", null);
 
-            // Build the tool path: "toolboxPath\modelName"
-            var toolPath = $"{path}\\{modelName}";
-
-            // Read the model's declared parameter order so we can map the user's named
-            // dict to a positional array in the order arcpy expects. See class-level
-            // doc comment above for the symptom this prevents.
-            List<string> paramOrder;
+            // Step-by-step execution. Calling ExecuteToolAsync on the model as a
+            // whole tool triggers Pro's chain pre-validation, which rejects any
+            // intermediate INPUT whose producing tool has not yet created the FC
+            // on disk — fatal on first run. The ribbon Run dialog avoids this by
+            // running ModelBuilder's own engine: each process is validated JIT
+            // immediately before it executes, after its upstream outputs already
+            // exist. We mirror that here by parsing the model graph, topologically
+            // sorting processes, and calling ExecuteToolAsync once per step with
+            // refs resolved against a runtime variable map.
+            ModelGraph graph;
             try
             {
-                var description = AtbxManager.DescribeModel(path, modelName);
-                var inputs = JsonNode.Parse(description)?["inputs"]?.AsArray();
-                paramOrder = inputs?
-                    .Select(i => i?["name"]?.GetValue<string>() ?? "")
-                    .Where(n => !string.IsNullOrEmpty(n))
-                    .ToList() ?? new List<string>();
+                graph = AtbxManager.WalkModel(path, modelName);
             }
             catch (Exception ex)
             {
-                return new(false, $"Failed to read model parameter order from '{path}': {ex.Message}", null);
+                return new(false, $"Failed to read model from '{path}': {ex.Message}", null);
             }
 
-            // Collect user-supplied named values (case-insensitive matching against
-            // the model's declared names — arcpy is generally case-insensitive too).
+            // Reject iterators / nested sub-models — step-by-step semantics don't
+            // apply. Agents needing iteration should compose run_gp_tool calls.
+            var iterator = graph.Processes.FirstOrDefault(p => p.IsIterator);
+            if (iterator != null)
+            {
+                return new(false,
+                    $"Model '{modelName}' contains iterator or nested model '{iterator.Name}' " +
+                    $"(tool '{iterator.Tool}'). Step-by-step execution doesn't support these yet — " +
+                    $"compose run_gp_tool calls instead.",
+                    null);
+            }
+
+            // Collect user-supplied named values (case-insensitive matching).
             var namedValues = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             if (args.TryGetValue("parameters", out string? paramsJson) && !string.IsNullOrWhiteSpace(paramsJson))
             {
@@ -2178,52 +2187,144 @@ namespace APBridgeAddIn
                 }
             }
 
-            // Catch typos / stale param names early — surfacing the model's actual
-            // parameter list saves agents a describe_model round-trip.
+            // Determine model input parameter names (exposed Parameter variables
+            // that no process produces). Used to catch agent typos early.
+            var producedIds = graph.Processes
+                .SelectMany(p => p.Params.Values)
+                .Where(pm => pm.OutputVariableId != null)
+                .Select(pm => pm.OutputVariableId!)
+                .ToHashSet();
+            var inputParamNames = graph.Variables.Values
+                .Where(v => v.IsParameter && !producedIds.Contains(v.Id))
+                .Select(v => v.Name)
+                .ToList();
+
             var unknownKeys = namedValues.Keys
-                .Where(k => !paramOrder.Any(p => p.Equals(k, StringComparison.OrdinalIgnoreCase)))
+                .Where(k => !inputParamNames.Any(n => n.Equals(k, StringComparison.OrdinalIgnoreCase)))
                 .ToList();
             if (unknownKeys.Any())
             {
                 return new(false,
                     $"Unknown model parameter(s): {string.Join(", ", unknownKeys)}. " +
-                    $"Model '{modelName}' expects: [{string.Join(", ", paramOrder)}]",
+                    $"Model '{modelName}' expects: [{string.Join(", ", inputParamNames)}]",
                     null);
             }
 
-            // Build positional array in the model's declared order. For parameters
-            // the user did NOT supply, send arcpy's "#" sentinel — this tells the
-            // GP engine "use the parameter's declared default". Empty string is
-            // NOT equivalent: arcpy reads "" as an explicit empty value and the
-            // validator emits ERROR 000735 ("Value is required") for required
-            // params or overrides the model's default for optional ones. If the
-            // user explicitly supplied an empty string, that intent is preserved
-            // (the dict contains the key with value "").
-            var paramValues = paramOrder
-                .Select(name => namedValues.TryGetValue(name, out var v) ? v : "#")
-                .ToArray();
-
-            var valueArray = Geoprocessing.MakeValueArray(paramValues);
-            var result = await Geoprocessing.ExecuteToolAsync(toolPath, valueArray, DefaultRunEnvironments());
-
-            if (result.IsFailed)
+            // Seed the runtime variable map: variable id → value (path or literal).
+            // User-supplied input values win over the variable's stored default.
+            // Intermediate variables that have an explicit stored path are pre-
+            // seeded too, so explicit-path models honor the author's choice.
+            var runtimeValues = new Dictionary<string, string>();
+            foreach (var v in graph.Variables.Values)
             {
-                var errorTexts = result.Messages
-                    .Where(m => m.Type == GPMessageType.Error)
-                    .Select(m => m.Text)
-                    .ToList();
-
-                var msgs = result.Messages.Any()
-                    ? string.Join("; ", result.Messages.Select(m => m.Text))
-                    : errorTexts.Any()
-                        ? string.Join("; ", errorTexts)
-                        : "arcpy reported failure with no messages — check parameters";
-
-                return new(false, $"Model execution failed: {msgs}", null);
+                if (v.IsParameter && namedValues.TryGetValue(v.Name, out var userVal))
+                    runtimeValues[v.Id] = userVal;
+                else if (!string.IsNullOrEmpty(v.StoredValue))
+                    runtimeValues[v.Id] = v.StoredValue;
             }
 
-            var outputMessages = result.Messages.Select(m => new { type = m.Type.ToString(), text = m.Text }).ToList();
-            return new(true, null, new { success = true, messages = outputMessages });
+            // Workspace for generating derived-output paths. Same source as
+            // DefaultRunEnvironments, but we need the path string directly to
+            // build per-step output paths upfront (so downstream refs resolve).
+            string scratchGdb;
+            try { scratchGdb = Project.Current?.DefaultGeodatabasePath ?? ""; }
+            catch { scratchGdb = ""; }
+
+            var env = DefaultRunEnvironments();
+            var allMessages = new List<object>();
+
+            foreach (var proc in graph.Processes)
+            {
+                // Resolve each slot in JSON-insertion order. Pro empirically writes
+                // process params in tool-declared slot order (per Desktop's data on
+                // SummarizeWithin: in_polygons, in_sum_features, out_feature_class,
+                // keep_all_polygons, sum_fields, sum_shape, shape_unit). Trusting
+                // that order produces the positional value array ExecuteToolAsync
+                // expects.
+                var values = new List<object>();
+                foreach (var (slotName, pm) in proc.Params)
+                {
+                    if (pm.OutputVariableId != null)
+                    {
+                        if (!runtimeValues.TryGetValue(pm.OutputVariableId, out var outPath) ||
+                            string.IsNullOrEmpty(outPath))
+                        {
+                            var varName = graph.Variables.TryGetValue(pm.OutputVariableId, out var ov)
+                                ? ov.Name
+                                : $"output_{pm.OutputVariableId}";
+                            outPath = string.IsNullOrEmpty(scratchGdb)
+                                ? varName
+                                : $"{scratchGdb}\\{varName}";
+                            runtimeValues[pm.OutputVariableId] = outPath;
+                        }
+                        values.Add(outPath);
+                    }
+                    else if (pm.RefVariableId != null)
+                    {
+                        if (runtimeValues.TryGetValue(pm.RefVariableId, out var refVal))
+                        {
+                            values.Add(refVal);
+                        }
+                        else
+                        {
+                            // Unresolved ref: distinguish "user didn't supply a model input"
+                            // (use arcpy's "#" sentinel so the GP engine resolves from the
+                            // variable's declared default) from "intermediate that the
+                            // producer step should have populated but didn't" (pass empty
+                            // so the error surfaces immediately).
+                            var isUnsuppliedInput = graph.Variables.TryGetValue(pm.RefVariableId, out var v)
+                                && v.IsParameter
+                                && !producedIds.Contains(pm.RefVariableId);
+                            values.Add(isUnsuppliedInput ? "#" : "");
+                        }
+                    }
+                    else if (pm.LiteralValue != null)
+                    {
+                        // Guard against compound-CRS WKT stored on `in_coor_system`-like
+                        // slots. Pro auto-stamps Project steps fed by intermediate outputs
+                        // with the source dataset's COMPOUNDCRS (NAD83 + NAVD88 etc.), and
+                        // that value triggers ERROR 000365 (Invalid geographic
+                        // transformation) at execution. Substituting "#" tells the GP
+                        // engine to infer from the input's native CRS, which is what the
+                        // ribbon Run does. Targeted check: compound CRS WKTs always
+                        // contain COMPOUNDCRS or a VERTCRS clause; no legitimate horizontal
+                        // CRS literal does.
+                        var lit = pm.LiteralValue;
+                        if (lit.Contains("COMPOUNDCRS", StringComparison.OrdinalIgnoreCase)
+                            || lit.Contains("VERTCRS", StringComparison.OrdinalIgnoreCase))
+                            values.Add("#");
+                        else
+                            values.Add(lit);
+                    }
+                    else
+                    {
+                        values.Add("");
+                    }
+                }
+
+                var valueArray = Geoprocessing.MakeValueArray(values.ToArray());
+                var stepResult = await Geoprocessing.ExecuteToolAsync(proc.Tool, valueArray, env);
+
+                if (stepResult.IsFailed)
+                {
+                    var msgs = stepResult.Messages.Any()
+                        ? string.Join("; ", stepResult.Messages.Select(m => $"{m.Type}: {m.Text}"))
+                        : "arcpy reported failure with no messages";
+                    return new(false,
+                        $"Step '{proc.Name}' ({proc.Tool}) failed: {msgs}",
+                        new { failedStep = proc.Name, tool = proc.Tool, completedSteps = allMessages.Count });
+                }
+
+                foreach (var m in stepResult.Messages)
+                    allMessages.Add(new { step = proc.Name, type = m.Type.ToString(), text = m.Text });
+            }
+
+            return new(true, null, new
+            {
+                success = true,
+                stepsRun = graph.Processes.Count,
+                messages = allMessages
+            });
         }
 
         /// <summary>
@@ -2232,13 +2333,33 @@ namespace APBridgeAddIn
         /// ERROR 000210 (output already exists) is an unhelpful failure
         /// mode when the whole point is repeatable automation.
         ///
+        /// Also pins workspace + scratchWorkspace to the project's default
+        /// GDB. The ribbon Run dialog applies these by default; ExecuteToolAsync
+        /// from an Add-In does NOT, which causes ModelBuilder models whose
+        /// intermediate outputs are derived (no explicit path) to fail
+        /// pre-validation with ERROR 000735 ("Value is required") on every
+        /// step's out_dataset — the GP engine cannot resolve where to place
+        /// the derived output. Pinning both env vars gives derived outputs
+        /// somewhere to land, mirroring GUI behavior.
+        ///
         /// NOTE: MakeEnvironmentArray is a named-argument method (every GP
         /// env is a separate parameter); passing a Dictionary as a positional
         /// arg binds it to `workspace`, producing a cryptic runtime binder
         /// error. Use named-argument syntax.
         /// </summary>
-        private static IReadOnlyList<KeyValuePair<string, string>> DefaultRunEnvironments() =>
-            Geoprocessing.MakeEnvironmentArray(overwriteoutput: true);
+        private static IReadOnlyList<KeyValuePair<string, string>> DefaultRunEnvironments()
+        {
+            string? defaultGdb = null;
+            try { defaultGdb = Project.Current?.DefaultGeodatabasePath; }
+            catch { /* no open project — fall through to env without workspace */ }
+
+            return !string.IsNullOrEmpty(defaultGdb)
+                ? Geoprocessing.MakeEnvironmentArray(
+                    overwriteoutput: true,
+                    workspace: defaultGdb,
+                    scratchWorkspace: defaultGdb)
+                : Geoprocessing.MakeEnvironmentArray(overwriteoutput: true);
+        }
 
         /// <summary>
         /// Runs an arbitrary geoprocessing tool by name (e.g., <c>analysis.Buffer</c>,
