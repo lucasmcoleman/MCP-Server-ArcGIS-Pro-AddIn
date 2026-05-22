@@ -2119,6 +2119,92 @@ namespace APBridgeAddIn
         }
 
         /// <summary>
+        /// Declared parameter signatures for common system GP tools, keyed by
+        /// <c>"toolboxAlias.toolName"</c>. Order matches each tool's positional
+        /// signature in the ArcGIS Pro 3.x docs. When the step-by-step model
+        /// executor encounters one of these tools, it walks this list in order
+        /// and fills each position by looking up the slot name in the process's
+        /// stored params (using arcpy's <c>"#"</c> sentinel for slots the model
+        /// omits, so the GP engine uses each tool's declared default).
+        ///
+        /// Without this name-to-position mapping, the executor packs values
+        /// densely in JSON insertion order — which silently corrupts the call
+        /// when a model omits an optional slot before an included one. Example:
+        /// <c>management.Project</c> with <c>{in_dataset, out_dataset, out_coor_system,
+        /// preserve_shape, vertical}</c> in JSON order dense-packs as positions
+        /// 0..4, but the real signature has <c>transform_method</c> at slot 3 and
+        /// <c>in_coor_system</c> at slot 4, so <c>"false"</c> from preserve_shape
+        /// lands in transform_method (→ ERROR 000365) and <c>"false"</c> from
+        /// vertical lands in in_coor_system (→ WARNING 230002).
+        ///
+        /// Pro SDK exposes no introspection API for tool signatures — the docs
+        /// just say "look it up". Extend this dictionary as new tools are
+        /// encountered in real models. For tools not listed here, the executor
+        /// falls back to dense-packing (the old behavior) and the resulting
+        /// shift will surface as misnamed-slot errors that pinpoint the tool.
+        /// </summary>
+        private static readonly Dictionary<string, string[]> GpToolSignatures =
+            new(StringComparer.OrdinalIgnoreCase)
+            {
+                ["management.Project"] = new[]
+                {
+                    "in_dataset", "out_dataset", "out_coor_system",
+                    "transform_method", "in_coor_system",
+                    "preserve_shape", "max_deviation", "vertical"
+                },
+                ["management.CopyFeatures"] = new[]
+                {
+                    "in_features", "out_feature_class",
+                    "config_keyword", "spatial_grid_1", "spatial_grid_2", "spatial_grid_3"
+                },
+                ["analysis.PairwiseErase"] = new[]
+                {
+                    "in_features", "erase_features", "out_feature_class", "cluster_tolerance"
+                },
+                ["analysis.SummarizeWithin"] = new[]
+                {
+                    "in_polygons", "in_sum_features", "out_feature_class",
+                    "keep_all_polygons", "sum_fields", "sum_shape", "shape_unit",
+                    "group_field", "add_min_maj", "add_group_percent", "out_group_table"
+                },
+                ["management.SelectLayerByLocation"] = new[]
+                {
+                    "in_layer", "overlap_type", "select_features",
+                    "search_distance", "selection_type", "invert_spatial_relationship"
+                },
+                ["management.CalculateField"] = new[]
+                {
+                    "in_table", "field", "expression", "expression_type",
+                    "code_block", "field_type", "enforce_domains"
+                },
+                ["management.JoinField"] = new[]
+                {
+                    "in_data", "in_field", "join_table", "join_field",
+                    "fields", "fm_option", "field_mapping", "index_join_fields"
+                },
+                ["management.AddField"] = new[]
+                {
+                    "in_table", "field_name", "field_type",
+                    "field_precision", "field_scale", "field_length", "field_alias",
+                    "field_is_nullable", "field_is_required", "field_domain"
+                },
+                ["analysis.Buffer"] = new[]
+                {
+                    "in_features", "out_feature_class", "buffer_distance_or_field",
+                    "line_side", "line_end_type", "dissolve_option", "dissolve_field", "method"
+                },
+                ["analysis.Clip"] = new[]
+                {
+                    "in_features", "clip_features", "out_feature_class", "cluster_tolerance"
+                },
+                ["analysis.Intersect"] = new[]
+                {
+                    "in_features", "out_feature_class", "join_attributes",
+                    "cluster_tolerance", "output_type"
+                },
+            };
+
+        /// <summary>
         /// Runs a ModelBuilder model with the given parameter dict. ModelBuilder models
         /// bind parameters by DECLARED ORDER (arcpy positional convention), but agents
         /// pass by NAME via the JSON dict. We read the model's parameter declaration
@@ -2241,9 +2327,34 @@ namespace APBridgeAddIn
                 // keep_all_polygons, sum_fields, sum_shape, shape_unit). Trusting
                 // that order produces the positional value array ExecuteToolAsync
                 // expects.
+                // Build positional value array. Two strategies:
+                //
+                //   1) Known tool: walk GpToolSignatures[proc.Tool] in declared order
+                //      and fill each position from proc.Params by slot NAME. For slots
+                //      the model omitted (sparse storage), insert "#" so arcpy uses
+                //      the tool's declared default. This is the correct contract for
+                //      GP system tools.
+                //
+                //   2) Unknown tool: fall back to dense-packing by JSON insertion
+                //      order. Same as the old behavior — wrong for any tool that
+                //      omits optional slots before included ones, but the resulting
+                //      misalignment surfaces as obvious slot-mismatch errors that
+                //      point at which tool to add to the signature table.
+                var slotOrder = GpToolSignatures.TryGetValue(proc.Tool, out var sig)
+                    ? sig.AsEnumerable()
+                    : proc.Params.Keys;
+
                 var values = new List<object>();
-                foreach (var (slotName, pm) in proc.Params)
+                foreach (var slotName in slotOrder)
                 {
+                    if (!proc.Params.TryGetValue(slotName, out var pm))
+                    {
+                        // Slot exists in the tool signature but model didn't store it.
+                        // "#" tells arcpy to use the tool's declared default.
+                        values.Add("#");
+                        continue;
+                    }
+
                     if (pm.OutputVariableId != null)
                     {
                         if (!runtimeValues.TryGetValue(pm.OutputVariableId, out var outPath) ||
@@ -2280,21 +2391,7 @@ namespace APBridgeAddIn
                     }
                     else if (pm.LiteralValue != null)
                     {
-                        // Guard against compound-CRS WKT stored on `in_coor_system`-like
-                        // slots. Pro auto-stamps Project steps fed by intermediate outputs
-                        // with the source dataset's COMPOUNDCRS (NAD83 + NAVD88 etc.), and
-                        // that value triggers ERROR 000365 (Invalid geographic
-                        // transformation) at execution. Substituting "#" tells the GP
-                        // engine to infer from the input's native CRS, which is what the
-                        // ribbon Run does. Targeted check: compound CRS WKTs always
-                        // contain COMPOUNDCRS or a VERTCRS clause; no legitimate horizontal
-                        // CRS literal does.
-                        var lit = pm.LiteralValue;
-                        if (lit.Contains("COMPOUNDCRS", StringComparison.OrdinalIgnoreCase)
-                            || lit.Contains("VERTCRS", StringComparison.OrdinalIgnoreCase))
-                            values.Add("#");
-                        else
-                            values.Add(lit);
+                        values.Add(pm.LiteralValue);
                     }
                     else
                     {
