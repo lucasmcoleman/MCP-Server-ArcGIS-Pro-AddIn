@@ -668,6 +668,46 @@ namespace ArcGisMcpServer.Tools
         }
 
         [McpServerTool, Description(
+            "Start a ModelBuilder model run asynchronously and return a job id " +
+            "immediately. Use this instead of RunModel when the model may exceed " +
+            "the agent's tool-call timeout (e.g., Aurora-class models with hosted " +
+            "service clips). Poll progress with GetRunStatus(jobId). Returns " +
+            "{jobId, started, pollWith}.")]
+        public static async Task<string> RunModelAsync(
+            [Description("Full file path to the .atbx toolbox file")] string toolboxPath,
+            [Description("Name of the model to run")] string modelName,
+            [Description("Optional: JSON object mapping parameter names to values, " +
+                "e.g., {\"StudyArea\": \"Counties\", \"BufferDistance\": \"1000 Meters\"}")] string? parameters = null)
+        {
+            var args = new Dictionary<string, string>
+            {
+                ["toolboxPath"] = toolboxPath,
+                ["modelName"] = modelName
+            };
+            if (!string.IsNullOrWhiteSpace(parameters))
+                args["parameters"] = parameters;
+
+            var r = await _client!.OpAsync("pro.runModelAsync", args);
+            return FormatResult(r, "pro.runModelAsync");
+        }
+
+        [McpServerTool, Description(
+            "Get the current status of an async model run by job id. Returns a " +
+            "snapshot: status (running/succeeded/failed), totalSteps, " +
+            "completedSteps, currentStep, plus failedStep/failedTool/error on " +
+            "failure and the cumulative messages list. Cheap to poll; reads a " +
+            "snapshot without blocking the run. Once endedUtc is populated the " +
+            "run is done and messages are final. Jobs auto-expire 1 hour after " +
+            "completion.")]
+        public static async Task<string> GetRunStatus(
+            [Description("Job id returned by RunModelAsync")] string jobId)
+        {
+            var args = new Dictionary<string, string> { ["jobId"] = jobId };
+            var r = await _client!.OpAsync("pro.getRunStatus", args);
+            return FormatResult(r, "pro.getRunStatus");
+        }
+
+        [McpServerTool, Description(
             "Run any geoprocessing tool directly (not just models). " +
             "Useful for one-off operations like Buffer, Clip, Select, etc.")]
         public static async Task<string> RunGPTool(
