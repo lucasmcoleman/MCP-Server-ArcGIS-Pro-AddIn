@@ -2458,6 +2458,21 @@ namespace APBridgeAddIn
                     var msgs = stepResult.Messages.Any()
                         ? string.Join("; ", stepResult.Messages.Select(m => $"{m.Type}: {m.Text}"))
                         : "arcpy reported failure with no messages";
+
+                    // Hint when a layer-name reference fails because no map view
+                    // is active. ERROR 000732 ("does not exist or is not supported")
+                    // and ERROR 000840 ("not a Feature Layer") commonly fire when
+                    // the user restarted Pro and no map tab is focused — layer-name
+                    // refs in the model can't resolve. Adding a clear hint here
+                    // saves the user from having to recognize the raw GP code.
+                    if ((msgs.Contains("ERROR 000732") || msgs.Contains("ERROR 000840"))
+                        && MapView.Active == null)
+                    {
+                        msgs += " [hint: no active map view — layer-name references "
+                              + "in the model require a map tab to be focused. Open "
+                              + "or click on a map view in Pro and retry.]";
+                    }
+
                     return new(false,
                         $"Step '{proc.Name}' ({proc.Tool}) failed: {msgs}",
                         new { failedStep = proc.Name, tool = proc.Tool, completedSteps = allMessages.Count });
