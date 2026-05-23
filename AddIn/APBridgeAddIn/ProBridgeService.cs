@@ -2407,7 +2407,7 @@ namespace APBridgeAddIn
                             string.IsNullOrEmpty(outPath))
                         {
                             var varName = graph.Variables.TryGetValue(pm.OutputVariableId, out var ov)
-                                ? ov.Name
+                                ? SanitizeGdbName(ov.Name)
                                 : $"output_{pm.OutputVariableId}";
                             outPath = string.IsNullOrEmpty(scratchGdb)
                                 ? varName
@@ -2502,6 +2502,35 @@ namespace APBridgeAddIn
                     workspace: defaultGdb,
                     scratchWorkspace: defaultGdb)
                 : Geoprocessing.MakeEnvironmentArray(overwriteoutput: true);
+        }
+
+        /// <summary>
+        /// Sanitizes a ModelBuilder variable name for use as a File Geodatabase
+        /// feature class or table name. GDB names must start with a letter and
+        /// contain only letters, digits, and underscores. ModelBuilder lets you
+        /// name a variable anything (including spaces, dashes, and other
+        /// punctuation), and when the executor uses that name to derive an
+        /// output path it would otherwise produce ERROR 000354 ("The name
+        /// contains invalid characters") on the first step whose output
+        /// variable wasn't typed to be GDB-safe.
+        ///
+        /// Replaces invalid characters with underscores, collapses runs of
+        /// underscores, and prefixes a letter if the result would otherwise
+        /// start with a digit. Empty/null input falls back to "out".
+        /// </summary>
+        private static string SanitizeGdbName(string? name)
+        {
+            if (string.IsNullOrWhiteSpace(name)) return "out";
+            var sb = new System.Text.StringBuilder(name.Length);
+            foreach (var c in name)
+                sb.Append(char.IsLetterOrDigit(c) || c == '_' ? c : '_');
+            // Collapse runs of underscores
+            var collapsed = System.Text.RegularExpressions.Regex
+                .Replace(sb.ToString(), "_+", "_")
+                .Trim('_');
+            if (string.IsNullOrEmpty(collapsed)) return "out";
+            // Must start with a letter
+            return char.IsLetter(collapsed[0]) ? collapsed : "x_" + collapsed;
         }
 
         /// <summary>
