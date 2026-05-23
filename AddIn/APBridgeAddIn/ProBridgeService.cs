@@ -766,6 +766,12 @@ namespace APBridgeAddIn
                 case "pro.runModel":
                     return await HandleRunModel(req.Args);
 
+                case "pro.runModelAsync":
+                    return HandleRunModelAsync(req.Args);
+
+                case "pro.getRunStatus":
+                    return HandleGetRunStatus(req.Args);
+
                 case "pro.runGPTool":
                     return await HandleRunGPTool(req.Args);
 
@@ -2228,6 +2234,166 @@ namespace APBridgeAddIn
         /// </summary>
         private static async Task<IpcResponse> HandleRunModel(Dictionary<string, string>? args)
         {
+            return await RunModelCore(args, null);
+        }
+
+        /// <summary>
+        /// Kicks off a model run on a background task and returns a job id
+        /// immediately. Caller polls <c>HandleGetRunStatus</c> for progress and
+        /// completion. Designed to escape agent-side MCP tool-call ceilings
+        /// (Claude Desktop caps at ~4 min; Aurora-class models can run longer
+        /// because of hosted-service clips). Each status poll is a cheap
+        /// snapshot read so polling overhead is minimal.
+        /// </summary>
+        private static IpcResponse HandleRunModelAsync(Dictionary<string, string>? args)
+        {
+            if (args == null ||
+                !args.TryGetValue("toolboxPath", out string? path) ||
+                string.IsNullOrWhiteSpace(path) ||
+                !args.TryGetValue("modelName", out string? modelName) ||
+                string.IsNullOrWhiteSpace(modelName))
+                return new(false, "args 'toolboxPath' & 'modelName' required", null);
+
+            // Drop completed jobs older than 1 hour so the registry doesn't grow
+            // unboundedly. Polling clients should fetch final status within that
+            // window; long-finished jobs are no longer interesting.
+            var cutoff = DateTime.UtcNow.AddHours(-1);
+            foreach (var kv in _runJobs.ToArray())
+            {
+                if (kv.Value.EndedUtc.HasValue && kv.Value.EndedUtc.Value < cutoff)
+                    _runJobs.TryRemove(kv.Key, out _);
+            }
+
+            var job = new RunJob
+            {
+                JobId = Guid.NewGuid().ToString("N").Substring(0, 12),
+                ToolboxPath = path,
+                ModelName = modelName,
+                StartedUtc = DateTime.UtcNow,
+                Status = "running"
+            };
+            _runJobs[job.JobId] = job;
+
+            // Fire-and-forget background execution. Exceptions are captured into
+            // the job record; nothing bubbles to an unobserved task fault.
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    var resp = await RunModelCore(args, job);
+                    lock (job.Lock)
+                    {
+                        if (resp.Ok)
+                        {
+                            job.Status = "succeeded";
+                        }
+                        else
+                        {
+                            job.Status = "failed";
+                            job.Error = resp.Error ?? "unknown failure";
+                            // Pull failedStep/tool out of the response data shape
+                            // that RunModelCore returns on a step failure.
+                            if (resp.Data is { } d)
+                            {
+                                try
+                                {
+                                    var dynData = d.GetType().GetProperty("failedStep")?.GetValue(d) as string;
+                                    if (dynData != null) job.FailedStep = dynData;
+                                    var dynTool = d.GetType().GetProperty("tool")?.GetValue(d) as string;
+                                    if (dynTool != null) job.FailedTool = dynTool;
+                                }
+                                catch { }
+                            }
+                        }
+                        job.EndedUtc = DateTime.UtcNow;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    lock (job.Lock)
+                    {
+                        job.Status = "failed";
+                        job.Error = $"{ex.GetType().Name}: {ex.Message}";
+                        job.EndedUtc = DateTime.UtcNow;
+                    }
+                }
+            });
+
+            return new(true, null, new
+            {
+                jobId = job.JobId,
+                started = job.StartedUtc,
+                pollWith = "get_run_status"
+            });
+        }
+
+        /// <summary>
+        /// Returns a snapshot of a background run job's state. Cheap to call
+        /// repeatedly; takes the job lock just long enough to copy the
+        /// current state. Status values: <c>running</c>, <c>succeeded</c>,
+        /// <c>failed</c>. Once <c>endedUtc</c> is populated, the run is done
+        /// and the messages list is final.
+        /// </summary>
+        private static IpcResponse HandleGetRunStatus(Dictionary<string, string>? args)
+        {
+            if (args == null ||
+                !args.TryGetValue("jobId", out string? jobId) ||
+                string.IsNullOrWhiteSpace(jobId))
+                return new(false, "arg 'jobId' required", null);
+
+            if (!_runJobs.TryGetValue(jobId, out var job))
+                return new(false, $"Job '{jobId}' not found (expired or never existed)", null);
+
+            lock (job.Lock)
+            {
+                return new(true, null, new
+                {
+                    jobId = job.JobId,
+                    status = job.Status,
+                    startedUtc = job.StartedUtc,
+                    endedUtc = job.EndedUtc,
+                    totalSteps = job.TotalSteps,
+                    completedSteps = job.CompletedSteps,
+                    currentStep = job.CurrentStep,
+                    failedStep = job.FailedStep,
+                    failedTool = job.FailedTool,
+                    error = job.Error,
+                    messages = job.Messages.ToList()
+                });
+            }
+        }
+
+        /// <summary>
+        /// Background job state for an async model run. Updated by
+        /// RunModelCore from a Task.Run thread; read by HandleGetRunStatus
+        /// from the IPC handler thread. The <see cref="Lock"/> serializes
+        /// concurrent writes from the executor and snapshot reads from the
+        /// status handler.
+        /// </summary>
+        private sealed class RunJob
+        {
+            public string JobId { get; init; } = "";
+            public string ToolboxPath { get; init; } = "";
+            public string ModelName { get; init; } = "";
+            public DateTime StartedUtc { get; init; }
+            public DateTime? EndedUtc { get; set; }
+            public string Status { get; set; } = "running";
+            public int TotalSteps { get; set; }
+            public int CompletedSteps { get; set; }
+            public string? CurrentStep { get; set; }
+            public string? FailedStep { get; set; }
+            public string? FailedTool { get; set; }
+            public string? Error { get; set; }
+            public List<object> Messages { get; } = new();
+            public object Lock { get; } = new();
+        }
+
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, RunJob>
+            _runJobs = new();
+
+        private static async Task<IpcResponse> RunModelCore(
+            Dictionary<string, string>? args, RunJob? job)
+        {
             if (args == null ||
                 !args.TryGetValue("toolboxPath", out string? path) ||
                 string.IsNullOrWhiteSpace(path) ||
@@ -2252,6 +2418,11 @@ namespace APBridgeAddIn
             catch (Exception ex)
             {
                 return new(false, $"Failed to read model from '{path}': {ex.Message}", null);
+            }
+
+            if (job != null)
+            {
+                lock (job.Lock) job.TotalSteps = graph.Processes.Count;
             }
 
             // Reject iterators / nested sub-models — step-by-step semantics don't
@@ -2326,6 +2497,10 @@ namespace APBridgeAddIn
 
             foreach (var proc in graph.Processes)
             {
+                if (job != null)
+                {
+                    lock (job.Lock) job.CurrentStep = proc.Name;
+                }
                 // Resolve each slot in JSON-insertion order. Pro empirically writes
                 // process params in tool-declared slot order (per Desktop's data on
                 // SummarizeWithin: in_polygons, in_sum_features, out_feature_class,
@@ -2480,6 +2655,16 @@ namespace APBridgeAddIn
 
                 foreach (var m in stepResult.Messages)
                     allMessages.Add(new { step = proc.Name, type = m.Type.ToString(), text = m.Text });
+
+                if (job != null)
+                {
+                    lock (job.Lock)
+                    {
+                        job.CompletedSteps++;
+                        foreach (var m in stepResult.Messages)
+                            job.Messages.Add(new { step = proc.Name, type = m.Type.ToString(), text = m.Text });
+                    }
+                }
             }
 
             return new(true, null, new
