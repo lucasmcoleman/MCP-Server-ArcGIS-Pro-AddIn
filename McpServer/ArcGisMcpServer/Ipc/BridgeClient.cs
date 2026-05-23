@@ -13,11 +13,14 @@ namespace ArcGisMcpServer.Ipc
     {
         public int MaxRetries { get; init; } = 3;
         public int ConnectTimeoutMs { get; init; } = 5000;
-        // 120s default covers slow Pro operations like create_project on a fresh
-        // template (.gdb init + template copy + UI setup can easily take 60s+).
-        // Agents can't show incremental progress, so cutting off mid-operation
-        // makes successful work look like a failure.
-        public int RequestTimeoutMs { get; init; } = 120000;
+        // 600s default covers long-running operations like run_model on a
+        // realistic ModelBuilder chain (Aurora's 31-step model with hosted
+        // service clips takes minutes). Shorter ops (most read-side handlers)
+        // complete in seconds, so the long ceiling is not paid in practice;
+        // it only kicks in for genuinely long ones. Cutting off mid-operation
+        // makes successful work look like a failure and the bridge keeps
+        // running server-side after the MCP gave up, wasting GP resources.
+        public int RequestTimeoutMs { get; init; } = 600000;
         public int InitialBackoffMs { get; init; } = 250;
         public int MaxBackoffMs { get; init; } = 4000;
 
@@ -32,7 +35,7 @@ namespace ArcGisMcpServer.Ipc
         {
             MaxRetries        = EnvInt("ARCGIS_MCP_MAX_RETRIES",        3),
             ConnectTimeoutMs  = EnvInt("ARCGIS_MCP_CONNECT_TIMEOUT_MS", 5000),
-            RequestTimeoutMs  = EnvInt("ARCGIS_MCP_REQUEST_TIMEOUT_MS", 120000),
+            RequestTimeoutMs  = EnvInt("ARCGIS_MCP_REQUEST_TIMEOUT_MS", 600000),
             InitialBackoffMs  = EnvInt("ARCGIS_MCP_INITIAL_BACKOFF_MS", 250),
             MaxBackoffMs      = EnvInt("ARCGIS_MCP_MAX_BACKOFF_MS",     4000),
         };
