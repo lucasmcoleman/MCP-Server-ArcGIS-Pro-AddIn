@@ -2344,6 +2344,52 @@ namespace APBridgeAddIn
                     ? sig.AsEnumerable()
                     : proc.Params.Keys;
 
+                // Pre-pass: record outputs whose slot is NOT in the tool signature.
+                // Some tools (notably selection tools — SelectLayerByLocation,
+                // SelectLayerByAttribute) modify their in_layer in place and return
+                // it; arcpy has no positional output param for the modified layer,
+                // but ModelBuilder still names a logical output variable so
+                // downstream steps can reference it. The signature walk below
+                // skips any slot not in the signature, so without this pre-pass
+                // the output variable never lands in the runtime map and
+                // downstream refs resolve to empty → ERROR 000735.
+                //
+                // For each such output, record it as the first resolved input
+                // value (typically in_layer). Outputs whose slot IS in the
+                // signature are still recorded by the signature walk's existing
+                // OutputVariableId branch.
+                if (sig != null)
+                {
+                    foreach (var (slotName, pm) in proc.Params)
+                    {
+                        if (pm.OutputVariableId == null) continue;
+                        if (sig.Contains(slotName, StringComparer.OrdinalIgnoreCase)) continue;
+                        if (runtimeValues.ContainsKey(pm.OutputVariableId)) continue;
+
+                        string? sourceValue = null;
+                        foreach (var (_, sp) in proc.Params)
+                        {
+                            if (sp.OutputVariableId != null) continue;
+                            if (sp.RefVariableId != null
+                                && runtimeValues.TryGetValue(sp.RefVariableId, out var v)
+                                && !string.IsNullOrEmpty(v))
+                            {
+                                sourceValue = v;
+                                break;
+                            }
+                            if (sp.LiteralValue != null && !string.IsNullOrEmpty(sp.LiteralValue))
+                            {
+                                sourceValue = sp.LiteralValue;
+                                break;
+                            }
+                        }
+                        if (!string.IsNullOrEmpty(sourceValue))
+                        {
+                            runtimeValues[pm.OutputVariableId] = sourceValue;
+                        }
+                    }
+                }
+
                 var values = new List<object>();
                 foreach (var slotName in slotOrder)
                 {
