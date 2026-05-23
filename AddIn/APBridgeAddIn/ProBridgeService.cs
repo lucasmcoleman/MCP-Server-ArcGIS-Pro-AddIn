@@ -2172,6 +2172,11 @@ namespace APBridgeAddIn
                     "in_layer", "overlap_type", "select_features",
                     "search_distance", "selection_type", "invert_spatial_relationship"
                 },
+                ["management.SelectLayerByAttribute"] = new[]
+                {
+                    "in_layer_or_view", "selection_type", "where_clause",
+                    "invert_where_clause"
+                },
                 ["management.CalculateField"] = new[]
                 {
                     "in_table", "field", "expression", "expression_type",
