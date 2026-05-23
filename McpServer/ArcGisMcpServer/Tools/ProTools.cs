@@ -673,7 +673,7 @@ namespace ArcGisMcpServer.Tools
             "the agent's tool-call timeout (e.g., Aurora-class models with hosted " +
             "service clips). Poll progress with GetRunStatus(jobId). Returns " +
             "{jobId, started, pollWith}.")]
-        public static async Task<string> RunModelAsync(
+        public static async Task<string> StartRunModel(
             [Description("Full file path to the .atbx toolbox file")] string toolboxPath,
             [Description("Name of the model to run")] string modelName,
             [Description("Optional: JSON object mapping parameter names to values, " +
