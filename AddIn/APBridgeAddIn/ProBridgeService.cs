@@ -2437,7 +2437,7 @@ namespace APBridgeAddIn
                     }
                     else if (pm.LiteralValue != null)
                     {
-                        values.Add(pm.LiteralValue);
+                        values.Add(SubstituteModelVars(pm.LiteralValue, graph, runtimeValues));
                     }
                     else
                     {
@@ -2502,6 +2502,48 @@ namespace APBridgeAddIn
                     workspace: defaultGdb,
                     scratchWorkspace: defaultGdb)
                 : Geoprocessing.MakeEnvironmentArray(overwriteoutput: true);
+        }
+
+        /// <summary>
+        /// Substitutes ModelBuilder <c>%VarName%</c> patterns in a literal
+        /// value with the runtime value of that variable. ModelBuilder's own
+        /// engine performs this string substitution before handing expressions
+        /// to arcpy (most commonly on <c>CalculateField.expression</c> and
+        /// SQL where-clauses); our step-by-step executor must do the same or
+        /// arcpy sees the literal <c>%Foo%</c> and treats it as Python /
+        /// invalid SQL, producing ERROR 000539 (SyntaxError) or similar.
+        ///
+        /// Variable lookup is case-insensitive by name. Unresolved patterns
+        /// are left in place; the resulting GP error will surface the missing
+        /// variable name to the caller.
+        /// </summary>
+        private static string SubstituteModelVars(
+            string literal,
+            ModelGraph graph,
+            Dictionary<string, string> runtimeValues)
+        {
+            if (string.IsNullOrEmpty(literal) || !literal.Contains('%'))
+                return literal;
+            return System.Text.RegularExpressions.Regex.Replace(
+                literal,
+                @"%([A-Za-z_][A-Za-z0-9_]*)%",
+                match =>
+                {
+                    var varName = match.Groups[1].Value;
+                    foreach (var v in graph.Variables.Values)
+                    {
+                        if (!string.Equals(v.Name, varName,
+                            StringComparison.OrdinalIgnoreCase)) continue;
+                        if (runtimeValues.TryGetValue(v.Id, out var val)
+                            && !string.IsNullOrEmpty(val))
+                            return val;
+                        // Fall back to the variable's stored value (model
+                        // parameter default) if the runtime map doesn't carry it.
+                        if (!string.IsNullOrEmpty(v.StoredValue))
+                            return v.StoredValue;
+                    }
+                    return match.Value;
+                });
         }
 
         /// <summary>
