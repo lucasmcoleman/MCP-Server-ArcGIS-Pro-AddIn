@@ -42,17 +42,33 @@ namespace ArcGisMcpServer.Tools
             return FormatResult(r, "pro.listMaps");
         }
 
-        [McpServerTool, Description("List of layers in the active map")]
-        public static async Task<string> ListLayers()
+        [McpServerTool, Description(
+            "List names of layers AND standalone tables in a map. Returns a flat " +
+            "JSON array of names including spatial layers (nested via group layers " +
+            "appear inline with their parents in TOC order) AND non-spatial " +
+            "standalone tables. Use get_layer_properties on a returned name to " +
+            "distinguish layer-vs-table or to discover geometry type. Default: " +
+            "active map; specify 'map' to list items from a different map in the project.")]
+        public static async Task<string> ListLayers(
+            [Description("Optional: name of the map to list. Default: active map.")] string? map = null)
         {
-            var r = await _client!.OpAsync("pro.listLayers");
+            var args = new Dictionary<string, string>();
+            if (!string.IsNullOrWhiteSpace(map)) args["map"] = map;
+            var r = await _client!.OpAsync("pro.listLayers", args);
             return FormatResult(r, "pro.listLayers");
         }
 
-        [McpServerTool, Description("Count features in a layer by name")]
-        public static async Task<string> CountFeatures(string layer)
+        [McpServerTool, Description(
+            "Count features (or rows, for standalone tables) in a layer or " +
+            "standalone table by name. Searches the active map by default; " +
+            "specify 'map' to target a different map in the project.")]
+        public static async Task<string> CountFeatures(
+            [Description("Layer or standalone table name (matches what list_layers returns)")] string layer,
+            [Description("Optional: name of the map to operate on. Default: active map.")] string? map = null)
         {
-            var r = await _client!.OpAsync("pro.countFeatures", new() { ["layer"] = layer });
+            var args = new Dictionary<string, string> { ["layer"] = layer };
+            if (!string.IsNullOrWhiteSpace(map)) args["map"] = map;
+            var r = await _client!.OpAsync("pro.countFeatures", args);
             return FormatResult(r, "pro.countFeatures");
         }
 
@@ -68,39 +84,53 @@ namespace ArcGisMcpServer.Tools
             "Returns the number of selected features. " +
             "Example where clauses: \"POP > 1000\", \"NAME = 'Seattle'\", \"STATE IN ('WA','OR')\".")]
         public static async Task<string> SelectByAttribute(
-            [Description("Name of the feature layer in the active map")] string layer,
-            [Description("SQL WHERE clause to filter the layer's features")] string where)
+            [Description("Feature layer OR standalone table name (matches what list_layers returns)")] string layer,
+            [Description("SQL WHERE clause to filter the rows. Example: \"POP > 1000\"")] string where,
+            [Description("Optional: name of the map to operate on. Default: active map.")] string? map = null)
         {
-            var r = await _client!.OpAsync("pro.selectByAttribute", new()
+            var args = new Dictionary<string, string>
             {
                 ["layer"] = layer,
                 ["where"] = where
-            });
+            };
+            if (!string.IsNullOrWhiteSpace(map)) args["map"] = map;
+            var r = await _client!.OpAsync("pro.selectByAttribute", args);
             return FormatResult(r, "pro.selectByAttribute");
         }
 
         [McpServerTool, Description(
-            "List the field schema of a feature layer: name, alias, type, length, " +
-            "isNullable, isEditable for each field. Use before select_by_attribute, " +
-            "read_layer_attributes, or run_gp_tool calls that take field names so the " +
-            "agent can verify fields exist and check types before crafting a query.")]
+            "List the field schema of a feature layer or standalone table: name, " +
+            "alias, type, length, isNullable, isEditable for each field. Use before " +
+            "select_by_attribute, read_layer_attributes, or run_gp_tool calls that " +
+            "take field names so the agent can verify fields exist and check types " +
+            "before crafting a query. Works on standalone tables (non-spatial " +
+            "attribute tables) as well as feature layers. Default: active map; " +
+            "specify 'map' to target a different map in the project.")]
         public static async Task<string> ListFields(
-            [Description("Layer name, matching what list_layers returns")] string layer)
+            [Description("Layer or standalone table name (matches what list_layers returns)")] string layer,
+            [Description("Optional: name of the map to operate on. Default: active map.")] string? map = null)
         {
-            var r = await _client!.OpAsync("pro.listFields", new() { ["layer"] = layer });
+            var args = new Dictionary<string, string> { ["layer"] = layer };
+            if (!string.IsNullOrWhiteSpace(map)) args["map"] = map;
+            var r = await _client!.OpAsync("pro.listFields", args);
             return FormatResult(r, "pro.listFields");
         }
 
         [McpServerTool, Description(
-            "Get general properties of a layer: type (FeatureLayer, RasterLayer, etc.), " +
-            "data source path, spatial reference (wkid + name), extent, visibility, " +
-            "feature count, and geometry type. Useful as a 'tell me about this layer' " +
-            "query before deciding what operations apply (e.g., GP tools that only work " +
-            "on point layers vs polygon layers).")]
+            "Get general properties of a layer or standalone table. For layers: type " +
+            "(FeatureLayer, RasterLayer, etc.), data source path, spatial reference " +
+            "(wkid + name), extent, visibility, feature count, geometry type. For " +
+            "standalone tables: type (StandaloneTable), data source path, row count " +
+            "(no SR/extent/geometry — they're non-spatial). Useful as a 'tell me about " +
+            "this' query before deciding what operations apply. Default: active map; " +
+            "specify 'map' to target a different map in the project.")]
         public static async Task<string> GetLayerProperties(
-            [Description("Layer name, matching what list_layers returns")] string layer)
+            [Description("Layer or standalone table name (matches what list_layers returns)")] string layer,
+            [Description("Optional: name of the map to operate on. Default: active map.")] string? map = null)
         {
-            var r = await _client!.OpAsync("pro.getLayerProperties", new() { ["layer"] = layer });
+            var args = new Dictionary<string, string> { ["layer"] = layer };
+            if (!string.IsNullOrWhiteSpace(map)) args["map"] = map;
+            var r = await _client!.OpAsync("pro.getLayerProperties", args);
             return FormatResult(r, "pro.getLayerProperties");
         }
 
@@ -114,17 +144,19 @@ namespace ArcGisMcpServer.Tools
             "and 'limit' to cap response size. If 'limited' is true in the response, " +
             "more rows exist than were returned — narrow with 'where' to see them.")]
         public static async Task<string> ReadLayerAttributes(
-            [Description("Layer name, matching what list_layers returns")] string layer,
+            [Description("Layer or standalone table name (matches what list_layers returns)")] string layer,
             [Description("Optional: comma-separated field names. Omit for all non-geometry fields.")] string? fields = null,
             [Description("Optional: SQL WHERE clause to filter rows.")] string? where = null,
             [Description("Optional: ORDER BY clause without the 'ORDER BY' keyword (e.g., 'Population DESC').")] string? orderBy = null,
-            [Description("Optional: max rows to return. Default 50, max 1000.")] int limit = 50)
+            [Description("Optional: max rows to return. Default 50, max 1000.")] int limit = 50,
+            [Description("Optional: name of the map to operate on. Default: active map.")] string? map = null)
         {
             var args = new Dictionary<string, string> { ["layer"] = layer };
             if (!string.IsNullOrWhiteSpace(fields)) args["fields"] = fields;
             if (!string.IsNullOrWhiteSpace(where)) args["where"] = where;
             if (!string.IsNullOrWhiteSpace(orderBy)) args["orderBy"] = orderBy;
             args["limit"] = limit.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            if (!string.IsNullOrWhiteSpace(map)) args["map"] = map;
             var r = await _client!.OpAsync("pro.readLayerAttributes", args);
             return FormatResult(r, "pro.readLayerAttributes");
         }
@@ -137,13 +169,15 @@ namespace ArcGisMcpServer.Tools
             "with an additional 'selectedTotal' count. If nothing is selected, returns " +
             "an empty rows list and selectedTotal=0 (not an error).")]
         public static async Task<string> GetSelectedFeatures(
-            [Description("Layer name, matching what list_layers returns")] string layer,
+            [Description("Layer or standalone table name (matches what list_layers returns)")] string layer,
             [Description("Optional: comma-separated field names. Omit for all non-geometry fields.")] string? fields = null,
-            [Description("Optional: max rows to return. Default 50, max 1000.")] int limit = 50)
+            [Description("Optional: max rows to return. Default 50, max 1000.")] int limit = 50,
+            [Description("Optional: name of the map to operate on. Default: active map.")] string? map = null)
         {
             var args = new Dictionary<string, string> { ["layer"] = layer };
             if (!string.IsNullOrWhiteSpace(fields)) args["fields"] = fields;
             args["limit"] = limit.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            if (!string.IsNullOrWhiteSpace(map)) args["map"] = map;
             var r = await _client!.OpAsync("pro.getSelectedFeatures", args);
             return FormatResult(r, "pro.getSelectedFeatures");
         }
@@ -156,11 +190,12 @@ namespace ArcGisMcpServer.Tools
             "tool inputs when those tools accept layer names, which is a common source of " +
             "confusing 'unexpectedly-empty' outputs.")]
         public static async Task<string> ClearSelection(
-            [Description("Optional: name of a specific layer to clear. Omit to clear all layers.")] string? layer = null)
+            [Description("Optional: name of a specific layer or standalone table to clear. Omit to clear ALL feature layers AND all standalone tables.")] string? layer = null,
+            [Description("Optional: name of the map to operate on. Default: active map.")] string? map = null)
         {
             var args = new Dictionary<string, string>();
-            if (!string.IsNullOrWhiteSpace(layer))
-                args["layer"] = layer;
+            if (!string.IsNullOrWhiteSpace(layer)) args["layer"] = layer;
+            if (!string.IsNullOrWhiteSpace(map)) args["map"] = map;
             var r = await _client!.OpAsync("pro.clearSelection", args);
             return FormatResult(r, "pro.clearSelection");
         }
@@ -630,6 +665,46 @@ namespace ArcGisMcpServer.Tools
 
             var r = await _client!.OpAsync("pro.runModel", args);
             return FormatResult(r, "pro.runModel");
+        }
+
+        [McpServerTool, Description(
+            "Start a ModelBuilder model run asynchronously and return a job id " +
+            "immediately. Use this instead of RunModel when the model may exceed " +
+            "the agent's tool-call timeout (e.g., Aurora-class models with hosted " +
+            "service clips). Poll progress with GetRunStatus(jobId). Returns " +
+            "{jobId, started, pollWith}.")]
+        public static async Task<string> StartRunModel(
+            [Description("Full file path to the .atbx toolbox file")] string toolboxPath,
+            [Description("Name of the model to run")] string modelName,
+            [Description("Optional: JSON object mapping parameter names to values, " +
+                "e.g., {\"StudyArea\": \"Counties\", \"BufferDistance\": \"1000 Meters\"}")] string? parameters = null)
+        {
+            var args = new Dictionary<string, string>
+            {
+                ["toolboxPath"] = toolboxPath,
+                ["modelName"] = modelName
+            };
+            if (!string.IsNullOrWhiteSpace(parameters))
+                args["parameters"] = parameters;
+
+            var r = await _client!.OpAsync("pro.runModelAsync", args);
+            return FormatResult(r, "pro.runModelAsync");
+        }
+
+        [McpServerTool, Description(
+            "Get the current status of an async model run by job id. Returns a " +
+            "snapshot: status (running/succeeded/failed), totalSteps, " +
+            "completedSteps, currentStep, plus failedStep/failedTool/error on " +
+            "failure and the cumulative messages list. Cheap to poll; reads a " +
+            "snapshot without blocking the run. Once endedUtc is populated the " +
+            "run is done and messages are final. Jobs auto-expire 1 hour after " +
+            "completion.")]
+        public static async Task<string> GetRunStatus(
+            [Description("Job id returned by RunModelAsync")] string jobId)
+        {
+            var args = new Dictionary<string, string> { ["jobId"] = jobId };
+            var r = await _client!.OpAsync("pro.getRunStatus", args);
+            return FormatResult(r, "pro.getRunStatus");
         }
 
         [McpServerTool, Description(

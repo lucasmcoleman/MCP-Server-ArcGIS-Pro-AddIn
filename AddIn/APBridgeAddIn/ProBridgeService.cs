@@ -129,10 +129,23 @@ namespace APBridgeAddIn
                     return new(true, null, new { name });
 
                 case "pro.listLayers":
-                    var layers = await QueuedTask.Run(() =>
-                        MapView.Active?.Map?.GetLayersAsFlattenedList().Select(l => l.Name).ToList()
-                        ?? new List<string>());
-                    return new(true, null, layers);
+                {
+                    string? mapName = null;
+                    req.Args?.TryGetValue("map", out mapName);
+
+                    var allNames = await QueuedTask.Run(() =>
+                    {
+                        var map = ResolveMap(mapName);
+                        var names = new List<string>();
+                        // Layers first (flattened tree, group layers + their children),
+                        // then standalone tables. Both contribute to the response so
+                        // the agent sees the full set of addressable map members.
+                        names.AddRange(map.GetLayersAsFlattenedList().Select(l => l.Name));
+                        names.AddRange(map.StandaloneTables.Select(t => t.Name));
+                        return names;
+                    });
+                    return new(true, null, allNames);
+                }
 
                 case "pro.countFeatures":
                 {
@@ -140,22 +153,21 @@ namespace APBridgeAddIn
                         !req.Args.TryGetValue("layer", out string? layerName) ||
                         string.IsNullOrWhiteSpace(layerName))
                         return new(false, "arg 'layer' required", null);
+                    req.Args.TryGetValue("map", out string? mapName);
 
                     int count = await QueuedTask.Run(() =>
                     {
-                        var fl = MapView.Active?.Map?.GetLayersAsFlattenedList()
-                            .OfType<FeatureLayer>()
-                            .FirstOrDefault(l => l.Name.Equals(layerName, StringComparison.OrdinalIgnoreCase));
-                        if (fl == null) throw new InvalidOperationException($"Layer not found: {layerName}");
-                        // Guard against layers whose underlying feature class can't
-                        // be resolved (broken data source, unloaded analysis output,
-                        // deleted gdb feature class). Without this, fc.GetDefinition()
-                        // a few lines down NREs and the caller sees a generic
-                        // "NullReferenceException" instead of an actionable message.
-                        using var fc = fl.GetFeatureClass()
+                        var map = ResolveMap(mapName);
+                        var member = FindMapMemberByName(map, layerName)
+                            ?? throw new InvalidOperationException($"Layer or table not found: {layerName}");
+                        // Both FeatureClass (for FeatureLayer) and Table (for
+                        // StandaloneTable) expose GetCount(); FeatureClass inherits
+                        // from Table, so the count_features semantics extend
+                        // naturally to standalone tables ("count rows").
+                        using var table = GetTableFromMember(member)
                             ?? throw new InvalidOperationException(
-                                $"Layer '{fl.Name}' has no resolved feature class — its data source may be missing or unloaded.");
-                        return (int)fc.GetCount();
+                                $"'{member.Name}' is a {member.GetType().Name} with no attribute table — count_features works on feature layers and standalone tables.");
+                        return (int)table.GetCount();
                     });
                     return new(true, null, new { count });
                 }
@@ -187,19 +199,26 @@ namespace APBridgeAddIn
                         !req.Args.TryGetValue("where", out string? where) ||
                         string.IsNullOrWhiteSpace(where))
                         return new(false, "args 'layer' & 'where' required", null);
+                    req.Args.TryGetValue("map", out string? sbaMapName);
 
-                    var selectionInfo = await QueuedTask.Run<object?>(() =>
+                    var selectionInfo = await QueuedTask.Run<object>(() =>
                     {
-                        var fl = MapView.Active?.Map?.GetLayersAsFlattenedList()
-                            .OfType<FeatureLayer>()
-                            .FirstOrDefault(l => l.Name.Equals(layerName, StringComparison.OrdinalIgnoreCase));
-                        if (fl == null) return null;
-                        var sel = fl.Select(new ArcGIS.Core.Data.QueryFilter { WhereClause = where });
-                        return new { layer = fl.Name, selectedCount = sel?.GetCount() ?? 0 };
+                        var map = ResolveMap(sbaMapName);
+                        var member = FindMapMemberByName(map, layerName)
+                            ?? throw new InvalidOperationException($"Layer or table not found: {layerName}");
+                        // Both FeatureLayer and StandaloneTable expose Select(QueryFilter),
+                        // but the methods are declared on the subclasses (not on MapMember),
+                        // so dispatch explicitly. Returns a Selection on either path.
+                        var qf = new ArcGIS.Core.Data.QueryFilter { WhereClause = where };
+                        var sel = member switch
+                        {
+                            FeatureLayer flSba => flSba.Select(qf),
+                            ArcGIS.Desktop.Mapping.StandaloneTable stSba => stSba.Select(qf),
+                            _ => throw new InvalidOperationException(
+                                $"'{member.Name}' is a {member.GetType().Name} which doesn't support selection — select_by_attribute works on feature layers and standalone tables.")
+                        };
+                        return (object)new { layer = member.Name, selectedCount = sel?.GetCount() ?? 0 };
                     });
-
-                    if (selectionInfo == null)
-                        return new(false, $"Layer not found: {layerName}", null);
                     return new(true, null, selectionInfo);
                 }
 
@@ -209,25 +228,21 @@ namespace APBridgeAddIn
                         !req.Args.TryGetValue("layer", out string? lfLayerName) ||
                         string.IsNullOrWhiteSpace(lfLayerName))
                         return new(false, "arg 'layer' required", null);
+                    req.Args.TryGetValue("map", out string? lfMapName);
 
                     var data = await QueuedTask.Run<object>(() =>
                     {
-                        var map = MapView.Active?.Map
-                            ?? throw new InvalidOperationException("No active map");
-                        var fl = map.GetLayersAsFlattenedList()
-                            .OfType<FeatureLayer>()
-                            .FirstOrDefault(l => l.Name.Equals(lfLayerName, StringComparison.OrdinalIgnoreCase))
-                            ?? throw new InvalidOperationException($"Layer not found: {lfLayerName}");
+                        var map = ResolveMap(lfMapName);
+                        var member = FindMapMemberByName(map, lfLayerName)
+                            ?? throw new InvalidOperationException($"Layer or table not found: {lfLayerName}");
 
-                        // Guard against layers whose underlying feature class can't
-                        // be resolved (broken data source, unloaded analysis output,
-                        // deleted gdb feature class). Without this, fc.GetDefinition()
-                        // a few lines down NREs and the caller sees a generic
-                        // "NullReferenceException" instead of an actionable message.
-                        using var fc = fl.GetFeatureClass()
+                        // FeatureClass.GetDefinition() returns FeatureClassDefinition;
+                        // Table.GetDefinition() returns TableDefinition. The former
+                        // inherits from the latter, so GetFields() works uniformly.
+                        using var table = GetTableFromMember(member)
                             ?? throw new InvalidOperationException(
-                                $"Layer '{fl.Name}' has no resolved feature class — its data source may be missing or unloaded.");
-                        var fields = fc.GetDefinition().GetFields()
+                                $"'{member.Name}' is a {member.GetType().Name} with no attribute table — list_fields works on feature layers and standalone tables.");
+                        var fields = table.GetDefinition().GetFields()
                             .Select(f => new
                             {
                                 name = f.Name,
@@ -239,7 +254,7 @@ namespace APBridgeAddIn
                             })
                             .ToList();
 
-                        return new { layer = fl.Name, fields };
+                        return new { layer = member.Name, fields };
                     });
                     return new(true, null, data);
                 }
@@ -250,56 +265,79 @@ namespace APBridgeAddIn
                         !req.Args.TryGetValue("layer", out string? lpLayerName) ||
                         string.IsNullOrWhiteSpace(lpLayerName))
                         return new(false, "arg 'layer' required", null);
+                    req.Args.TryGetValue("map", out string? lpMapName);
 
                     var data = await QueuedTask.Run<object>(() =>
                     {
-                        var map = MapView.Active?.Map
-                            ?? throw new InvalidOperationException("No active map");
-                        var layer = map.GetLayersAsFlattenedList()
-                            .FirstOrDefault(l => l.Name.Equals(lpLayerName, StringComparison.OrdinalIgnoreCase))
-                            ?? throw new InvalidOperationException($"Layer not found: {lpLayerName}");
+                        var map = ResolveMap(lpMapName);
+                        var member = FindMapMemberByName(map, lpLayerName)
+                            ?? throw new InvalidOperationException($"Layer or table not found: {lpLayerName}");
 
-                        // Build properties dict incrementally — different layer types
+                        // Build properties dict incrementally — different member types
                         // expose different things; wrap each accessor in try/catch so
-                        // a missing property (e.g., SR on a basemap) doesn't blow up
-                        // the whole response.
+                        // a missing property (e.g., SR on a basemap, or extent on a
+                        // standalone table) doesn't blow up the whole response.
                         var props = new Dictionary<string, object?>
                         {
-                            ["name"] = layer.Name,
-                            ["type"] = layer.GetType().Name,
-                            ["isVisible"] = layer.IsVisible
+                            ["name"] = member.Name,
+                            ["type"] = member.GetType().Name
                         };
 
-                        try
+                        if (member is Layer layer)
                         {
-                            var sr = layer.GetSpatialReference();
-                            if (sr != null)
-                                props["spatialReference"] = new { wkid = sr.Wkid, name = sr.Name };
-                        }
-                        catch { }
+                            // Spatial-member properties: visibility, SR, extent, and
+                            // (for FeatureLayer) geometry type, feature count, source path.
+                            props["isVisible"] = layer.IsVisible;
 
-                        try
-                        {
-                            var extent = layer.QueryExtent();
-                            if (extent != null)
-                                props["extent"] = new
-                                {
-                                    xmin = extent.XMin,
-                                    ymin = extent.YMin,
-                                    xmax = extent.XMax,
-                                    ymax = extent.YMax
-                                };
-                        }
-                        catch { }
-
-                        if (layer is FeatureLayer flProps)
-                        {
                             try
                             {
-                                props["geometryType"] = flProps.ShapeType.ToString();
-                                using var fc = flProps.GetFeatureClass();
-                                props["featureCount"] = (int)fc.GetCount();
-                                props["dataSource"] = fc.GetPath()?.ToString();
+                                var sr = layer.GetSpatialReference();
+                                if (sr != null)
+                                    props["spatialReference"] = new { wkid = sr.Wkid, name = sr.Name };
+                            }
+                            catch { }
+
+                            try
+                            {
+                                var extent = layer.QueryExtent();
+                                if (extent != null)
+                                    props["extent"] = new
+                                    {
+                                        xmin = extent.XMin,
+                                        ymin = extent.YMin,
+                                        xmax = extent.XMax,
+                                        ymax = extent.YMax
+                                    };
+                            }
+                            catch { }
+
+                            if (layer is FeatureLayer flProps)
+                            {
+                                try
+                                {
+                                    props["geometryType"] = flProps.ShapeType.ToString();
+                                    using var fc = flProps.GetFeatureClass();
+                                    if (fc != null)
+                                    {
+                                        props["featureCount"] = (int)fc.GetCount();
+                                        props["dataSource"] = fc.GetPath()?.ToString();
+                                    }
+                                }
+                                catch { }
+                            }
+                        }
+                        else if (member is ArcGIS.Desktop.Mapping.StandaloneTable st)
+                        {
+                            // Standalone tables have no geometry or spatial reference;
+                            // surface what they DO have: row count + source path.
+                            try
+                            {
+                                using var table = st.GetTable();
+                                if (table != null)
+                                {
+                                    props["rowCount"] = (int)table.GetCount();
+                                    props["dataSource"] = table.GetPath()?.ToString();
+                                }
                             }
                             catch { }
                         }
@@ -315,6 +353,7 @@ namespace APBridgeAddIn
                         !req.Args.TryGetValue("layer", out string? raLayerName) ||
                         string.IsNullOrWhiteSpace(raLayerName))
                         return new(false, "arg 'layer' required", null);
+                    req.Args.TryGetValue("map", out string? raMapName);
 
                     req.Args.TryGetValue("fields", out string? fieldsStr);
                     req.Args.TryGetValue("where", out string? whereClause);
@@ -335,24 +374,21 @@ namespace APBridgeAddIn
 
                     var data = await QueuedTask.Run<object>(() =>
                     {
-                        var map = MapView.Active?.Map
-                            ?? throw new InvalidOperationException("No active map");
-                        var fl = map.GetLayersAsFlattenedList()
-                            .OfType<FeatureLayer>()
-                            .FirstOrDefault(l => l.Name.Equals(raLayerName, StringComparison.OrdinalIgnoreCase))
-                            ?? throw new InvalidOperationException($"Layer not found: {raLayerName}");
+                        var map = ResolveMap(raMapName);
+                        var member = FindMapMemberByName(map, raLayerName)
+                            ?? throw new InvalidOperationException($"Layer or table not found: {raLayerName}");
 
-                        // Guard against layers whose underlying feature class can't
-                        // be resolved (broken data source, unloaded analysis output,
-                        // deleted gdb feature class). Without this, fc.GetDefinition()
-                        // a few lines down NREs and the caller sees a generic
-                        // "NullReferenceException" instead of an actionable message.
-                        using var fc = fl.GetFeatureClass()
+                        // FeatureClass for feature layers, Table for standalone tables.
+                        // Both share GetDefinition()/GetFields() via TableDefinition;
+                        // GetShapeField is on FeatureClassDefinition only, so we narrow.
+                        using var table = GetTableFromMember(member)
                             ?? throw new InvalidOperationException(
-                                $"Layer '{fl.Name}' has no resolved feature class — its data source may be missing or unloaded.");
-                        var fcDef = fc.GetDefinition();
-                        var allFields = fcDef.GetFields();
-                        var shapeFieldName = fcDef.GetShapeField();
+                                $"'{member.Name}' is a {member.GetType().Name} with no attribute table — read_layer_attributes works on feature layers and standalone tables.");
+                        var tableDef = table.GetDefinition();
+                        var allFields = tableDef.GetFields();
+                        var shapeFieldName = (tableDef is ArcGIS.Core.Data.FeatureClassDefinition fcd)
+                            ? fcd.GetShapeField()
+                            : null;
 
                         // Output field set: requested fields verbatim (validate
                         // each exists), or all non-geometry/blob/raster fields.
@@ -387,7 +423,7 @@ namespace APBridgeAddIn
 
                         var rows = new List<Dictionary<string, object?>>();
                         bool limited = false;
-                        using (var cursor = fc.Search(queryFilter, false))
+                        using (var cursor = table.Search(queryFilter, false))
                         {
                             while (cursor.MoveNext())
                             {
@@ -414,7 +450,7 @@ namespace APBridgeAddIn
 
                         return (object)new
                         {
-                            layer = fl.Name,
+                            layer = member.Name,
                             fieldNames = outputFields.Select(f => f.Name).ToList(),
                             rows,
                             returned = rows.Count,
@@ -430,6 +466,7 @@ namespace APBridgeAddIn
                         !req.Args.TryGetValue("layer", out string? gsfLayerName) ||
                         string.IsNullOrWhiteSpace(gsfLayerName))
                         return new(false, "arg 'layer' required", null);
+                    req.Args.TryGetValue("map", out string? gsfMapName);
 
                     req.Args.TryGetValue("fields", out string? gsfFieldsStr);
                     int gsfLimit = 50;
@@ -445,24 +482,18 @@ namespace APBridgeAddIn
 
                     var data = await QueuedTask.Run<object>(() =>
                     {
-                        var map = MapView.Active?.Map
-                            ?? throw new InvalidOperationException("No active map");
-                        var fl = map.GetLayersAsFlattenedList()
-                            .OfType<FeatureLayer>()
-                            .FirstOrDefault(l => l.Name.Equals(gsfLayerName, StringComparison.OrdinalIgnoreCase))
-                            ?? throw new InvalidOperationException($"Layer not found: {gsfLayerName}");
+                        var map = ResolveMap(gsfMapName);
+                        var member = FindMapMemberByName(map, gsfLayerName)
+                            ?? throw new InvalidOperationException($"Layer or table not found: {gsfLayerName}");
 
-                        // Guard against layers whose underlying feature class can't
-                        // be resolved (broken data source, unloaded analysis output,
-                        // deleted gdb feature class). Without this, fc.GetDefinition()
-                        // a few lines down NREs and the caller sees a generic
-                        // "NullReferenceException" instead of an actionable message.
-                        using var fc = fl.GetFeatureClass()
+                        using var table = GetTableFromMember(member)
                             ?? throw new InvalidOperationException(
-                                $"Layer '{fl.Name}' has no resolved feature class — its data source may be missing or unloaded.");
-                        var fcDef = fc.GetDefinition();
-                        var allFields = fcDef.GetFields();
-                        var shapeFieldName = fcDef.GetShapeField();
+                                $"'{member.Name}' is a {member.GetType().Name} with no attribute table — get_selected_features works on feature layers and standalone tables.");
+                        var tableDef = table.GetDefinition();
+                        var allFields = tableDef.GetFields();
+                        var shapeFieldName = (tableDef is ArcGIS.Core.Data.FeatureClassDefinition fcdGsf)
+                            ? fcdGsf.GetShapeField()
+                            : null;
 
                         // Output field resolution — same logic as read_layer_attributes
                         List<ArcGIS.Core.Data.Field> outputFields;
@@ -488,10 +519,19 @@ namespace APBridgeAddIn
                             }
                         }
 
-                        // Read from the layer's current Selection (not the
-                        // underlying feature class). Empty selection returns an
-                        // empty rows list and selectedTotal=0 rather than an error.
-                        using var selection = fl.GetSelection();
+                        // Read from the member's current Selection (not the underlying
+                        // table). Empty selection returns an empty rows list and
+                        // selectedTotal=0 rather than an error. FeatureLayer and
+                        // StandaloneTable both expose GetSelection() returning a
+                        // common Selection type — but the methods themselves are
+                        // declared on the subclasses, not on MapMember, so we dispatch.
+                        using var selection = member switch
+                        {
+                            FeatureLayer flGsf => flGsf.GetSelection(),
+                            ArcGIS.Desktop.Mapping.StandaloneTable stGsf => stGsf.GetSelection(),
+                            _ => throw new InvalidOperationException(
+                                $"'{member.Name}' is a {member.GetType().Name} which doesn't support selection.")
+                        };
                         long selectedTotal = selection.GetCount();
 
                         var rows = new List<Dictionary<string, object?>>();
@@ -521,7 +561,7 @@ namespace APBridgeAddIn
 
                         return (object)new
                         {
-                            layer = fl.Name,
+                            layer = member.Name,
                             fieldNames = outputFields.Select(f => f.Name).ToList(),
                             rows,
                             returned = rows.Count,
@@ -725,6 +765,12 @@ namespace APBridgeAddIn
 
                 case "pro.runModel":
                     return await HandleRunModel(req.Args);
+
+                case "pro.runModelAsync":
+                    return HandleRunModelAsync(req.Args);
+
+                case "pro.getRunStatus":
+                    return HandleGetRunStatus(req.Args);
 
                 case "pro.runGPTool":
                     return await HandleRunGPTool(req.Args);
@@ -963,6 +1009,69 @@ namespace APBridgeAddIn
         /// planet. <c>clampedToSrValidRange</c> indicates whether clamping fired.
         /// </summary>
         /// <summary>
+        /// Resolve a Map by name from the current project, or the active MapView's
+        /// map if mapName is null/whitespace. Throws InvalidOperationException with
+        /// a clear message if the named map doesn't exist or no map is active.
+        /// Wraps the Project.Current/MapView.Active access points so every handler
+        /// can accept an optional 'map' parameter without duplicating boilerplate.
+        /// Must be called from within a QueuedTask (Project.Current and MapProjectItem.GetMap
+        /// have thread-affinity requirements).
+        /// </summary>
+        private static ArcGIS.Desktop.Mapping.Map ResolveMap(string? mapName)
+        {
+            if (string.IsNullOrWhiteSpace(mapName))
+            {
+                return MapView.Active?.Map
+                    ?? throw new InvalidOperationException(
+                        "No active map and no 'map' parameter provided. Open a map view in Pro or specify 'map' explicitly.");
+            }
+            var mapItem = Project.Current.GetItems<MapProjectItem>()
+                .FirstOrDefault(m => m.Name.Equals(mapName, StringComparison.OrdinalIgnoreCase))
+                ?? throw new InvalidOperationException($"Map not found: {mapName}");
+            return mapItem.GetMap();
+        }
+
+        /// <summary>
+        /// Find a MapMember (Layer or StandaloneTable) by name in a Map. Searches
+        /// flattened layer tree (descending into group layers) AND standalone
+        /// tables. Returns null if not found. Case-insensitive name match.
+        /// First match wins — for duplicate names across groups, layer order in
+        /// the TOC determines priority.
+        /// </summary>
+        private static ArcGIS.Desktop.Mapping.MapMember? FindMapMemberByName(
+            ArcGIS.Desktop.Mapping.Map map, string name)
+        {
+            foreach (var layer in map.GetLayersAsFlattenedList())
+            {
+                if (layer.Name.Equals(name, StringComparison.OrdinalIgnoreCase))
+                    return layer;
+            }
+            foreach (var table in map.StandaloneTables)
+            {
+                if (table.Name.Equals(name, StringComparison.OrdinalIgnoreCase))
+                    return table;
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// Resolve the underlying ArcGIS.Core.Data.Table for a MapMember that has
+        /// row-providing data. Returns FeatureClass for FeatureLayers (FeatureClass
+        /// inherits from Table) and Table for StandaloneTables. Returns null for
+        /// member types without an attribute table (GroupLayer, RasterLayer, etc.).
+        /// </summary>
+        private static ArcGIS.Core.Data.Table? GetTableFromMember(
+            ArcGIS.Desktop.Mapping.MapMember member)
+        {
+            return member switch
+            {
+                FeatureLayer fl => fl.GetFeatureClass(),
+                ArcGIS.Desktop.Mapping.StandaloneTable st => st.GetTable(),
+                _ => null
+            };
+        }
+
+        /// <summary>
         /// Shared attribute-setter for the add_*_features handlers. Walks each
         /// key in the supplied JSON object, looks up the matching field (case-
         /// insensitive) in the feature class definition, coerces the JSON value
@@ -1161,28 +1270,49 @@ namespace APBridgeAddIn
         private static async Task<IpcResponse> HandleClearSelection(Dictionary<string, string>? args)
         {
             string? layerName = null;
+            string? mapName = null;
             args?.TryGetValue("layer", out layerName);
+            args?.TryGetValue("map", out mapName);
 
             var result = await QueuedTask.Run<(bool ok, string? error, int cleared, string? layerCleared)>(() =>
             {
-                var map = MapView.Active?.Map;
-                if (map == null) return (false, "No active map view", 0, null);
+                ArcGIS.Desktop.Mapping.Map map;
+                try { map = ResolveMap(mapName); }
+                catch (InvalidOperationException ex) { return (false, ex.Message, 0, null); }
 
                 if (!string.IsNullOrWhiteSpace(layerName))
                 {
-                    var fl = map.GetLayersAsFlattenedList()
-                        .OfType<FeatureLayer>()
-                        .FirstOrDefault(l => l.Name.Equals(layerName, StringComparison.OrdinalIgnoreCase));
-                    if (fl == null)
-                        throw new InvalidOperationException($"Layer not found: {layerName}");
-                    fl.ClearSelection();
-                    return (true, null, 1, fl.Name);
+                    // Single-target mode: clear selection on the named feature layer
+                    // OR standalone table. Both expose ClearSelection() on their
+                    // subclasses (not on MapMember), so dispatch.
+                    var member = FindMapMemberByName(map, layerName)
+                        ?? throw new InvalidOperationException($"Layer or table not found: {layerName}");
+                    switch (member)
+                    {
+                        case FeatureLayer flCs: flCs.ClearSelection(); break;
+                        case ArcGIS.Desktop.Mapping.StandaloneTable stCs: stCs.ClearSelection(); break;
+                        default:
+                            throw new InvalidOperationException(
+                                $"'{member.Name}' is a {member.GetType().Name} which doesn't support selection.");
+                    }
+                    return (true, null, 1, member.Name);
                 }
 
-                var featureLayers = map.GetLayersAsFlattenedList().OfType<FeatureLayer>().ToList();
-                foreach (var fl in featureLayers)
+                // All-targets mode: clear every feature layer AND every standalone
+                // table. Both contribute selection state that would silently restrict
+                // downstream GP tool inputs; clearing both makes the reset uniform.
+                int clearedCount = 0;
+                foreach (var fl in map.GetLayersAsFlattenedList().OfType<FeatureLayer>())
+                {
                     fl.ClearSelection();
-                return (true, null, featureLayers.Count, null);
+                    clearedCount++;
+                }
+                foreach (var st in map.StandaloneTables)
+                {
+                    st.ClearSelection();
+                    clearedCount++;
+                }
+                return (true, null, clearedCount, null);
             });
 
             if (!result.ok) return new(false, result.error, null);
@@ -1995,6 +2125,97 @@ namespace APBridgeAddIn
         }
 
         /// <summary>
+        /// Declared parameter signatures for common system GP tools, keyed by
+        /// <c>"toolboxAlias.toolName"</c>. Order matches each tool's positional
+        /// signature in the ArcGIS Pro 3.x docs. When the step-by-step model
+        /// executor encounters one of these tools, it walks this list in order
+        /// and fills each position by looking up the slot name in the process's
+        /// stored params (using arcpy's <c>"#"</c> sentinel for slots the model
+        /// omits, so the GP engine uses each tool's declared default).
+        ///
+        /// Without this name-to-position mapping, the executor packs values
+        /// densely in JSON insertion order — which silently corrupts the call
+        /// when a model omits an optional slot before an included one. Example:
+        /// <c>management.Project</c> with <c>{in_dataset, out_dataset, out_coor_system,
+        /// preserve_shape, vertical}</c> in JSON order dense-packs as positions
+        /// 0..4, but the real signature has <c>transform_method</c> at slot 3 and
+        /// <c>in_coor_system</c> at slot 4, so <c>"false"</c> from preserve_shape
+        /// lands in transform_method (→ ERROR 000365) and <c>"false"</c> from
+        /// vertical lands in in_coor_system (→ WARNING 230002).
+        ///
+        /// Pro SDK exposes no introspection API for tool signatures — the docs
+        /// just say "look it up". Extend this dictionary as new tools are
+        /// encountered in real models. For tools not listed here, the executor
+        /// falls back to dense-packing (the old behavior) and the resulting
+        /// shift will surface as misnamed-slot errors that pinpoint the tool.
+        /// </summary>
+        private static readonly Dictionary<string, string[]> GpToolSignatures =
+            new(StringComparer.OrdinalIgnoreCase)
+            {
+                ["management.Project"] = new[]
+                {
+                    "in_dataset", "out_dataset", "out_coor_system",
+                    "transform_method", "in_coor_system",
+                    "preserve_shape", "max_deviation", "vertical"
+                },
+                ["management.CopyFeatures"] = new[]
+                {
+                    "in_features", "out_feature_class",
+                    "config_keyword", "spatial_grid_1", "spatial_grid_2", "spatial_grid_3"
+                },
+                ["analysis.PairwiseErase"] = new[]
+                {
+                    "in_features", "erase_features", "out_feature_class", "cluster_tolerance"
+                },
+                ["analysis.SummarizeWithin"] = new[]
+                {
+                    "in_polygons", "in_sum_features", "out_feature_class",
+                    "keep_all_polygons", "sum_fields", "sum_shape", "shape_unit",
+                    "group_field", "add_min_maj", "add_group_percent", "out_group_table"
+                },
+                ["management.SelectLayerByLocation"] = new[]
+                {
+                    "in_layer", "overlap_type", "select_features",
+                    "search_distance", "selection_type", "invert_spatial_relationship"
+                },
+                ["management.SelectLayerByAttribute"] = new[]
+                {
+                    "in_layer_or_view", "selection_type", "where_clause",
+                    "invert_where_clause"
+                },
+                ["management.CalculateField"] = new[]
+                {
+                    "in_table", "field", "expression", "expression_type",
+                    "code_block", "field_type", "enforce_domains"
+                },
+                ["management.JoinField"] = new[]
+                {
+                    "in_data", "in_field", "join_table", "join_field",
+                    "fields", "fm_option", "field_mapping", "index_join_fields"
+                },
+                ["management.AddField"] = new[]
+                {
+                    "in_table", "field_name", "field_type",
+                    "field_precision", "field_scale", "field_length", "field_alias",
+                    "field_is_nullable", "field_is_required", "field_domain"
+                },
+                ["analysis.Buffer"] = new[]
+                {
+                    "in_features", "out_feature_class", "buffer_distance_or_field",
+                    "line_side", "line_end_type", "dissolve_option", "dissolve_field", "method"
+                },
+                ["analysis.Clip"] = new[]
+                {
+                    "in_features", "clip_features", "out_feature_class", "cluster_tolerance"
+                },
+                ["analysis.Intersect"] = new[]
+                {
+                    "in_features", "out_feature_class", "join_attributes",
+                    "cluster_tolerance", "output_type"
+                },
+            };
+
+        /// <summary>
         /// Runs a ModelBuilder model with the given parameter dict. ModelBuilder models
         /// bind parameters by DECLARED ORDER (arcpy positional convention), but agents
         /// pass by NAME via the JSON dict. We read the model's parameter declaration
@@ -2013,6 +2234,19 @@ namespace APBridgeAddIn
         /// </summary>
         private static async Task<IpcResponse> HandleRunModel(Dictionary<string, string>? args)
         {
+            return await RunModelCore(args, null);
+        }
+
+        /// <summary>
+        /// Kicks off a model run on a background task and returns a job id
+        /// immediately. Caller polls <c>HandleGetRunStatus</c> for progress and
+        /// completion. Designed to escape agent-side MCP tool-call ceilings
+        /// (Claude Desktop caps at ~4 min; Aurora-class models can run longer
+        /// because of hosted-service clips). Each status poll is a cheap
+        /// snapshot read so polling overhead is minimal.
+        /// </summary>
+        private static IpcResponse HandleRunModelAsync(Dictionary<string, string>? args)
+        {
             if (args == null ||
                 !args.TryGetValue("toolboxPath", out string? path) ||
                 string.IsNullOrWhiteSpace(path) ||
@@ -2020,29 +2254,190 @@ namespace APBridgeAddIn
                 string.IsNullOrWhiteSpace(modelName))
                 return new(false, "args 'toolboxPath' & 'modelName' required", null);
 
-            // Build the tool path: "toolboxPath\modelName"
-            var toolPath = $"{path}\\{modelName}";
+            // Drop completed jobs older than 1 hour so the registry doesn't grow
+            // unboundedly. Polling clients should fetch final status within that
+            // window; long-finished jobs are no longer interesting.
+            var cutoff = DateTime.UtcNow.AddHours(-1);
+            foreach (var kv in _runJobs.ToArray())
+            {
+                if (kv.Value.EndedUtc.HasValue && kv.Value.EndedUtc.Value < cutoff)
+                    _runJobs.TryRemove(kv.Key, out _);
+            }
 
-            // Read the model's declared parameter order so we can map the user's named
-            // dict to a positional array in the order arcpy expects. See class-level
-            // doc comment above for the symptom this prevents.
-            List<string> paramOrder;
+            var job = new RunJob
+            {
+                JobId = Guid.NewGuid().ToString("N").Substring(0, 12),
+                ToolboxPath = path,
+                ModelName = modelName,
+                StartedUtc = DateTime.UtcNow,
+                Status = "running"
+            };
+            _runJobs[job.JobId] = job;
+
+            // Fire-and-forget background execution. Exceptions are captured into
+            // the job record; nothing bubbles to an unobserved task fault.
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    var resp = await RunModelCore(args, job);
+                    lock (job.Lock)
+                    {
+                        if (resp.Ok)
+                        {
+                            job.Status = "succeeded";
+                        }
+                        else
+                        {
+                            job.Status = "failed";
+                            job.Error = resp.Error ?? "unknown failure";
+                            // Pull failedStep/tool out of the response data shape
+                            // that RunModelCore returns on a step failure.
+                            if (resp.Data is { } d)
+                            {
+                                try
+                                {
+                                    var dynData = d.GetType().GetProperty("failedStep")?.GetValue(d) as string;
+                                    if (dynData != null) job.FailedStep = dynData;
+                                    var dynTool = d.GetType().GetProperty("tool")?.GetValue(d) as string;
+                                    if (dynTool != null) job.FailedTool = dynTool;
+                                }
+                                catch { }
+                            }
+                        }
+                        job.EndedUtc = DateTime.UtcNow;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    lock (job.Lock)
+                    {
+                        job.Status = "failed";
+                        job.Error = $"{ex.GetType().Name}: {ex.Message}";
+                        job.EndedUtc = DateTime.UtcNow;
+                    }
+                }
+            });
+
+            return new(true, null, new
+            {
+                jobId = job.JobId,
+                started = job.StartedUtc,
+                pollWith = "get_run_status"
+            });
+        }
+
+        /// <summary>
+        /// Returns a snapshot of a background run job's state. Cheap to call
+        /// repeatedly; takes the job lock just long enough to copy the
+        /// current state. Status values: <c>running</c>, <c>succeeded</c>,
+        /// <c>failed</c>. Once <c>endedUtc</c> is populated, the run is done
+        /// and the messages list is final.
+        /// </summary>
+        private static IpcResponse HandleGetRunStatus(Dictionary<string, string>? args)
+        {
+            if (args == null ||
+                !args.TryGetValue("jobId", out string? jobId) ||
+                string.IsNullOrWhiteSpace(jobId))
+                return new(false, "arg 'jobId' required", null);
+
+            if (!_runJobs.TryGetValue(jobId, out var job))
+                return new(false, $"Job '{jobId}' not found (expired or never existed)", null);
+
+            lock (job.Lock)
+            {
+                return new(true, null, new
+                {
+                    jobId = job.JobId,
+                    status = job.Status,
+                    startedUtc = job.StartedUtc,
+                    endedUtc = job.EndedUtc,
+                    totalSteps = job.TotalSteps,
+                    completedSteps = job.CompletedSteps,
+                    currentStep = job.CurrentStep,
+                    failedStep = job.FailedStep,
+                    failedTool = job.FailedTool,
+                    error = job.Error,
+                    messages = job.Messages.ToList()
+                });
+            }
+        }
+
+        /// <summary>
+        /// Background job state for an async model run. Updated by
+        /// RunModelCore from a Task.Run thread; read by HandleGetRunStatus
+        /// from the IPC handler thread. The <see cref="Lock"/> serializes
+        /// concurrent writes from the executor and snapshot reads from the
+        /// status handler.
+        /// </summary>
+        private sealed class RunJob
+        {
+            public string JobId { get; init; } = "";
+            public string ToolboxPath { get; init; } = "";
+            public string ModelName { get; init; } = "";
+            public DateTime StartedUtc { get; init; }
+            public DateTime? EndedUtc { get; set; }
+            public string Status { get; set; } = "running";
+            public int TotalSteps { get; set; }
+            public int CompletedSteps { get; set; }
+            public string? CurrentStep { get; set; }
+            public string? FailedStep { get; set; }
+            public string? FailedTool { get; set; }
+            public string? Error { get; set; }
+            public List<object> Messages { get; } = new();
+            public object Lock { get; } = new();
+        }
+
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, RunJob>
+            _runJobs = new();
+
+        private static async Task<IpcResponse> RunModelCore(
+            Dictionary<string, string>? args, RunJob? job)
+        {
+            if (args == null ||
+                !args.TryGetValue("toolboxPath", out string? path) ||
+                string.IsNullOrWhiteSpace(path) ||
+                !args.TryGetValue("modelName", out string? modelName) ||
+                string.IsNullOrWhiteSpace(modelName))
+                return new(false, "args 'toolboxPath' & 'modelName' required", null);
+
+            // Step-by-step execution. Calling ExecuteToolAsync on the model as a
+            // whole tool triggers Pro's chain pre-validation, which rejects any
+            // intermediate INPUT whose producing tool has not yet created the FC
+            // on disk — fatal on first run. The ribbon Run dialog avoids this by
+            // running ModelBuilder's own engine: each process is validated JIT
+            // immediately before it executes, after its upstream outputs already
+            // exist. We mirror that here by parsing the model graph, topologically
+            // sorting processes, and calling ExecuteToolAsync once per step with
+            // refs resolved against a runtime variable map.
+            ModelGraph graph;
             try
             {
-                var description = AtbxManager.DescribeModel(path, modelName);
-                var inputs = JsonNode.Parse(description)?["inputs"]?.AsArray();
-                paramOrder = inputs?
-                    .Select(i => i?["name"]?.GetValue<string>() ?? "")
-                    .Where(n => !string.IsNullOrEmpty(n))
-                    .ToList() ?? new List<string>();
+                graph = AtbxManager.WalkModel(path, modelName);
             }
             catch (Exception ex)
             {
-                return new(false, $"Failed to read model parameter order from '{path}': {ex.Message}", null);
+                return new(false, $"Failed to read model from '{path}': {ex.Message}", null);
             }
 
-            // Collect user-supplied named values (case-insensitive matching against
-            // the model's declared names — arcpy is generally case-insensitive too).
+            if (job != null)
+            {
+                lock (job.Lock) job.TotalSteps = graph.Processes.Count;
+            }
+
+            // Reject iterators / nested sub-models — step-by-step semantics don't
+            // apply. Agents needing iteration should compose run_gp_tool calls.
+            var iterator = graph.Processes.FirstOrDefault(p => p.IsIterator);
+            if (iterator != null)
+            {
+                return new(false,
+                    $"Model '{modelName}' contains iterator or nested model '{iterator.Name}' " +
+                    $"(tool '{iterator.Tool}'). Step-by-step execution doesn't support these yet — " +
+                    $"compose run_gp_tool calls instead.",
+                    null);
+            }
+
+            // Collect user-supplied named values (case-insensitive matching).
             var namedValues = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             if (args.TryGetValue("parameters", out string? paramsJson) && !string.IsNullOrWhiteSpace(paramsJson))
             {
@@ -2054,52 +2449,230 @@ namespace APBridgeAddIn
                 }
             }
 
-            // Catch typos / stale param names early — surfacing the model's actual
-            // parameter list saves agents a describe_model round-trip.
+            // Determine model input parameter names (exposed Parameter variables
+            // that no process produces). Used to catch agent typos early.
+            var producedIds = graph.Processes
+                .SelectMany(p => p.Params.Values)
+                .Where(pm => pm.OutputVariableId != null)
+                .Select(pm => pm.OutputVariableId!)
+                .ToHashSet();
+            var inputParamNames = graph.Variables.Values
+                .Where(v => v.IsParameter && !producedIds.Contains(v.Id))
+                .Select(v => v.Name)
+                .ToList();
+
             var unknownKeys = namedValues.Keys
-                .Where(k => !paramOrder.Any(p => p.Equals(k, StringComparison.OrdinalIgnoreCase)))
+                .Where(k => !inputParamNames.Any(n => n.Equals(k, StringComparison.OrdinalIgnoreCase)))
                 .ToList();
             if (unknownKeys.Any())
             {
                 return new(false,
                     $"Unknown model parameter(s): {string.Join(", ", unknownKeys)}. " +
-                    $"Model '{modelName}' expects: [{string.Join(", ", paramOrder)}]",
+                    $"Model '{modelName}' expects: [{string.Join(", ", inputParamNames)}]",
                     null);
             }
 
-            // Build positional array in the model's declared order. For parameters
-            // the user did NOT supply, send arcpy's "#" sentinel — this tells the
-            // GP engine "use the parameter's declared default". Empty string is
-            // NOT equivalent: arcpy reads "" as an explicit empty value and the
-            // validator emits ERROR 000735 ("Value is required") for required
-            // params or overrides the model's default for optional ones. If the
-            // user explicitly supplied an empty string, that intent is preserved
-            // (the dict contains the key with value "").
-            var paramValues = paramOrder
-                .Select(name => namedValues.TryGetValue(name, out var v) ? v : "#")
-                .ToArray();
-
-            var valueArray = Geoprocessing.MakeValueArray(paramValues);
-            var result = await Geoprocessing.ExecuteToolAsync(toolPath, valueArray, DefaultRunEnvironments());
-
-            if (result.IsFailed)
+            // Seed the runtime variable map: variable id → value (path or literal).
+            // User-supplied input values win over the variable's stored default.
+            // Intermediate variables that have an explicit stored path are pre-
+            // seeded too, so explicit-path models honor the author's choice.
+            var runtimeValues = new Dictionary<string, string>();
+            foreach (var v in graph.Variables.Values)
             {
-                var errorTexts = result.Messages
-                    .Where(m => m.Type == GPMessageType.Error)
-                    .Select(m => m.Text)
-                    .ToList();
-
-                var msgs = result.Messages.Any()
-                    ? string.Join("; ", result.Messages.Select(m => m.Text))
-                    : errorTexts.Any()
-                        ? string.Join("; ", errorTexts)
-                        : "arcpy reported failure with no messages — check parameters";
-
-                return new(false, $"Model execution failed: {msgs}", null);
+                if (v.IsParameter && namedValues.TryGetValue(v.Name, out var userVal))
+                    runtimeValues[v.Id] = userVal;
+                else if (!string.IsNullOrEmpty(v.StoredValue))
+                    runtimeValues[v.Id] = v.StoredValue;
             }
 
-            var outputMessages = result.Messages.Select(m => new { type = m.Type.ToString(), text = m.Text }).ToList();
-            return new(true, null, new { success = true, messages = outputMessages });
+            // Workspace for generating derived-output paths. Same source as
+            // DefaultRunEnvironments, but we need the path string directly to
+            // build per-step output paths upfront (so downstream refs resolve).
+            string scratchGdb;
+            try { scratchGdb = Project.Current?.DefaultGeodatabasePath ?? ""; }
+            catch { scratchGdb = ""; }
+
+            var env = DefaultRunEnvironments();
+            var allMessages = new List<object>();
+
+            foreach (var proc in graph.Processes)
+            {
+                if (job != null)
+                {
+                    lock (job.Lock) job.CurrentStep = proc.Name;
+                }
+                // Resolve each slot in JSON-insertion order. Pro empirically writes
+                // process params in tool-declared slot order (per Desktop's data on
+                // SummarizeWithin: in_polygons, in_sum_features, out_feature_class,
+                // keep_all_polygons, sum_fields, sum_shape, shape_unit). Trusting
+                // that order produces the positional value array ExecuteToolAsync
+                // expects.
+                // Build positional value array. Two strategies:
+                //
+                //   1) Known tool: walk GpToolSignatures[proc.Tool] in declared order
+                //      and fill each position from proc.Params by slot NAME. For slots
+                //      the model omitted (sparse storage), insert "#" so arcpy uses
+                //      the tool's declared default. This is the correct contract for
+                //      GP system tools.
+                //
+                //   2) Unknown tool: fall back to dense-packing by JSON insertion
+                //      order. Same as the old behavior — wrong for any tool that
+                //      omits optional slots before included ones, but the resulting
+                //      misalignment surfaces as obvious slot-mismatch errors that
+                //      point at which tool to add to the signature table.
+                var slotOrder = GpToolSignatures.TryGetValue(proc.Tool, out var sig)
+                    ? sig.AsEnumerable()
+                    : proc.Params.Keys;
+
+                // Pre-pass: record outputs whose slot is NOT in the tool signature.
+                // Some tools (notably selection tools — SelectLayerByLocation,
+                // SelectLayerByAttribute) modify their in_layer in place and return
+                // it; arcpy has no positional output param for the modified layer,
+                // but ModelBuilder still names a logical output variable so
+                // downstream steps can reference it. The signature walk below
+                // skips any slot not in the signature, so without this pre-pass
+                // the output variable never lands in the runtime map and
+                // downstream refs resolve to empty → ERROR 000735.
+                //
+                // For each such output, record it as the first resolved input
+                // value (typically in_layer). Outputs whose slot IS in the
+                // signature are still recorded by the signature walk's existing
+                // OutputVariableId branch.
+                if (sig != null)
+                {
+                    foreach (var (slotName, pm) in proc.Params)
+                    {
+                        if (pm.OutputVariableId == null) continue;
+                        if (sig.Contains(slotName, StringComparer.OrdinalIgnoreCase)) continue;
+                        if (runtimeValues.ContainsKey(pm.OutputVariableId)) continue;
+
+                        string? sourceValue = null;
+                        foreach (var (_, sp) in proc.Params)
+                        {
+                            if (sp.OutputVariableId != null) continue;
+                            if (sp.RefVariableId != null
+                                && runtimeValues.TryGetValue(sp.RefVariableId, out var v)
+                                && !string.IsNullOrEmpty(v))
+                            {
+                                sourceValue = v;
+                                break;
+                            }
+                            if (sp.LiteralValue != null && !string.IsNullOrEmpty(sp.LiteralValue))
+                            {
+                                sourceValue = sp.LiteralValue;
+                                break;
+                            }
+                        }
+                        if (!string.IsNullOrEmpty(sourceValue))
+                        {
+                            runtimeValues[pm.OutputVariableId] = sourceValue;
+                        }
+                    }
+                }
+
+                var values = new List<object>();
+                foreach (var slotName in slotOrder)
+                {
+                    if (!proc.Params.TryGetValue(slotName, out var pm))
+                    {
+                        // Slot exists in the tool signature but model didn't store it.
+                        // "#" tells arcpy to use the tool's declared default.
+                        values.Add("#");
+                        continue;
+                    }
+
+                    if (pm.OutputVariableId != null)
+                    {
+                        if (!runtimeValues.TryGetValue(pm.OutputVariableId, out var outPath) ||
+                            string.IsNullOrEmpty(outPath))
+                        {
+                            var varName = graph.Variables.TryGetValue(pm.OutputVariableId, out var ov)
+                                ? SanitizeGdbName(ov.Name)
+                                : $"output_{pm.OutputVariableId}";
+                            outPath = string.IsNullOrEmpty(scratchGdb)
+                                ? varName
+                                : $"{scratchGdb}\\{varName}";
+                            runtimeValues[pm.OutputVariableId] = outPath;
+                        }
+                        values.Add(outPath);
+                    }
+                    else if (pm.RefVariableId != null)
+                    {
+                        if (runtimeValues.TryGetValue(pm.RefVariableId, out var refVal))
+                        {
+                            values.Add(refVal);
+                        }
+                        else
+                        {
+                            // Unresolved ref: distinguish "user didn't supply a model input"
+                            // (use arcpy's "#" sentinel so the GP engine resolves from the
+                            // variable's declared default) from "intermediate that the
+                            // producer step should have populated but didn't" (pass empty
+                            // so the error surfaces immediately).
+                            var isUnsuppliedInput = graph.Variables.TryGetValue(pm.RefVariableId, out var v)
+                                && v.IsParameter
+                                && !producedIds.Contains(pm.RefVariableId);
+                            values.Add(isUnsuppliedInput ? "#" : "");
+                        }
+                    }
+                    else if (pm.LiteralValue != null)
+                    {
+                        values.Add(SubstituteModelVars(pm.LiteralValue, graph, runtimeValues));
+                    }
+                    else
+                    {
+                        values.Add("");
+                    }
+                }
+
+                var valueArray = Geoprocessing.MakeValueArray(values.ToArray());
+                var stepResult = await Geoprocessing.ExecuteToolAsync(proc.Tool, valueArray, env);
+
+                if (stepResult.IsFailed)
+                {
+                    var msgs = stepResult.Messages.Any()
+                        ? string.Join("; ", stepResult.Messages.Select(m => $"{m.Type}: {m.Text}"))
+                        : "arcpy reported failure with no messages";
+
+                    // Hint when a layer-name reference fails because no map view
+                    // is active. ERROR 000732 ("does not exist or is not supported")
+                    // and ERROR 000840 ("not a Feature Layer") commonly fire when
+                    // the user restarted Pro and no map tab is focused — layer-name
+                    // refs in the model can't resolve. Adding a clear hint here
+                    // saves the user from having to recognize the raw GP code.
+                    if ((msgs.Contains("ERROR 000732") || msgs.Contains("ERROR 000840"))
+                        && MapView.Active == null)
+                    {
+                        msgs += " [hint: no active map view — layer-name references "
+                              + "in the model require a map tab to be focused. Open "
+                              + "or click on a map view in Pro and retry.]";
+                    }
+
+                    return new(false,
+                        $"Step '{proc.Name}' ({proc.Tool}) failed: {msgs}",
+                        new { failedStep = proc.Name, tool = proc.Tool, completedSteps = allMessages.Count });
+                }
+
+                foreach (var m in stepResult.Messages)
+                    allMessages.Add(new { step = proc.Name, type = m.Type.ToString(), text = m.Text });
+
+                if (job != null)
+                {
+                    lock (job.Lock)
+                    {
+                        job.CompletedSteps++;
+                        foreach (var m in stepResult.Messages)
+                            job.Messages.Add(new { step = proc.Name, type = m.Type.ToString(), text = m.Text });
+                    }
+                }
+            }
+
+            return new(true, null, new
+            {
+                success = true,
+                stepsRun = graph.Processes.Count,
+                messages = allMessages
+            });
         }
 
         /// <summary>
@@ -2108,13 +2681,104 @@ namespace APBridgeAddIn
         /// ERROR 000210 (output already exists) is an unhelpful failure
         /// mode when the whole point is repeatable automation.
         ///
+        /// Also pins workspace + scratchWorkspace to the project's default
+        /// GDB. The ribbon Run dialog applies these by default; ExecuteToolAsync
+        /// from an Add-In does NOT, which causes ModelBuilder models whose
+        /// intermediate outputs are derived (no explicit path) to fail
+        /// pre-validation with ERROR 000735 ("Value is required") on every
+        /// step's out_dataset — the GP engine cannot resolve where to place
+        /// the derived output. Pinning both env vars gives derived outputs
+        /// somewhere to land, mirroring GUI behavior.
+        ///
         /// NOTE: MakeEnvironmentArray is a named-argument method (every GP
         /// env is a separate parameter); passing a Dictionary as a positional
         /// arg binds it to `workspace`, producing a cryptic runtime binder
         /// error. Use named-argument syntax.
         /// </summary>
-        private static IReadOnlyList<KeyValuePair<string, string>> DefaultRunEnvironments() =>
-            Geoprocessing.MakeEnvironmentArray(overwriteoutput: true);
+        private static IReadOnlyList<KeyValuePair<string, string>> DefaultRunEnvironments()
+        {
+            string? defaultGdb = null;
+            try { defaultGdb = Project.Current?.DefaultGeodatabasePath; }
+            catch { /* no open project — fall through to env without workspace */ }
+
+            return !string.IsNullOrEmpty(defaultGdb)
+                ? Geoprocessing.MakeEnvironmentArray(
+                    overwriteoutput: true,
+                    workspace: defaultGdb,
+                    scratchWorkspace: defaultGdb)
+                : Geoprocessing.MakeEnvironmentArray(overwriteoutput: true);
+        }
+
+        /// <summary>
+        /// Substitutes ModelBuilder <c>%VarName%</c> patterns in a literal
+        /// value with the runtime value of that variable. ModelBuilder's own
+        /// engine performs this string substitution before handing expressions
+        /// to arcpy (most commonly on <c>CalculateField.expression</c> and
+        /// SQL where-clauses); our step-by-step executor must do the same or
+        /// arcpy sees the literal <c>%Foo%</c> and treats it as Python /
+        /// invalid SQL, producing ERROR 000539 (SyntaxError) or similar.
+        ///
+        /// Variable lookup is case-insensitive by name. Unresolved patterns
+        /// are left in place; the resulting GP error will surface the missing
+        /// variable name to the caller.
+        /// </summary>
+        private static string SubstituteModelVars(
+            string literal,
+            ModelGraph graph,
+            Dictionary<string, string> runtimeValues)
+        {
+            if (string.IsNullOrEmpty(literal) || !literal.Contains('%'))
+                return literal;
+            return System.Text.RegularExpressions.Regex.Replace(
+                literal,
+                @"%([A-Za-z_][A-Za-z0-9_]*)%",
+                match =>
+                {
+                    var varName = match.Groups[1].Value;
+                    foreach (var v in graph.Variables.Values)
+                    {
+                        if (!string.Equals(v.Name, varName,
+                            StringComparison.OrdinalIgnoreCase)) continue;
+                        if (runtimeValues.TryGetValue(v.Id, out var val)
+                            && !string.IsNullOrEmpty(val))
+                            return val;
+                        // Fall back to the variable's stored value (model
+                        // parameter default) if the runtime map doesn't carry it.
+                        if (!string.IsNullOrEmpty(v.StoredValue))
+                            return v.StoredValue;
+                    }
+                    return match.Value;
+                });
+        }
+
+        /// <summary>
+        /// Sanitizes a ModelBuilder variable name for use as a File Geodatabase
+        /// feature class or table name. GDB names must start with a letter and
+        /// contain only letters, digits, and underscores. ModelBuilder lets you
+        /// name a variable anything (including spaces, dashes, and other
+        /// punctuation), and when the executor uses that name to derive an
+        /// output path it would otherwise produce ERROR 000354 ("The name
+        /// contains invalid characters") on the first step whose output
+        /// variable wasn't typed to be GDB-safe.
+        ///
+        /// Replaces invalid characters with underscores, collapses runs of
+        /// underscores, and prefixes a letter if the result would otherwise
+        /// start with a digit. Empty/null input falls back to "out".
+        /// </summary>
+        private static string SanitizeGdbName(string? name)
+        {
+            if (string.IsNullOrWhiteSpace(name)) return "out";
+            var sb = new System.Text.StringBuilder(name.Length);
+            foreach (var c in name)
+                sb.Append(char.IsLetterOrDigit(c) || c == '_' ? c : '_');
+            // Collapse runs of underscores
+            var collapsed = System.Text.RegularExpressions.Regex
+                .Replace(sb.ToString(), "_+", "_")
+                .Trim('_');
+            if (string.IsNullOrEmpty(collapsed)) return "out";
+            // Must start with a letter
+            return char.IsLetter(collapsed[0]) ? collapsed : "x_" + collapsed;
+        }
 
         /// <summary>
         /// Runs an arbitrary geoprocessing tool by name (e.g., <c>analysis.Buffer</c>,
