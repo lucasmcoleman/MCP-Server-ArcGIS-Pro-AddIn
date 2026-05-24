@@ -307,11 +307,21 @@ namespace APBridgeAddIn.ModelBuilder
                                 var outputType = varMap.ContainsKey(elementId)
                                     ? TryGetString(varMap[elementId]["datatype"]?["type"]) ?? "DEFeatureClass"
                                     : "DEFeatureClass";
-                                parameters[param.Key] = new JsonObject
+                                var outputObj = new JsonObject
                                 {
                                     ["output"] = outputName,
                                     ["type"] = outputType
                                 };
+                                // Surface the variable's stored path (if any). Without this,
+                                // an output declared with an explicit path in the original
+                                // model is reported as pathless on round-trip, and the
+                                // write side has no way to preserve it.
+                                var outputValue = varMap.ContainsKey(elementId)
+                                    ? TryGetString(varMap[elementId]["value"])
+                                    : null;
+                                if (outputValue != null)
+                                    outputObj["value"] = outputValue;
+                                parameters[param.Key] = outputObj;
                             }
                             else if (elementId != null)
                             {
@@ -378,6 +388,179 @@ namespace APBridgeAddIn.ModelBuilder
             };
 
             return result.ToJsonString(JsonOpts);
+        }
+
+        /// <summary>
+        /// Parses the .atbx model into a graph suitable for step-by-step execution.
+        /// Unlike <see cref="DescribeModel"/>, this preserves variable IDs and the
+        /// raw param structure (refs vs. literals vs. outputs) so that the executor
+        /// can resolve refs against a runtime variable map. Processes are returned
+        /// in topological order (a process appears after every process whose output
+        /// it consumes).
+        ///
+        /// Iterators / nested-model processes (anything that has model_tool but no
+        /// system_tool) are flagged as IsIterator so the executor can reject them
+        /// with a clear message — step-by-step semantics don't apply to iteration.
+        /// </summary>
+        public static ModelGraph WalkModel(string atbxPath, string modelName)
+        {
+            using var zip = ZipFile.OpenRead(atbxPath);
+            var modelNode = ReadJsonEntry<JsonNode>(zip, $"{modelName}.tool/tool.model")
+                ?? throw new Exception($"Model '{modelName}' not found in toolbox");
+            var rcNode = ReadJsonEntry<JsonNode>(zip, $"{modelName}.tool/tool.content.rc");
+
+            var displayNames = new Dictionary<string, string>();
+            if (rcNode?["map"] is JsonNode map)
+                foreach (var kv in map.AsObject())
+                    displayNames[kv.Key] = TryGetString(kv.Value) ?? "";
+
+            string Resolve(string? titleRef, string fallback)
+            {
+                if (titleRef != null && titleRef.StartsWith("$rc:"))
+                {
+                    var key = titleRef[4..];
+                    if (displayNames.TryGetValue(key, out var name)) return name;
+                }
+                return fallback;
+            }
+
+            // ---- Variables ----
+            var variables = new Dictionary<string, ModelVariable>();
+            foreach (var v in modelNode["variables"]?.AsArray() ?? new JsonArray())
+            {
+                var id = TryGetString(v?["id"]);
+                if (id == null) continue;
+                var paramName = TryGetString(v?["param_name"]);
+                var title = TryGetString(v?["title"]);
+                var name = paramName ?? Resolve(title, $"var_{id}");
+                variables[id] = new ModelVariable
+                {
+                    Id = id,
+                    Name = name,
+                    Type = TryGetString(v?["datatype"]?["type"]),
+                    StoredValue = TryGetString(v?["value"]),
+                    IsParameter = TryGetString(v?["connection_type"]) == "Parameter",
+                    IsDerived = TryGetString(v?["derived"]) == "true",
+                };
+            }
+
+            // ---- Processes (unsorted) + producing-process map ----
+            var producers = new Dictionary<string, string>(); // variable id → process id that outputs it
+            var processList = new List<ModelProcess>();
+            foreach (var p in modelNode["processes"]?.AsArray() ?? new JsonArray())
+            {
+                var pid = TryGetString(p?["id"]);
+                if (pid == null) continue;
+                var systemTool = TryGetString(p?["system_tool"]);
+                var modelTool = TryGetString(p?["model_tool"]);
+                var tool = systemTool ?? modelTool ?? "unknown";
+                var name = Resolve(TryGetString(p?["title"]), $"Step_{pid}");
+
+                // Parse params preserving JSON insertion order (= tool-declared slot order).
+                var paramsDict = new Dictionary<string, ModelParam>();
+                var paramsNode = p?["params"];
+                if (paramsNode is JsonObject paramsObj)
+                {
+                    foreach (var slot in paramsObj)
+                    {
+                        var pv = slot.Value;
+                        if (pv is JsonObject pvo)
+                        {
+                            var direction = TryGetString(pvo["direction"]);
+                            var elementId = TryGetString(pvo["element_id"]);
+                            var literal = TryGetString(pvo["value"]);
+
+                            if (direction == "out" && elementId != null)
+                            {
+                                paramsDict[slot.Key] = new ModelParam { OutputVariableId = elementId };
+                                producers[elementId] = pid;
+                            }
+                            else if (elementId != null)
+                            {
+                                paramsDict[slot.Key] = new ModelParam { RefVariableId = elementId };
+                            }
+                            else if (literal != null)
+                            {
+                                paramsDict[slot.Key] = new ModelParam { LiteralValue = literal };
+                            }
+                            else
+                            {
+                                paramsDict[slot.Key] = new ModelParam { RawValue = pv.DeepClone() };
+                            }
+                        }
+                        else if (pv is JsonValue jv)
+                        {
+                            paramsDict[slot.Key] = new ModelParam { LiteralValue = jv.GetValue<string>() };
+                        }
+                        else
+                        {
+                            paramsDict[slot.Key] = new ModelParam { LiteralValue = "" };
+                        }
+                    }
+                }
+
+                processList.Add(new ModelProcess
+                {
+                    Id = pid,
+                    Name = name,
+                    Tool = tool,
+                    // model_tool with no system_tool ⇒ iterator or nested sub-model;
+                    // step-by-step execution doesn't have semantics for either.
+                    IsIterator = systemTool == null && modelTool != null,
+                    Params = paramsDict,
+                });
+            }
+
+            // ---- Topological sort ----
+            // Edge: process P depends on process Q if any input ref of P resolves
+            // to a variable produced by Q. Kahn's algorithm — stable order.
+            var depCount = new Dictionary<string, int>();
+            var consumers = new Dictionary<string, List<string>>(); // process id → ids of processes that depend on it
+            foreach (var proc in processList)
+            {
+                depCount[proc.Id] = 0;
+                consumers[proc.Id] = new List<string>();
+            }
+            foreach (var proc in processList)
+            {
+                foreach (var (_, pm) in proc.Params)
+                {
+                    if (pm.RefVariableId != null &&
+                        producers.TryGetValue(pm.RefVariableId, out var producerId) &&
+                        producerId != proc.Id)
+                    {
+                        depCount[proc.Id]++;
+                        consumers[producerId].Add(proc.Id);
+                    }
+                }
+            }
+
+            var sorted = new List<ModelProcess>();
+            var ready = new Queue<ModelProcess>(processList.Where(p => depCount[p.Id] == 0));
+            while (ready.Count > 0)
+            {
+                var proc = ready.Dequeue();
+                sorted.Add(proc);
+                foreach (var consumerId in consumers[proc.Id])
+                {
+                    if (--depCount[consumerId] == 0)
+                        ready.Enqueue(processList.First(p => p.Id == consumerId));
+                }
+            }
+
+            // If sorted.Count < processList.Count, there's a cycle. ModelBuilder
+            // forbids cycles in normal authoring, but if one ever appears we'd
+            // rather surface it than silently drop processes.
+            if (sorted.Count < processList.Count)
+            {
+                var dropped = processList.Where(p => !sorted.Any(s => s.Id == p.Id))
+                    .Select(p => p.Name);
+                throw new Exception(
+                    $"Model '{modelName}' has a dependency cycle — could not topologically sort. " +
+                    $"Unreachable processes: {string.Join(", ", dropped)}");
+            }
+
+            return new ModelGraph { Variables = variables, Processes = sorted };
         }
 
         #endregion
@@ -679,17 +862,27 @@ namespace APBridgeAddIn.ModelBuilder
                             if (outputName != null)
                             {
                                 var outputType = paramObj["type"]?.GetValue<string>() ?? "DEFeatureClass";
+                                // Accept an optional "value" — the explicit path the model
+                                // author wants this output written to. Without this, every
+                                // output round-trips as `derived` (no path), which forces
+                                // run_model to rely on env defaults to materialize it. The
+                                // ribbon Run dialog lets users type an output path; agents
+                                // need the same surface. When supplied, drop the "derived"
+                                // flag — explicit path is the opposite of derived.
+                                var outputValue = paramObj["value"]?.GetValue<string>();
                                 var outputId = nextId++.ToString();
                                 nameToId[outputName] = outputId;
 
-                                // Create the output variable
                                 var outputVar = new JsonObject
                                 {
                                     ["id"] = outputId,
                                     ["title"] = $"$rc:model.element{outputId}",
-                                    ["derived"] = "true",
                                     ["datatype"] = new JsonObject { ["type"] = outputType }
                                 };
+                                if (outputValue != null)
+                                    outputVar["value"] = outputValue;
+                                else
+                                    outputVar["derived"] = "true";
                                 variables.Add(outputVar);
                                 rcMap[$"model.element{outputId}"] = outputName;
 
@@ -980,5 +1173,54 @@ namespace APBridgeAddIn.ModelBuilder
         }
 
         #endregion
+    }
+
+    /// <summary>
+    /// A single variable in the model graph — either an exposed Parameter (model
+    /// input/output) or an intermediate (process output consumed downstream).
+    /// </summary>
+    internal class ModelVariable
+    {
+        public string Id { get; init; } = "";
+        public string Name { get; init; } = "";
+        public string? Type { get; init; }
+        public string? StoredValue { get; init; }
+        public bool IsParameter { get; init; }
+        public bool IsDerived { get; init; }
+    }
+
+    /// <summary>
+    /// A single parameter slot on a process. Exactly one of the variable-id /
+    /// literal fields is meaningful per instance.
+    /// </summary>
+    internal class ModelParam
+    {
+        public string? RefVariableId { get; init; }     // input: {element_id: X}
+        public string? OutputVariableId { get; init; }  // output: {direction: out, element_id: X}
+        public string? LiteralValue { get; init; }      // {value: "X"} or bare string
+        public JsonNode? RawValue { get; init; }        // complex pass-through (e.g., environments dict)
+    }
+
+    /// <summary>
+    /// A single process (tool invocation) in the model. Params is ordered by JSON
+    /// insertion — which empirically matches the GP tool's declared slot order.
+    /// </summary>
+    internal class ModelProcess
+    {
+        public string Id { get; init; } = "";
+        public string Name { get; init; } = "";
+        public string Tool { get; init; } = "";
+        public bool IsIterator { get; init; }
+        public Dictionary<string, ModelParam> Params { get; init; } = new();
+    }
+
+    /// <summary>
+    /// Topo-sorted walk of a ModelBuilder model: variables keyed by id and
+    /// processes in dependency order.
+    /// </summary>
+    internal class ModelGraph
+    {
+        public Dictionary<string, ModelVariable> Variables { get; init; } = new();
+        public List<ModelProcess> Processes { get; init; } = new();
     }
 }
