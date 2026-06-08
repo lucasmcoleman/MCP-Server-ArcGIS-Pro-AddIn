@@ -2348,15 +2348,28 @@ namespace APBridgeAddIn
                 lock (job.Lock) job.TotalSteps = graph.Processes.Count;
             }
 
-            // Reject iterators / nested sub-models — step-by-step semantics don't
-            // apply. Agents needing iteration should compose run_gp_tool calls.
-            var iterator = graph.Processes.FirstOrDefault(p => p.IsIterator);
-            if (iterator != null)
+            // Reject anything outside GpTool — script tools, nested models,
+            // legacy iterators. Step-by-step execution covers only system GP
+            // tools today; the other kinds round-trip cleanly through
+            // describe_model / create_model / update_model but need Pro's
+            // ribbon to actually run. Each ToolKind produces a slightly
+            // different message so the agent knows which substitution to try.
+            var nonGp = graph.Processes.FirstOrDefault(p => p.Kind != APBridgeAddIn.ModelBuilder.ToolKind.GpTool);
+            if (nonGp != null)
             {
+                var hint = nonGp.Kind switch
+                {
+                    APBridgeAddIn.ModelBuilder.ToolKind.ScriptTool =>
+                        "Custom script tools must be run via Pro's ribbon or with run_gp_tool against the script tool's name.",
+                    APBridgeAddIn.ModelBuilder.ToolKind.NestedModel =>
+                        "Run the nested model directly via run_model (recurse) or via Pro's ribbon.",
+                    APBridgeAddIn.ModelBuilder.ToolKind.Iterator =>
+                        "Iterator semantics aren't supported by step-by-step execution; compose run_gp_tool calls.",
+                    _ => "Unknown step kind; expose the tool's actual signature so the bridge can dispatch it."
+                };
                 return new(false,
-                    $"Model '{modelName}' contains iterator or nested model '{iterator.Name}' " +
-                    $"(tool '{iterator.Tool}'). Step-by-step execution doesn't support these yet — " +
-                    $"compose run_gp_tool calls instead.",
+                    $"Model '{modelName}' contains a non-GP step '{nonGp.Name}' " +
+                    $"(kind '{nonGp.Kind}', tool '{nonGp.Tool}'). " + hint,
                     null);
             }
 

@@ -275,14 +275,23 @@ namespace APBridgeAddIn.ModelBuilder
             {
                 var processId = TryGetString(p?["id"]);
                 var title = TryGetString(p?["title"]);
-                var tool = TryGetString(p?["system_tool"])
-                    ?? TryGetString(p?["model_tool"])
-                    ?? "unknown";
+                // Same four-shape detection as WalkModel — keep them in lockstep.
+                var systemTool = TryGetString(p?["system_tool"]);
+                var modelTool  = TryGetString(p?["model_tool"]);
+                var toolType   = TryGetString(p?["tool_type"]);
+                var toolPath   = TryGetString(p?["path"]);
+                string tool; string kind;
+                if (systemTool != null) { tool = systemTool;             kind = "gpTool"; }
+                else if (toolType == "ScriptTool") { tool = toolPath ?? "unknown"; kind = "scriptTool"; }
+                else if (toolType == "ModelTool")  { tool = toolPath ?? "unknown"; kind = "nestedModel"; }
+                else if (modelTool != null)        { tool = modelTool;              kind = "iterator"; }
+                else                                { tool = "unknown";             kind = "unknown"; }
 
                 var step = new JsonObject
                 {
                     ["name"] = ResolveName(title, $"Step_{processId}"),
-                    ["tool"] = tool
+                    ["tool"] = tool,
+                    ["kind"] = kind
                 };
 
                 // Translate parameters
@@ -452,8 +461,21 @@ namespace APBridgeAddIn.ModelBuilder
                 var pid = TryGetString(p?["id"]);
                 if (pid == null) continue;
                 var systemTool = TryGetString(p?["system_tool"]);
-                var modelTool = TryGetString(p?["model_tool"]);
-                var tool = systemTool ?? modelTool ?? "unknown";
+                var modelTool  = TryGetString(p?["model_tool"]);
+                var toolType   = TryGetString(p?["tool_type"]);
+                var toolPath   = TryGetString(p?["path"]);
+                // Process header takes one of four shapes:
+                //   {system_tool:"alias.toolName"}             → built-in GP tool
+                //   {tool_type:"ScriptTool", path:"Name"}      → custom script tool by name
+                //   {tool_type:"ModelTool",  path:"Name"}      → nested model by name
+                //   {model_tool:"..."}                         → legacy iterator (and very old nested-model encoding)
+                ToolKind kind;
+                string tool;
+                if (systemTool != null) { tool = systemTool;             kind = ToolKind.GpTool; }
+                else if (toolType == "ScriptTool") { tool = toolPath ?? "unknown"; kind = ToolKind.ScriptTool; }
+                else if (toolType == "ModelTool")  { tool = toolPath ?? "unknown"; kind = ToolKind.NestedModel; }
+                else if (modelTool != null)        { tool = modelTool;              kind = ToolKind.Iterator; }
+                else                                { tool = "unknown";             kind = ToolKind.Unknown; }
                 var name = Resolve(TryGetString(p?["title"]), $"Step_{pid}");
 
                 // Parse params preserving JSON insertion order (= tool-declared slot order).
@@ -504,9 +526,12 @@ namespace APBridgeAddIn.ModelBuilder
                     Id = pid,
                     Name = name,
                     Tool = tool,
-                    // model_tool with no system_tool ⇒ iterator or nested sub-model;
-                    // step-by-step execution doesn't have semantics for either.
-                    IsIterator = systemTool == null && modelTool != null,
+                    Kind = kind,
+                    // Step-by-step execution doesn't have semantics for anything
+                    // outside GpTool. The executor's iterator-reject path covers
+                    // all non-GP kinds; keep IsIterator true for them so existing
+                    // callers (and the executor's FirstOrDefault check) stay correct.
+                    IsIterator = kind != ToolKind.GpTool,
                     Params = paramsDict,
                 });
             }
@@ -820,6 +845,10 @@ namespace APBridgeAddIn.ModelBuilder
             {
                 var stepName = step?["name"]?.GetValue<string>() ?? $"Step{nextId}";
                 var tool = step?["tool"]?.GetValue<string>() ?? "unknown";
+                // Step kind drives the process header shape (system_tool vs
+                // tool_type+path). Absent kind defaults to "gpTool" so every
+                // existing caller's payload continues to write as before.
+                var kind = step?["kind"]?.GetValue<string>() ?? "gpTool";
                 var parameters = step?["parameters"]?.AsObject();
                 var environments = step?["environments"]?.AsObject();
 
@@ -962,13 +991,32 @@ namespace APBridgeAddIn.ModelBuilder
                     }
                 }
 
+                // Process header shape varies by step kind:
+                //   gpTool      → {system_tool: "alias.toolName"}
+                //   scriptTool  → {tool_type: "ScriptTool", path: "Name"}
+                //   nestedModel → {tool_type: "ModelTool",  path: "Name"}
+                // Path values are names relative to the host toolbox, no
+                // extension. WalkModel mirrors the inverse mapping.
                 var process = new JsonObject
                 {
                     ["id"] = processId,
                     ["title"] = $"$rc:model.element{processId}",
-                    ["system_tool"] = tool,
                     ["params"] = processParams
                 };
+                if (string.Equals(kind, "scriptTool", StringComparison.OrdinalIgnoreCase))
+                {
+                    process["tool_type"] = "ScriptTool";
+                    process["path"] = tool;
+                }
+                else if (string.Equals(kind, "nestedModel", StringComparison.OrdinalIgnoreCase))
+                {
+                    process["tool_type"] = "ModelTool";
+                    process["path"] = tool;
+                }
+                else
+                {
+                    process["system_tool"] = tool;
+                }
 
                 // Handle environments
                 if (environments != null)
@@ -1247,6 +1295,22 @@ namespace APBridgeAddIn.ModelBuilder
     }
 
     /// <summary>
+    /// What kind of tool a process invokes. The bridge can step-execute
+    /// <see cref="GpTool"/> directly; the other kinds need Pro's ribbon to run.
+    /// <see cref="Iterator"/> is the legacy <c>model_tool</c> path that
+    /// pre-dated <c>tool_type</c>; both ModelBuilder iterators and (older)
+    /// nested-model references land there.
+    /// </summary>
+    internal enum ToolKind
+    {
+        GpTool,
+        ScriptTool,
+        NestedModel,
+        Iterator,
+        Unknown
+    }
+
+    /// <summary>
     /// A single process (tool invocation) in the model. Params is ordered by JSON
     /// insertion — which empirically matches the GP tool's declared slot order.
     /// </summary>
@@ -1255,6 +1319,7 @@ namespace APBridgeAddIn.ModelBuilder
         public string Id { get; init; } = "";
         public string Name { get; init; } = "";
         public string Tool { get; init; } = "";
+        public ToolKind Kind { get; init; } = ToolKind.GpTool;
         public bool IsIterator { get; init; }
         public Dictionary<string, ModelParam> Params { get; init; } = new();
     }
