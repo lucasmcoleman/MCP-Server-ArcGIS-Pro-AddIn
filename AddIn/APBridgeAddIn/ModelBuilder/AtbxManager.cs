@@ -823,6 +823,40 @@ namespace APBridgeAddIn.ModelBuilder
                 var parameters = step?["parameters"]?.AsObject();
                 var environments = step?["environments"]?.AsObject();
 
+                // Canonicalize the output-slot key for this tool. When the
+                // user supplies an output under a non-canonical key (e.g.,
+                // `out_features` on management.CalculateGeometryAttributes
+                // whose real slot is `updated_features`), Pro's load-time
+                // normalizer rewrites the slot and stamps its default UI
+                // label ("Updated Features") as the variable name, orphaning
+                // every downstream `ref` to the user-supplied output name.
+                // Rewriting to the canonical slot up front means Pro never
+                // runs the normalizer and the user-supplied output name
+                // stays put. Only acts when the tool is in OutputSlots AND
+                // the canonical key isn't already occupied (if both exist
+                // the user has a conflicting payload — leave it for Pro to
+                // flag rather than silently merging).
+                if (parameters != null &&
+                    GpToolCatalog.OutputSlots.TryGetValue(tool, out var canonOut))
+                {
+                    string? wrongKey = null;
+                    foreach (var p in parameters)
+                    {
+                        if (p.Value is JsonObject po && po["output"] != null
+                            && !string.Equals(p.Key, canonOut.Slot, StringComparison.OrdinalIgnoreCase))
+                        {
+                            wrongKey = p.Key;
+                            break;
+                        }
+                    }
+                    if (wrongKey != null && !parameters.ContainsKey(canonOut.Slot))
+                    {
+                        var node = parameters[wrongKey]?.DeepClone();
+                        parameters.Remove(wrongKey);
+                        if (node != null) parameters[canonOut.Slot] = node;
+                    }
+                }
+
                 var processId = nextId++.ToString();
                 rcMap[$"model.element{processId}"] = stepName;
 
@@ -862,6 +896,17 @@ namespace APBridgeAddIn.ModelBuilder
                             if (outputName != null)
                             {
                                 var outputType = paramObj["type"]?.GetValue<string>() ?? "DEFeatureClass";
+                                // GPComposite is Pro's multi-type slot wrapper —
+                                // appropriate on INPUT params (e.g., CalculateField.in_table
+                                // accepts TableView | RasterLayer | MosaicLayer) but on a
+                                // derived OUTPUT variable it hard-crashes Pro on .atbx open.
+                                // Coerce to the tool's canonical concrete DE* type when
+                                // known; leave alone for unknown tools.
+                                if (string.Equals(outputType, "GPComposite", StringComparison.OrdinalIgnoreCase)
+                                    && GpToolCatalog.OutputSlots.TryGetValue(tool, out var outCoerce))
+                                {
+                                    outputType = outCoerce.Type;
+                                }
                                 // Accept an optional "value" — the explicit path the model
                                 // author wants this output written to. Without this, every
                                 // output round-trips as `derived` (no path), which forces

@@ -2103,7 +2103,13 @@ namespace APBridgeAddIn
 
             var defNode = JsonNode.Parse(definition);
             var modelName = defNode?["name"]?.GetValue<string>() ?? "unknown";
-            return new(true, null, new { modelName, toolboxPath = path, created = true });
+            return new(true, null, new
+            {
+                modelName,
+                toolboxPath = path,
+                created = true,
+                hint = "Refresh the toolbox in Pro's Catalog pane to see the new model."
+            });
         }
 
         private static IpcResponse HandleUpdateModel(Dictionary<string, string>? args)
@@ -2124,96 +2130,13 @@ namespace APBridgeAddIn
             return new(true, null, new { modelName, toolboxPath = path, updated = true });
         }
 
-        /// <summary>
-        /// Declared parameter signatures for common system GP tools, keyed by
-        /// <c>"toolboxAlias.toolName"</c>. Order matches each tool's positional
-        /// signature in the ArcGIS Pro 3.x docs. When the step-by-step model
-        /// executor encounters one of these tools, it walks this list in order
-        /// and fills each position by looking up the slot name in the process's
-        /// stored params (using arcpy's <c>"#"</c> sentinel for slots the model
-        /// omits, so the GP engine uses each tool's declared default).
-        ///
-        /// Without this name-to-position mapping, the executor packs values
-        /// densely in JSON insertion order — which silently corrupts the call
-        /// when a model omits an optional slot before an included one. Example:
-        /// <c>management.Project</c> with <c>{in_dataset, out_dataset, out_coor_system,
-        /// preserve_shape, vertical}</c> in JSON order dense-packs as positions
-        /// 0..4, but the real signature has <c>transform_method</c> at slot 3 and
-        /// <c>in_coor_system</c> at slot 4, so <c>"false"</c> from preserve_shape
-        /// lands in transform_method (→ ERROR 000365) and <c>"false"</c> from
-        /// vertical lands in in_coor_system (→ WARNING 230002).
-        ///
-        /// Pro SDK exposes no introspection API for tool signatures — the docs
-        /// just say "look it up". Extend this dictionary as new tools are
-        /// encountered in real models. For tools not listed here, the executor
-        /// falls back to dense-packing (the old behavior) and the resulting
-        /// shift will surface as misnamed-slot errors that pinpoint the tool.
-        /// </summary>
-        private static readonly Dictionary<string, string[]> GpToolSignatures =
-            new(StringComparer.OrdinalIgnoreCase)
-            {
-                ["management.Project"] = new[]
-                {
-                    "in_dataset", "out_dataset", "out_coor_system",
-                    "transform_method", "in_coor_system",
-                    "preserve_shape", "max_deviation", "vertical"
-                },
-                ["management.CopyFeatures"] = new[]
-                {
-                    "in_features", "out_feature_class",
-                    "config_keyword", "spatial_grid_1", "spatial_grid_2", "spatial_grid_3"
-                },
-                ["analysis.PairwiseErase"] = new[]
-                {
-                    "in_features", "erase_features", "out_feature_class", "cluster_tolerance"
-                },
-                ["analysis.SummarizeWithin"] = new[]
-                {
-                    "in_polygons", "in_sum_features", "out_feature_class",
-                    "keep_all_polygons", "sum_fields", "sum_shape", "shape_unit",
-                    "group_field", "add_min_maj", "add_group_percent", "out_group_table"
-                },
-                ["management.SelectLayerByLocation"] = new[]
-                {
-                    "in_layer", "overlap_type", "select_features",
-                    "search_distance", "selection_type", "invert_spatial_relationship"
-                },
-                ["management.SelectLayerByAttribute"] = new[]
-                {
-                    "in_layer_or_view", "selection_type", "where_clause",
-                    "invert_where_clause"
-                },
-                ["management.CalculateField"] = new[]
-                {
-                    "in_table", "field", "expression", "expression_type",
-                    "code_block", "field_type", "enforce_domains"
-                },
-                ["management.JoinField"] = new[]
-                {
-                    "in_data", "in_field", "join_table", "join_field",
-                    "fields", "fm_option", "field_mapping", "index_join_fields"
-                },
-                ["management.AddField"] = new[]
-                {
-                    "in_table", "field_name", "field_type",
-                    "field_precision", "field_scale", "field_length", "field_alias",
-                    "field_is_nullable", "field_is_required", "field_domain"
-                },
-                ["analysis.Buffer"] = new[]
-                {
-                    "in_features", "out_feature_class", "buffer_distance_or_field",
-                    "line_side", "line_end_type", "dissolve_option", "dissolve_field", "method"
-                },
-                ["analysis.Clip"] = new[]
-                {
-                    "in_features", "clip_features", "out_feature_class", "cluster_tolerance"
-                },
-                ["analysis.Intersect"] = new[]
-                {
-                    "in_features", "out_feature_class", "join_attributes",
-                    "cluster_tolerance", "output_type"
-                },
-            };
+        // GP tool positional signatures live in ModelBuilder/GpToolCatalog.cs
+        // so the writer (AtbxManager) can consult the same data to canonicalize
+        // user-supplied parameter keys before they reach Pro's load-time
+        // normalizer. For the rationale behind needing positional signatures at
+        // all (Pro SDK exposes no introspection API; dense-packing
+        // dict-insertion-order silently corrupts calls when a model omits an
+        // optional slot before an included one), see the GpToolCatalog summary.
 
         /// <summary>
         /// Runs a ModelBuilder model with the given parameter dict. ModelBuilder models
@@ -2509,18 +2432,18 @@ namespace APBridgeAddIn
                 // expects.
                 // Build positional value array. Two strategies:
                 //
-                //   1) Known tool: walk GpToolSignatures[proc.Tool] in declared order
-                //      and fill each position from proc.Params by slot NAME. For slots
-                //      the model omitted (sparse storage), insert "#" so arcpy uses
-                //      the tool's declared default. This is the correct contract for
-                //      GP system tools.
+                //   1) Known tool: walk GpToolCatalog.Signatures[proc.Tool] in declared
+                //      order and fill each position from proc.Params by slot NAME. For
+                //      slots the model omitted (sparse storage), insert "#" so arcpy
+                //      uses the tool's declared default. This is the correct contract
+                //      for GP system tools.
                 //
                 //   2) Unknown tool: fall back to dense-packing by JSON insertion
                 //      order. Same as the old behavior — wrong for any tool that
                 //      omits optional slots before included ones, but the resulting
                 //      misalignment surfaces as obvious slot-mismatch errors that
                 //      point at which tool to add to the signature table.
-                var slotOrder = GpToolSignatures.TryGetValue(proc.Tool, out var sig)
+                var slotOrder = GpToolCatalog.Signatures.TryGetValue(proc.Tool, out var sig)
                     ? sig.AsEnumerable()
                     : proc.Params.Keys;
 
