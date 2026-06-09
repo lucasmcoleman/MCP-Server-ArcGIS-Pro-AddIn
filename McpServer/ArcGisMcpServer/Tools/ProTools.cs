@@ -647,6 +647,56 @@ namespace ArcGisMcpServer.Tools
         }
 
         [McpServerTool, Description(
+            "Surgically set (or clear) the default value of one model input parameter — " +
+            "without regenerating the rest of the model. Use this instead of UpdateModel when " +
+            "you only need to change a parameter default. Everything else in the model " +
+            "(other variables, every step, the diagram) stays byte-identical, so this cannot " +
+            "re-trigger slot canonicalization or any other round-trip behavior. " +
+            "Pass an empty defaultValue to clear an existing default.")]
+        public static async Task<string> SetParameterDefault(
+            [Description("Full file path to the .atbx toolbox file")] string toolboxPath,
+            [Description("Name of the existing model containing the parameter")] string modelName,
+            [Description("Exact param_name of the input parameter to modify (must be an exposed model Parameter, not a derived output)")] string parameterName,
+            [Description("New default value as a string; empty string clears the default")] string defaultValue)
+        {
+            var r = await _client!.OpAsync("pro.setParameterDefault", new()
+            {
+                ["toolboxPath"] = toolboxPath,
+                ["modelName"] = modelName,
+                ["parameterName"] = parameterName,
+                ["defaultValue"] = defaultValue ?? ""
+            });
+            return FormatResult(r, "pro.setParameterDefault");
+        }
+
+        [McpServerTool, Description(
+            "Surgically set one parameter on one step inside an existing model — without " +
+            "regenerating the rest of the model. Use this to retarget a step input or change " +
+            "a literal step value. Everything else stays byte-identical. " +
+            "paramValue is a JSON string with one of two shapes: " +
+            "{\"ref\":\"VariableName\"} to wire the param to that variable, OR " +
+            "{\"value\":\"literal\"} (or a bare JSON string) for a literal value. " +
+            "Does NOT accept output declarations — changing a step's output reshapes the " +
+            "graph and belongs in AddStep/RemoveStep (not yet implemented).")]
+        public static async Task<string> SetStepParameter(
+            [Description("Full file path to the .atbx toolbox file")] string toolboxPath,
+            [Description("Name of the existing model containing the step")] string modelName,
+            [Description("Exact display name of the step to modify (match what DescribeModel returns)")] string stepName,
+            [Description("Parameter key on the step (e.g., 'in_features', 'where_clause')")] string paramKey,
+            [Description("New parameter value as JSON: {\"ref\":\"Var\"} or {\"value\":\"x\"} or a bare \"string\"")] string paramValue)
+        {
+            var r = await _client!.OpAsync("pro.setStepParameter", new()
+            {
+                ["toolboxPath"] = toolboxPath,
+                ["modelName"] = modelName,
+                ["stepName"] = stepName,
+                ["paramKey"] = paramKey,
+                ["paramValue"] = paramValue
+            });
+            return FormatResult(r, "pro.setStepParameter");
+        }
+
+        [McpServerTool, Description(
             "Run a ModelBuilder model with specified parameter values. " +
             "Use DescribeModel first to see what parameters the model expects.")]
         public static async Task<string> RunModel(
