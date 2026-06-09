@@ -763,6 +763,12 @@ namespace APBridgeAddIn
                 case "pro.updateModel":
                     return HandleUpdateModel(req.Args);
 
+                case "pro.setParameterDefault":
+                    return HandleSetParameterDefault(req.Args);
+
+                case "pro.setStepParameter":
+                    return HandleSetStepParameter(req.Args);
+
                 case "pro.runModel":
                     return await HandleRunModel(req.Args);
 
@@ -2128,6 +2134,73 @@ namespace APBridgeAddIn
 
             AtbxManager.UpdateModel(path, modelName, definition);
             return new(true, null, new { modelName, toolboxPath = path, updated = true });
+        }
+
+        /// <summary>
+        /// Surgical write — updates only one input parameter's default value
+        /// inside an existing model. See <see cref="AtbxManager.SetParameterDefault"/>
+        /// for the byte-identical-everything-else guarantee.
+        /// </summary>
+        private static IpcResponse HandleSetParameterDefault(Dictionary<string, string>? args)
+        {
+            if (args == null ||
+                !args.TryGetValue("toolboxPath", out string? path) ||
+                string.IsNullOrWhiteSpace(path) ||
+                !args.TryGetValue("modelName", out string? modelName) ||
+                string.IsNullOrWhiteSpace(modelName) ||
+                !args.TryGetValue("parameterName", out string? paramName) ||
+                string.IsNullOrWhiteSpace(paramName))
+                return new(false, "args 'toolboxPath', 'modelName' & 'parameterName' required", null);
+
+            // Empty default is meaningful (clears existing default); accept absent
+            // arg as empty rather than rejecting.
+            args.TryGetValue("defaultValue", out string? defaultValue);
+
+            if (!File.Exists(path))
+                return new(false, $"Toolbox not found: {path}", null);
+
+            try
+            {
+                AtbxManager.SetParameterDefault(path, modelName, paramName, defaultValue ?? "");
+                return new(true, null, new { modelName, parameterName = paramName, defaultValue = defaultValue ?? "", modified = true });
+            }
+            catch (Exception ex)
+            {
+                return new(false, ex.Message, null);
+            }
+        }
+
+        /// <summary>
+        /// Surgical write — updates only one step's one parameter inside an
+        /// existing model. See <see cref="AtbxManager.SetStepParameter"/>.
+        /// </summary>
+        private static IpcResponse HandleSetStepParameter(Dictionary<string, string>? args)
+        {
+            if (args == null ||
+                !args.TryGetValue("toolboxPath", out string? path) ||
+                string.IsNullOrWhiteSpace(path) ||
+                !args.TryGetValue("modelName", out string? modelName) ||
+                string.IsNullOrWhiteSpace(modelName) ||
+                !args.TryGetValue("stepName", out string? stepName) ||
+                string.IsNullOrWhiteSpace(stepName) ||
+                !args.TryGetValue("paramKey", out string? paramKey) ||
+                string.IsNullOrWhiteSpace(paramKey) ||
+                !args.TryGetValue("paramValue", out string? paramValueJson) ||
+                string.IsNullOrWhiteSpace(paramValueJson))
+                return new(false, "args 'toolboxPath', 'modelName', 'stepName', 'paramKey' & 'paramValue' required", null);
+
+            if (!File.Exists(path))
+                return new(false, $"Toolbox not found: {path}", null);
+
+            try
+            {
+                AtbxManager.SetStepParameter(path, modelName, stepName, paramKey, paramValueJson);
+                return new(true, null, new { modelName, stepName, paramKey, modified = true });
+            }
+            catch (Exception ex)
+            {
+                return new(false, ex.Message, null);
+            }
         }
 
         // GP tool positional signatures live in ModelBuilder/GpToolCatalog.cs
