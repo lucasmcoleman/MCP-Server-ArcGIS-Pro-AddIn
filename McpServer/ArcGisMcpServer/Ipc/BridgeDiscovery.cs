@@ -13,15 +13,18 @@ namespace ArcGisMcpServer.Ipc
     /// </summary>
     public sealed class BridgePinException : Exception
     {
-        public BridgePinException(string pin, IReadOnlyList<BridgeDiscovery.BridgeEntry> live)
-            : base(BuildMessage(pin, live)) { }
+        public BridgePinException(string pin, bool fromEnv, IReadOnlyList<BridgeDiscovery.BridgeEntry> live)
+            : base(BuildMessage(pin, fromEnv, live)) { }
 
-        private static string BuildMessage(string pin, IReadOnlyList<BridgeDiscovery.BridgeEntry> live)
+        private static string BuildMessage(string pin, bool fromEnv, IReadOnlyList<BridgeDiscovery.BridgeEntry> live)
         {
             var available = live.Count == 0
                 ? "none (no ArcGIS Pro instance with the bridge Add-In is running)"
                 : string.Join(", ", live.Select(e => $"'{e.ProjectName ?? "<no project>"}' (pid {e.Pid})"));
-            return $"ARCGIS_PROJECT is pinned to '{pin}' but no live ArcGIS Pro instance has " +
+            var source = fromEnv
+                ? "ARCGIS_PROJECT is pinned to"
+                : "Routing was set via select_bridge to";
+            return $"{source} '{pin}' but no live ArcGIS Pro instance has " +
                    $"that project open. Live bridges: {available}.";
         }
     }
@@ -57,16 +60,32 @@ namespace ArcGisMcpServer.Ipc
             Environment.GetEnvironmentVariable("ARCGIS_PROJECT") is { } p
             && !string.IsNullOrWhiteSpace(p) ? p : null;
 
+        // Agent-set routing override (select_bridge tool). Only honored when no
+        // ARCGIS_PROJECT env pin exists — the env pin is the operator's
+        // isolation contract in multi-agent setups and must not be steerable
+        // from inside the session. Volatile: tool calls may run on different
+        // threads. In HTTP mode this is process-global (all HTTP clients of one
+        // server share it) — acceptable, HTTP deployments are single-tenant.
+        private static volatile string? _runtimeOverride;
+        public static string? RuntimeOverride
+        {
+            get => _runtimeOverride;
+            set => _runtimeOverride = string.IsNullOrWhiteSpace(value) ? null : value.Trim();
+        }
+
+        /// <summary>The pin Discover() acts on: env var first, else agent override.</summary>
+        public static string? EffectivePin => PinnedProject ?? _runtimeOverride;
+
         public static string Discover()
         {
             var entries = ReadAllLive();
-            var pin = PinnedProject;
+            var pin = EffectivePin;
 
             if (pin != null)
             {
                 var match = SelectPinned(entries, pin);
-                if (match == null) throw new BridgePinException(pin, entries);
-                Console.Error.WriteLine($"[BridgeDiscovery] ARCGIS_PROJECT='{pin}' matched bridge pid={match.Pid} pipe={match.PipeName}.");
+                if (match == null) throw new BridgePinException(pin, PinnedProject != null, entries);
+                Console.Error.WriteLine($"[BridgeDiscovery] pin '{pin}' ({(PinnedProject != null ? "env" : "select_bridge")}) matched bridge pid={match.Pid} pipe={match.PipeName}.");
                 return match.PipeName;
             }
 
@@ -91,7 +110,7 @@ namespace ArcGisMcpServer.Ipc
         /// </summary>
         public static BridgeEntry? SelectCurrent(IReadOnlyList<BridgeEntry> entries)
         {
-            var pin = PinnedProject;
+            var pin = EffectivePin;
             if (pin != null) return SelectPinned(entries, pin);
             return entries.OrderByDescending(e => e.StartedUtc).FirstOrDefault();
         }

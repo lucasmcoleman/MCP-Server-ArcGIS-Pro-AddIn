@@ -1516,19 +1516,23 @@ namespace ArcGisMcpServer.Tools
             // which is exactly when an agent most needs to see what's going on.
             var entries = BridgeDiscovery.ReadAllLive();
             var selected = BridgeDiscovery.SelectCurrent(entries);
-            var pin = BridgeDiscovery.PinnedProject;
+            var envPin = BridgeDiscovery.PinnedProject;
+            var pin = BridgeDiscovery.EffectivePin;
+            var source = envPin != null ? "env" : (pin != null ? "agent" : "auto");
 
+            var pinLabel = source == "env" ? "PINNED via ARCGIS_PROJECT" : "Routing set via select_bridge";
             var note = pin == null
                 ? (entries.Count > 1
-                    ? "No ARCGIS_PROJECT pin: this server follows the most-recently-started instance, " +
-                      "which can change if another Pro launches. Set ARCGIS_PROJECT to pin."
-                    : "No ARCGIS_PROJECT pin set.")
+                    ? "Auto routing: this server follows the most-recently-started instance, which can " +
+                      "change if another Pro launches. Use select_bridge (or the ARCGIS_PROJECT env var) to pin."
+                    : "Auto routing (most-recently-started instance). Use select_bridge to target a specific instance.")
                 : (selected == null
-                    ? $"PINNED to '{pin}' but that project is not open in any live instance — requests will fail until it is."
-                    : $"PINNED to '{pin}': all requests route to pid {selected.Pid} only.");
+                    ? $"{pinLabel} to '{pin}' but that project is not open in any live instance — requests will fail until it is."
+                    : $"{pinLabel} to '{pin}': all requests route to pid {selected.Pid} only.");
 
             var payload = new BridgeListPayload(
                 pin,
+                source,
                 entries
                     .OrderByDescending(e => e.StartedUtc)
                     .Select(e => new BridgeInstanceInfo(
@@ -1537,6 +1541,40 @@ namespace ArcGisMcpServer.Tools
                     .ToList(),
                 note);
             return JsonSerializer.Serialize(payload, IndentedJsonContext.Default.BridgeListPayload);
+        }
+
+        [McpServerTool, Description(
+            "Route this server's subsequent tool calls to a specific ArcGIS Pro " +
+            "instance, selected by the project it has open (run list_bridges " +
+            "first to see live instances). Lets one agent work across multiple " +
+            "Pro instances by switching between them: select_bridge('ProjectB'), " +
+            "do work there, select_bridge('ProjectA') to switch back, or " +
+            "select_bridge() with no argument to return to automatic " +
+            "most-recent routing. The selection is strict — while it is set, " +
+            "calls fail rather than touch a different instance — and persists " +
+            "for this server process until changed. Refused when the server is " +
+            "hard-pinned via the ARCGIS_PROJECT env var (that pin is the user's " +
+            "isolation guarantee in multi-agent setups and cannot be overridden " +
+            "from inside a session). Returns the same payload as list_bridges " +
+            "reflecting the new routing.")]
+        public static string SelectBridge(
+            [Description("Project to route to: bare name, name.aprx, or full path (case-insensitive). " +
+                         "Omit/empty to clear the selection and return to automatic routing.")]
+            string? project = null)
+        {
+            if (BridgeDiscovery.PinnedProject is { } envPin)
+                return JsonSerializer.Serialize(
+                    new FormatErrorPayload(false, "select_bridge",
+                        $"This server is hard-pinned to '{envPin}' via the ARCGIS_PROJECT env var; " +
+                        "select_bridge cannot override an operator pin. To work across multiple Pro " +
+                        "instances from one session, either run this server unpinned or configure one " +
+                        "pinned server entry per instance in .mcp.json."),
+                    IndentedJsonContext.Default.FormatErrorPayload);
+
+            BridgeDiscovery.RuntimeOverride = project;
+            // Echo the resulting routing state so the agent sees immediately
+            // whether the selection matched a live instance.
+            return ListBridges();
         }
 
         private static Dictionary<string, string> BuildSurroundArgs(

@@ -41,6 +41,7 @@ namespace ArcGisMcpServer.Ipc
 
     public record BridgeListPayload(
         [property: JsonPropertyName("pinnedProject")] string? PinnedProject,
+        [property: JsonPropertyName("routingSource")] string RoutingSource, // "env" | "agent" | "auto"
         [property: JsonPropertyName("bridges")] List<BridgeInstanceInfo> Bridges,
         [property: JsonPropertyName("note")] string Note
     );
