@@ -8,12 +8,20 @@
 #   ./tools/Test-McpStdio.ps1 -Tool ping -ServerPath <exe-or-dll> -Env @{ ARCGIS_PROJECT = 'MyProj' }
 
 param(
-    [Parameter(Mandatory = $true)] [string]$Tool,
+    [string]$Tool,
     [string]$ArgumentsJson = '{}',
+    # Sequence of calls in ONE server process (needed to test session state
+    # like select_bridge). Each item: 'tool_name' or 'tool_name|{"arg":"v"}'.
+    [string[]]$Calls,
     [string]$ServerPath = "McpServer\ArcGisMcpServer\bin\Release\net8.0\ArcGisMcpServer.dll",
     [hashtable]$Env = @{},
     [int]$TimeoutSec = 30
 )
+
+if (-not $Calls) {
+    if (-not $Tool) { throw 'Provide -Tool or -Calls.' }
+    $Calls = @("$Tool|$ArgumentsJson")
+}
 
 $ErrorActionPreference = 'Stop'
 
@@ -51,14 +59,23 @@ try {
     Read-Response 1 | Out-Null
 
     $stdin.WriteLine('{"jsonrpc":"2.0","method":"notifications/initialized"}')
-    $call = '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"' + $Tool + '","arguments":' + $ArgumentsJson + '}}'
-    $stdin.WriteLine($call)
     $stdin.Flush()
 
-    $resp = Read-Response 2 | ConvertFrom-Json
-    # Tool output is MCP content blocks; print the text payloads.
-    foreach ($c in $resp.result.content) { if ($c.type -eq 'text') { $c.text } }
-    if ($resp.error) { Write-Error ($resp.error | ConvertTo-Json -Compress) }
+    $id = 1
+    foreach ($spec in $Calls) {
+        $name, $argsJson = $spec -split '\|', 2
+        if (-not $argsJson) { $argsJson = '{}' }
+        $id++
+        $call = '{"jsonrpc":"2.0","id":' + $id + ',"method":"tools/call","params":{"name":"' + $name + '","arguments":' + $argsJson + '}}'
+        $stdin.WriteLine($call)
+        $stdin.Flush()
+
+        $resp = Read-Response $id | ConvertFrom-Json
+        "=== $name ==="
+        # Tool output is MCP content blocks; print the text payloads.
+        foreach ($c in $resp.result.content) { if ($c.type -eq 'text') { $c.text } }
+        if ($resp.error) { Write-Error ($resp.error | ConvertTo-Json -Compress) }
+    }
 }
 finally {
     try { $proc.Kill() } catch { }

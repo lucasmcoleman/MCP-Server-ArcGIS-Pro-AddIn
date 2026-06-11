@@ -127,11 +127,12 @@ namespace ArcGisMcpServer.Ipc
             // FormatResult and reaches the agent with actionable next steps.
             if (lastEx is BridgePinException)
                 return new IpcResponse(false,
-                    $"{lastEx.Message} The pin is strict so this server never routes to a " +
-                    "different Pro instance. If the project is still loading, retry in ~30s. " +
-                    "Otherwise open that project in an ArcGIS Pro instance (or fix/unset the " +
-                    "ARCGIS_PROJECT env var and restart the MCP server). Use list_bridges to " +
-                    "see live instances.",
+                    $"{lastEx.Message} Pinned routing is strict so this server never falls " +
+                    "back to a different Pro instance. If the project is still loading, retry " +
+                    "in ~30s. Otherwise open that project in an ArcGIS Pro instance, route to " +
+                    "another live instance with select_bridge (unless pinned via the " +
+                    "ARCGIS_PROJECT env var, which only the user can change), or use " +
+                    "list_bridges to see what's live.",
                     null);
             return new IpcResponse(false,
                 $"bridge unreachable for op '{req.Op}' after {attempts} attempt(s): {lastEx?.Message}. " +
