@@ -1,0 +1,122 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What this project is
+
+An MCP (Model Context Protocol) server that lets MCP clients drive ArcGIS Pro in real time. Two independently-built artifacts compose the system:
+
+- **`McpServer/ArcGisMcpServer/`** — .NET 8 stdio/HTTP MCP server, single-file publish (~21 MB). One `[McpServerTool]`-decorated static method per public tool. Each method translates the tool call into a bridge op via `BridgeClient.OpAsync("pro.X", args)` and `FormatResult`s the response.
+- **`AddIn/APBridgeAddIn/`** — ArcGIS Pro 3.6+ Add-In (a `.esriAddinX` ZIP bundle). Hosts a named-pipe server inside the Pro process and dispatches incoming ops to handlers in `ProBridgeService.cs`.
+
+The two halves are coupled only by the IPC contract (line-delimited JSON `IpcRequest`/`IpcResponse` over `ArcGisProBridge_<PID>`) plus the discovery registry at `%LOCALAPPDATA%\ArcGisMcpBridge\<PID>.json`.
+
+## Big-picture architecture
+
+```
+MCP client  ⇄  ArcGisMcpServer.exe  ⇄  (named pipe)  ⇄  APBridgeAddIn (in Pro)
+```
+
+- **`ProTools.cs`** is the agent-facing surface. Each `[McpServerTool, Description(...)]` method names a tool, declares typed parameters, calls one bridge op, returns a JSON string. Add a new agent-facing tool here.
+- **`ProBridgeService.cs`** is the Pro-side dispatcher. `HandleAsync` switches on `req.Op` (e.g., `"pro.runModel"`); each case calls a `HandleX` method that returns an `IpcResponse`. Add a new Pro-side capability here, then add a matching MCP tool in `ProTools.cs`.
+- **`AtbxManager.cs`** (~1.6K lines) owns ModelBuilder `.atbx` read/write. `.atbx` files are ZIPs containing per-tool folders (`{toolName}.tool/tool.model` + content + diagram); `WalkModel` parses one into a typed `ModelGraph` (variables + topo-sorted processes), `GenerateModelFiles` writes the JSON files from a simplified definition. Every `.atbx` write — bulk (`CreateModel`, `UpdateModel`) and surgical (`SetParameterDefault`, `SetStepParameter`) — routes through `WriteAtbxAtomically` (see "Things that bite").
+- **`GpToolCatalog.cs`** is a shared static the executor AND the writer both consult. `Signatures` maps `"alias.tool"` → ordered slot names (positional). `OutputSlots` maps each known tool to its canonical output slot key + default concrete `DE*` type. The writer uses `OutputSlots` to canonicalize non-canonical user-supplied keys (e.g., `out_features` → `updated_features` on `CalculateGeometryAttributes`) and to coerce `GPComposite` output declarations to the concrete `DE*` type Pro requires.
+- **`BridgeDiscovery.cs`** + **`BridgeRegistry.cs`** implement per-PID routing. Each Pro instance writes its registry entry on Add-In load; `BridgeDiscovery.Discover()` runs on every MCP request and cleans up dead PIDs. Selection precedence: `ARCGIS_PROJECT` env match → most-recently-started live bridge → legacy `ArcGisProBridgePipe` fallback. This is what makes Pro restarts transparent mid-session.
+
+### `run_model` is special
+
+The bridge does NOT delegate ModelBuilder execution to Pro's own engine. `HandleRunModel` → `RunModelCore` parses the `.atbx` into a `ModelGraph`, topologically sorts processes, and calls `Geoprocessing.ExecuteToolAsync` once per step with refs resolved against a runtime variable map. This bypasses Pro's whole-chain pre-validation, which would otherwise reject intermediate inputs that haven't materialized yet (first-run failures).
+
+Key invariants the executor relies on:
+
+- **`GpToolCatalog.Signatures`** static dictionary maps `"toolboxAlias.toolName"` → ordered slot names. Required because Pro stores process params sparsely by name but `ExecuteToolAsync` takes positional value arrays — without this map, dense-packing puts values into the wrong slots (e.g., `false` from `preserve_shape` lands in `transform_method` for `management.Project`). Extend the dictionary in `GpToolCatalog.cs` when a new tool surfaces a slot-mismatch error; if the new tool also has a derived output, add a `GpToolCatalog.OutputSlots` entry in the same change so the writer can canonicalize and coerce its outputs.
+- **Output-recording pre-pass** handles in-place selection tools (`SelectLayerByLocation`, `SelectLayerByAttribute`) whose ModelBuilder output is a logical alias for `in_layer` — arcpy has no positional output slot for them, so the signature walk would skip the output param and downstream refs would resolve to empty.
+- **`SubstituteModelVars`** replaces `%VarName%` patterns in literal expressions with runtime values. ModelBuilder's own engine does this string substitution before handing expressions to arcpy; the executor must mirror it or `CalculateField` expressions with `%MitigationRatio%` etc. trip Python `SyntaxError`.
+- **`SanitizeGdbName`** translates ModelBuilder variable names into valid File Geodatabase FC names when deriving output paths (spaces → `_`, leading-digit prefix → `x_`).
+- **Async path:** `HandleRunModelAsync` + `HandleGetRunStatus` use a `ConcurrentDictionary<jobId, RunJob>` with per-job locks. The sync `HandleRunModel` and async path both call `RunModelCore(args, RunJob?)` — pass `null` for sync, a `RunJob` for async progress tracking. Use the async path for models that exceed the MCP client's tool-call ceiling (~4 min for Claude Desktop, longer for Claude Code).
+
+### Diagnostic tip
+
+`mcp-bridge.log` (lives at the active project's home folder) **only records failures and exceptions**. A successful run leaves no log entry. To verify a long run completed, look for the expected outputs in the project's default GDB rather than searching the log for success markers.
+
+## Build & deploy
+
+The repo has two independently-built artifacts and the deploy gotchas matter:
+
+### Add-In (`AddIn/APBridgeAddIn/`)
+
+**Must use MSBuild from Visual Studio — not `dotnet build`.** The Pro SDK targets file (`Esri.ProApp.SDK.Desktop.targets`) uses `CodeTaskFactory`, which is MSBuild-only.
+
+```powershell
+& "C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe" `
+  AddIn/APBridgeAddIn/APBridgeAddIn.csproj -p:Configuration=Release
+```
+
+Output: `AddIn/APBridgeAddIn/bin/Release/net8.0-windows8.0/APBridgeAddIn.esriAddinX` (a ZIP).
+
+Deploy by copying that file to `C:\Users\<you>\Documents\ArcGIS\AddIns\ArcGISPro\{c56ccfd4-f12a-4916-84c2-64248b3d746c}\APBridgeAddIn.esriAddinX`. The GUID is the `AddInInfo id` from `Config.daml` — stable across builds. Pro must be closed during the copy.
+
+`CS8632` warnings are cosmetic — ignore.
+
+### MCP Server (`McpServer/ArcGisMcpServer/`)
+
+```powershell
+pwsh ./build-mcp-server.ps1
+```
+
+This invokes `dotnet publish -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -o McpServer/ArcGisMcpServer/publish`, producing `publish/ArcGisMcpServer.exe`. The script **refuses to publish if any `ArcGisMcpServer.exe` is running** — any attached Claude Code session holds the file lock. Exit the MCP client first.
+
+The `.mcp.json` at the repo root points directly at the published exe, so a fresh build is picked up by the next Claude Code start. Plain `dotnet build` (without the publish script) is fine for syntax validation.
+
+### Full close-restart cycle
+
+For changes that affect both halves:
+
+```powershell
+pwsh ./restart-dev-cycle.ps1
+```
+
+The script verifies Pro is closed, rebuilds the Add-In, wipes the per-user AssemblyCache (Pro caches extracted DLLs there and may not re-extract on identical-mtime input), deploys the bundle, republishes the MCP exe, mirrors it to `publish-http/` for the HTTP variant, and restarts the `ArcGisMcpServer-HTTP` scheduled task if it was running. Steps are ordered so a build failure leaves the prior deployed state intact.
+
+## Doing common things
+
+### Adding an MCP tool that calls a new Pro op
+
+1. Add `case "pro.foo": return await HandleFoo(req.Args);` to the dispatcher in `ProBridgeService.HandleAsync` (around line 700-1000).
+2. Implement `HandleFoo(Dictionary<string,string>? args)` in `ProBridgeService.cs` — return `IpcResponse`. Wrap any Pro SDK calls that touch the map or layers in `QueuedTask.Run`.
+3. Add a `[McpServerTool, Description(...)] public static async Task<string> Foo(...)` method to `ProTools.cs` that builds an args dict, calls `_client!.OpAsync("pro.foo", args)`, returns `FormatResult(r, "pro.foo")`.
+4. Rebuild both halves and run the full close-restart cycle.
+
+### Working on `run_model` step execution
+
+`HandleRunModel` (thin wrapper) and `HandleRunModelAsync` both call `RunModelCore` in `ProBridgeService.cs`. The per-step loop is the heart of the executor — make changes there carefully. Test with the scratch `test_authoring.atbx` pattern: `create_toolbox` → `create_model` with the failing-shape steps → `describe_model` to verify round-trip → `run_model` to verify execution. The scratch toolbox can be deleted afterward.
+
+When a `run_model` failure surfaces, check the bridge log at the active project's home folder for the actual GP error code — Aurora model debugging history is full of cases where the MCP client gave up before the bridge could return the real error.
+
+The executor rejects non-`gpTool` step kinds with a kind-specific error: `scriptTool` and `nestedModel` steps round-trip cleanly through reader and writer (so `update_model` doesn't drop them), but executing them step-by-step is out-of-scope. Run those models via Pro's ribbon, or via `start_run_model` if Pro's whole-model executor handles the chain.
+
+### Adding a `.atbx` write path
+
+If you need a new write operation on an `.atbx` (e.g., `add_step`, `remove_step`, `rewire_connection`), wrap the mutation in `AtbxManager.WriteAtbxAtomically(atbxPath, zip => { ... })`. Never open a live `.atbx` directly with `FileStream` + `ZipArchive(Update)` from a new write path — Pro deadlocks on in-place writes to any `.atbx` containing a model it holds in a ModelBuilder canvas (or any model referenced by a canvas-open model via `scriptTool`/`nestedModel` steps). The helper reads the live file into memory, runs the mutation in-memory, then `File.Replace`s a temp file over the live one, so the bridge never holds the live file lock during the heavy write.
+
+### .atbx format notes
+
+ATBX files are plain ZIPs with a UTF-8 JSON layout — not SQLite. Each model lives in `{modelName}.tool/`:
+- `tool.model` — the graph (variables + processes + connections)
+- `tool.content` — resource declarations (parameters, environments)
+- `tool.content.rc` — string resource map (titles)
+- `tool.model.diagram` + `tool.model.diagram.xml` — visual layout
+- Toolbox-level: `toolbox.content` + `toolbox.content.rc`
+
+`AtbxManager.WalkModel` is the authoritative reader; `GenerateModelFiles` is the authoritative writer. Both round-trip the simplified JSON definition shape (the same shape `describe_model` returns and `create_model`/`update_model` accept).
+
+## Things that bite
+
+- **Never auto-kill ArcGIS Pro.** The standard rule is to ask the user to close Pro before any redeploy. The build script refuses to overwrite a running MCP exe; the Add-In bundle is the user's responsibility to copy in. Exception: when the user has explicitly granted permission for a specific task (e.g., overnight automation), launching Pro via `& "C:\Program Files\ArcGIS\Pro\bin\ArcGISPro.exe" "<aprx path>"` may still get stuck on Pro's Start Page or sign-in dialog — those modals require human clicks.
+- **`Geoprocessing.MakeEnvironmentArray` is a named-argument method, not a Dictionary-taker.** Passing `Dictionary<string,object>` positionally binds it to the first parameter (`workspace`) and produces a `RuntimeBinderException` about `MapMember`. Use named-arg syntax: `MakeEnvironmentArray(overwriteoutput: true, workspace: gdb)`.
+- **`JsonSerializerOptions` for `JsonNode` serialization** must come from `new(JsonSerializerOptions.Default)` (carries `DefaultJsonTypeInfoResolver`). A bare `new JsonSerializerOptions { WriteIndented = true }` will throw "TypeInfoResolver not specified" when serializing `JsonValueCustomized<T>` instances. New `[McpServerTool]` methods returning JSON should look at existing handlers in `ProTools.cs` for the right pattern.
+- **`ZipArchive` Update mode**: read pre-existing entries BEFORE doing any writes. Reading after writing can silently return empty streams (this used to corrupt `update_model` until F-series fixes). The pattern persists inside `WriteAtbxAtomically`'s mutation lambda — the helper runs the mutation against an in-memory `ZipArchive` in `Update` mode, so the read-before-write ordering still matters within the lambda body.
+- **`.atbx` writes deadlock against Pro's open ModelBuilder canvas.** An in-place write to a file Pro holds in a canvas, OR a file referenced via `scriptTool`/`nestedModel` by a canvas-open model, hangs for 4 minutes (the bridge's IPC timeout). Resolved by `AtbxManager.WriteAtbxAtomically`: all four existing write paths (`CreateModel`, `UpdateModel`, `SetParameterDefault`, `SetStepParameter`) route through it; any new write path must too. Operational caveat for users: after a surgical write, Pro's open canvas keeps showing the pre-write state until the user reopens that model tab — the file on disk is correct but Pro doesn't auto-reload.
+- **`GeoprocessingProjectItem`** lives in `ArcGIS.Desktop.GeoProcessing` (capital `P`), not `ArcGIS.Desktop.Core.Geoprocessing`.
+- **Git-bash mangles Windows `/F /IM` flags** when running `taskkill`. Use PowerShell `Stop-Process -Force` / `Start-Process` for any process control. The Bash tool is fine for `git`, `grep`, file ops; PowerShell for Windows-native commands.
+- **MSBuild's auto-deploy `RegisterAddIn.exe`** errors with "not recognized" when not on PATH. Benign — the `.esriAddinX` bundle is built before that step runs. Just do the file copy manually or via `restart-dev-cycle.ps1`.
