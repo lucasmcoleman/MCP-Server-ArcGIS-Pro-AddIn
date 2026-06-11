@@ -71,6 +71,25 @@ One agent per Pro instance is the supported concurrency model. Open each project
 
 Each agent is deterministically routed to its own Pro instance for the life of the session — including across Pro restarts (discovery re-resolves on every call, matching by project name rather than PID). The `list_bridges` tool shows every live instance and which one the calling server routes to. Two agents inside the *same* Pro instance is not supported: most view/edit operations target the single active map view, and Pro serializes UI-thread and GP work internally anyway.
 
+**One agent driving two Pro instances** works the same way, inverted: declare the server twice in one workspace's `.mcp.json`, each entry pinned to a different project:
+
+```json
+{
+  "mcpServers": {
+    "arcgis-a": {
+      "command": "McpServer/ArcGisMcpServer/publish/ArcGisMcpServer.exe",
+      "env": { "ARCGIS_PROJECT": "ProjectA" }
+    },
+    "arcgis-b": {
+      "command": "McpServer/ArcGisMcpServer/publish/ArcGisMcpServer.exe",
+      "env": { "ARCGIS_PROJECT": "ProjectB" }
+    }
+  }
+}
+```
+
+The client spawns two server processes; the agent sees two namespaced tool sets (`mcp__arcgis-a__list_layers` vs `mcp__arcgis-b__list_layers`) and addresses each instance explicitly. Strict pinning guarantees the namespaces can never cross-route. Useful for cross-project work — e.g., comparing data between projects, or copying models/symbology from one to the other.
+
 ---
 
 ## Available tools
