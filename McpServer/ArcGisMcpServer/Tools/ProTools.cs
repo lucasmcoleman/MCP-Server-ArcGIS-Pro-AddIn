@@ -430,8 +430,8 @@ namespace ArcGisMcpServer.Tools
             [Description("Optional: 'landscape' (default) or 'portrait' — coerces width/height order to match")] string? orientation = null)
         {
             var args = new Dictionary<string, string> { ["name"] = name };
-            if (widthInches.HasValue) args["widthInches"] = widthInches.Value.ToString();
-            if (heightInches.HasValue) args["heightInches"] = heightInches.Value.ToString();
+            if (widthInches.HasValue) args["widthInches"] = widthInches.Value.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            if (heightInches.HasValue) args["heightInches"] = heightInches.Value.ToString(System.Globalization.CultureInfo.InvariantCulture);
             if (!string.IsNullOrWhiteSpace(orientation)) args["orientation"] = orientation;
             var r = await _client!.OpAsync("pro.createLayout", args);
             return FormatResult(r, "pro.createLayout");
@@ -455,10 +455,10 @@ namespace ArcGisMcpServer.Tools
                 ["layoutName"] = layoutName,
                 ["mapName"] = mapName
             };
-            if (xInches.HasValue) args["xInches"] = xInches.Value.ToString();
-            if (yInches.HasValue) args["yInches"] = yInches.Value.ToString();
-            if (widthInches.HasValue) args["widthInches"] = widthInches.Value.ToString();
-            if (heightInches.HasValue) args["heightInches"] = heightInches.Value.ToString();
+            if (xInches.HasValue) args["xInches"] = xInches.Value.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            if (yInches.HasValue) args["yInches"] = yInches.Value.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            if (widthInches.HasValue) args["widthInches"] = widthInches.Value.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            if (heightInches.HasValue) args["heightInches"] = heightInches.Value.ToString(System.Globalization.CultureInfo.InvariantCulture);
             var r = await _client!.OpAsync("pro.addMapFrameToLayout", args);
             return FormatResult(r, "pro.addMapFrameToLayout");
         }
@@ -519,7 +519,7 @@ namespace ArcGisMcpServer.Tools
             if (!string.IsNullOrWhiteSpace(format))
                 args["format"] = format;
             if (resolution.HasValue)
-                args["resolution"] = resolution.Value.ToString();
+                args["resolution"] = resolution.Value.ToString(System.Globalization.CultureInfo.InvariantCulture);
             var r = await _client!.OpAsync("pro.exportLayout", args);
             return FormatResult(r, "pro.exportLayout");
         }
@@ -567,15 +567,20 @@ namespace ArcGisMcpServer.Tools
 
         [McpServerTool, Description(
             "Create a new empty toolbox (.atbx) file. " +
-            "If no path is specified, creates it in the project home folder.")]
+            "If no path is specified, creates it in the project home folder. " +
+            "Refuses to replace an existing toolbox (which would destroy its " +
+            "models) unless overwrite=true is passed explicitly.")]
         public static async Task<string> CreateToolbox(
             [Description("Display name for the new toolbox")] string name,
             [Description("Optional: full file path where the .atbx file should be created. " +
-                "If omitted, uses the project home folder.")] string? path = null)
+                "If omitted, uses the project home folder.")] string? path = null,
+            [Description("Optional: replace an existing toolbox at that path, DESTROYING its models (default false)")] bool overwrite = false)
         {
             var args = new Dictionary<string, string> { ["name"] = name };
             if (!string.IsNullOrWhiteSpace(path))
                 args["path"] = path;
+            if (overwrite)
+                args["overwrite"] = "true";
 
             var r = await _client!.OpAsync("pro.createToolbox", args);
             return FormatResult(r, "pro.createToolbox");
@@ -698,7 +703,10 @@ namespace ArcGisMcpServer.Tools
 
         [McpServerTool, Description(
             "Run a ModelBuilder model with specified parameter values. " +
-            "Use DescribeModel first to see what parameters the model expects.")]
+            "Use describe_model first to see what parameters the model expects. " +
+            "SYNCHRONOUS — blocks until the model finishes. For models that may " +
+            "run longer than ~2 minutes wall-clock, use start_run_model + " +
+            "get_run_status instead so the tool call doesn't time out.")]
         public static async Task<string> RunModel(
             [Description("Full file path to the .atbx toolbox file")] string toolboxPath,
             [Description("Name of the model to run")] string modelName,
@@ -719,10 +727,10 @@ namespace ArcGisMcpServer.Tools
 
         [McpServerTool, Description(
             "Start a ModelBuilder model run asynchronously and return a job id " +
-            "immediately. Use this instead of RunModel when the model may exceed " +
-            "the agent's tool-call timeout (e.g., Aurora-class models with hosted " +
-            "service clips). Poll progress with GetRunStatus(jobId). Returns " +
-            "{jobId, started, pollWith}.")]
+            "immediately. Use this instead of run_model when the model may exceed " +
+            "the agent's tool-call timeout (e.g., long-running models with hosted " +
+            "service clips). Poll progress with get_run_status using the returned " +
+            "jobId. Returns {jobId, started, pollWith}.")]
         public static async Task<string> StartRunModel(
             [Description("Full file path to the .atbx toolbox file")] string toolboxPath,
             [Description("Name of the model to run")] string modelName,
@@ -742,34 +750,53 @@ namespace ArcGisMcpServer.Tools
         }
 
         [McpServerTool, Description(
-            "Get the current status of an async model run by job id. Returns a " +
-            "snapshot: status (running/succeeded/failed), totalSteps, " +
-            "completedSteps, currentStep, plus failedStep/failedTool/error on " +
-            "failure and the cumulative messages list. Cheap to poll; reads a " +
-            "snapshot without blocking the run. Once endedUtc is populated the " +
-            "run is done and messages are final. Jobs auto-expire 1 hour after " +
-            "completion.")]
+            "Get the current status of an async model run by job id (from " +
+            "start_run_model). Returns a snapshot: status " +
+            "(running/succeeded/failed), totalSteps, completedSteps, currentStep, " +
+            "plus failedStep/failedTool/error on failure, totalMessages, and the " +
+            "messages list. Pass messagesFrom=<totalMessages from your previous " +
+            "poll> to receive only NEW messages instead of the whole list each " +
+            "time. Cheap to poll. Once endedUtc is populated the run is done. " +
+            "Jobs auto-expire 1 hour after completion.")]
         public static async Task<string> GetRunStatus(
-            [Description("Job id returned by RunModelAsync")] string jobId)
+            [Description("Job id returned by start_run_model")] string jobId,
+            [Description("Optional: skip messages before this index (use totalMessages from the prior poll)")] int messagesFrom = 0)
         {
             var args = new Dictionary<string, string> { ["jobId"] = jobId };
+            if (messagesFrom > 0)
+                args["messagesFrom"] = messagesFrom.ToString(System.Globalization.CultureInfo.InvariantCulture);
             var r = await _client!.OpAsync("pro.getRunStatus", args);
             return FormatResult(r, "pro.getRunStatus");
         }
 
         [McpServerTool, Description(
-            "Run any geoprocessing tool directly (not just models). " +
-            "Useful for one-off operations like Buffer, Clip, Select, etc.")]
+            "Run any geoprocessing tool directly (not just models). Useful for " +
+            "one-off operations like Buffer, Clip, AddField, Statistics, etc. " +
+            "Parameters are POSITIONAL in the tool's arcpy signature order — use " +
+            "describe_gp_tool to get the exact order, and pass \"#\" in any " +
+            "optional slot you want to skip (tool default applies). Multivalue/" +
+            "value-table params accept nested JSON arrays: [\"f1\",\"v1\"] pairs " +
+            "become arcpy's 'f1 v1;f2 v2' syntax automatically. Runs with " +
+            "overwriteoutput=true (existing outputs are replaced). The response " +
+            "includes returnValue/outputs so you know where results landed. " +
+            "Outputs are NOT added to the map — use add_layer_from_file to " +
+            "display them.")]
         public static async Task<string> RunGPTool(
             [Description("Geoprocessing tool name, e.g., 'analysis.Buffer', 'management.AddField'")] string tool,
-            [Description("JSON array of parameter values in order, e.g., " +
-                "[\"input_features\", \"output_features\", \"100 Meters\"]")] string parameters)
+            [Description("JSON array of parameter values in positional order, e.g., " +
+                "[\"Roads\", \"C:/out.gdb/RoadsBuf\", \"100 Meters\", \"#\", \"#\", \"ALL\"]")] string parameters,
+            [Description("Optional: JSON object of GP environment overrides for this call, e.g., " +
+                "{\"extent\": \"xmin ymin xmax ymax\", \"outputCoordinateSystem\": \"PROJCS[...]or wkid\", " +
+                "\"cellSize\": \"30\", \"mask\": \"StudyArea\", \"snapRaster\": \"dem\"}")] string? environments = null)
         {
-            var r = await _client!.OpAsync("pro.runGPTool", new()
+            var args = new Dictionary<string, string>
             {
                 ["tool"] = tool,
                 ["parameters"] = parameters
-            });
+            };
+            if (!string.IsNullOrWhiteSpace(environments))
+                args["environments"] = environments;
+            var r = await _client!.OpAsync("pro.runGPTool", args);
             return FormatResult(r, "pro.runGPTool");
         }
 
@@ -824,6 +851,609 @@ namespace ArcGisMcpServer.Tools
                 ["features"] = features
             });
             return FormatResult(r, "pro.addPolygonFeatures");
+        }
+
+        // ─── GP Tool Discovery ───────────────────────────────────────────
+
+        [McpServerTool, Description(
+            "Get the full parameter schema of any system geoprocessing tool by " +
+            "'alias.ToolName' (e.g., 'analysis.Buffer', 'management.AddField'). " +
+            "Returns each parameter IN POSITIONAL ORDER with name, data type, " +
+            "in/out direction, optional flag, default value, allowed values " +
+            "(coded domains), and dependencies. The positional order maps 1:1 to " +
+            "run_gp_tool's parameters array — pass \"#\" to skip an optional slot " +
+            "and use the tool's default. Call this BEFORE run_gp_tool when unsure " +
+            "of a tool's exact signature instead of guessing parameter order.")]
+        public static async Task<string> DescribeGpTool(
+            [Description("Tool id as 'alias.ToolName', e.g. 'analysis.Buffer'")] string tool)
+        {
+            var r = await _client!.OpAsync("pro.describeGpTool", new() { ["tool"] = tool });
+            return FormatResult(r, "pro.describeGpTool");
+        }
+
+        [McpServerTool, Description(
+            "Search ArcGIS Pro's ~1700 system geoprocessing tools by name keyword. " +
+            "Returns matching 'alias.ToolName' ids ready for describe_gp_tool / " +
+            "run_gp_tool. Example: keyword 'buffer' finds analysis.Buffer, " +
+            "analysis.PairwiseBuffer, analysis.GraphicBuffer, etc.")]
+        public static async Task<string> SearchGpTools(
+            [Description("Substring to match against tool names (case-insensitive)")] string keyword,
+            [Description("Optional: max results (default 25, max 100)")] int limit = 25)
+        {
+            var args = new Dictionary<string, string>
+            {
+                ["keyword"] = keyword,
+                ["limit"] = limit.ToString(System.Globalization.CultureInfo.InvariantCulture)
+            };
+            var r = await _client!.OpAsync("pro.searchGpTools", args);
+            return FormatResult(r, "pro.searchGpTools");
+        }
+
+        // ─── Python Escape Hatch ─────────────────────────────────────────
+
+        [McpServerTool, Description(
+            "Execute arbitrary Python code INSIDE ArcGIS Pro's live Python " +
+            "environment (arcpy pre-imported, full arcpy.mp / arcpy.da / CIM " +
+            "access). Because it runs in-process, " +
+            "arcpy.mp.ArcGISProject('CURRENT') manipulates the OPEN project — " +
+            "use this for anything the dedicated tools don't cover: advanced " +
+            "symbology, da.SearchCursor aggregation (pandas is available), " +
+            "Describe on any dataset, layouts, metadata, etc. " +
+            "CONTRACT: print() output is captured to 'stdout'; assign a variable " +
+            "named `result` to return a JSON-serializable value; exceptions " +
+            "return ok=false with the full traceback (read it and self-correct). " +
+            "State does NOT persist between calls (fresh namespace each time). " +
+            "Each call has ~2-5s GP framework overhead; batch related work into " +
+            "one call. Long-running code blocks Pro's GP queue — keep calls " +
+            "under a few minutes.")]
+        public static async Task<string> ExecutePython(
+            [Description("Python source code. arcpy is pre-imported. Set `result = ...` to return data; print() for logs.")] string code)
+        {
+            var r = await _client!.OpAsync("pro.executePython", new() { ["code"] = code });
+            return FormatResult(r, "pro.executePython");
+        }
+
+        // ─── View / Camera / Bookmarks ───────────────────────────────────
+
+        [McpServerTool, Description(
+            "Capture the active map view to a PNG image — this is how you SEE the " +
+            "map (current extent, symbology, drawn layers). Returns the file path; " +
+            "read the image file to inspect it. Use after symbology/layout changes " +
+            "to verify results visually, or before answering questions about what " +
+            "the map shows. Requires a map tab to be active in Pro (for layouts " +
+            "use export_layout). Default 1200x900 px to project_home/mcp-captures/.")]
+        public static async Task<string> CaptureMapView(
+            [Description("Optional: output PNG path. Default: <project home>/mcp-captures/map_view_<timestamp>.png")] string? output = null,
+            [Description("Optional: image width in pixels (default 1200, max 4096)")] int? width = null,
+            [Description("Optional: image height in pixels (default 900, max 4096)")] int? height = null)
+        {
+            var args = new Dictionary<string, string>();
+            if (!string.IsNullOrWhiteSpace(output)) args["output"] = output;
+            if (width.HasValue) args["width"] = width.Value.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            if (height.HasValue) args["height"] = height.Value.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            var r = await _client!.OpAsync("pro.captureMapView", args);
+            return FormatResult(r, "pro.captureMapView");
+        }
+
+        [McpServerTool, Description(
+            "Zoom the active map view to an explicit bounding box. Coordinates " +
+            "are in the map's spatial reference unless 'wkid' says otherwise " +
+            "(e.g., pass wkid=4326 for lon/lat degrees).")]
+        public static async Task<string> ZoomToExtent(
+            [Description("West edge")] double xmin,
+            [Description("South edge")] double ymin,
+            [Description("East edge")] double xmax,
+            [Description("North edge")] double ymax,
+            [Description("Optional: spatial reference WKID of the coordinates (default: map SR)")] int? wkid = null)
+        {
+            var inv = System.Globalization.CultureInfo.InvariantCulture;
+            var args = new Dictionary<string, string>
+            {
+                ["xmin"] = xmin.ToString(inv),
+                ["ymin"] = ymin.ToString(inv),
+                ["xmax"] = xmax.ToString(inv),
+                ["ymax"] = ymax.ToString(inv)
+            };
+            if (wkid.HasValue) args["wkid"] = wkid.Value.ToString(inv);
+            var r = await _client!.OpAsync("pro.zoomToExtent", args);
+            return FormatResult(r, "pro.zoomToExtent");
+        }
+
+        [McpServerTool, Description(
+            "Set the active map view's scale denominator (e.g., 24000 shows the " +
+            "map at 1:24,000). Keeps the current center point.")]
+        public static async Task<string> ZoomToScale(
+            [Description("Scale denominator, e.g. 24000 for 1:24,000")] double scale)
+        {
+            var r = await _client!.OpAsync("pro.zoomToScale", new()
+            {
+                ["scale"] = scale.ToString(System.Globalization.CultureInfo.InvariantCulture)
+            });
+            return FormatResult(r, "pro.zoomToScale");
+        }
+
+        [McpServerTool, Description(
+            "Zoom the active map view to the union of all currently selected " +
+            "features (any layer). No-op with a hint if nothing is selected.")]
+        public static async Task<string> ZoomToSelected()
+        {
+            var r = await _client!.OpAsync("pro.zoomToSelected");
+            return FormatResult(r, "pro.zoomToSelected");
+        }
+
+        [McpServerTool, Description(
+            "List spatial bookmarks of a map (name + extent). Default: active map.")]
+        public static async Task<string> ListBookmarks(
+            [Description("Optional: map name. Default: active map.")] string? map = null)
+        {
+            var args = new Dictionary<string, string>();
+            if (!string.IsNullOrWhiteSpace(map)) args["map"] = map;
+            var r = await _client!.OpAsync("pro.listBookmarks", args);
+            return FormatResult(r, "pro.listBookmarks");
+        }
+
+        [McpServerTool, Description("Zoom the active map view to a named bookmark.")]
+        public static async Task<string> ZoomToBookmark(
+            [Description("Bookmark name (see list_bookmarks)")] string name)
+        {
+            var r = await _client!.OpAsync("pro.zoomToBookmark", new() { ["name"] = name });
+            return FormatResult(r, "pro.zoomToBookmark");
+        }
+
+        [McpServerTool, Description(
+            "Create a bookmark of the active map view's current extent.")]
+        public static async Task<string> CreateBookmark(
+            [Description("Name for the new bookmark")] string name)
+        {
+            var r = await _client!.OpAsync("pro.createBookmark", new() { ["name"] = name });
+            return FormatResult(r, "pro.createBookmark");
+        }
+
+        // ─── Editing ─────────────────────────────────────────────────────
+
+        [McpServerTool, Description(
+            "Update attribute values on features/rows matching a WHERE clause or " +
+            "an explicit ObjectID list (exactly one of 'where'/'oids' required — " +
+            "use where=\"1=1\" to deliberately target every row; capped at 10,000 " +
+            "rows). 'attributes' is a JSON object {field: value, ...}. Edits go " +
+            "into Pro's undo-able edit session — call save_edits to persist to " +
+            "disk. Example: layer='Parcels', where=\"ZONE='R1'\", " +
+            "attributes='{\"STATUS\": \"Reviewed\", \"SCORE\": 5}'.")]
+        public static async Task<string> UpdateFeatures(
+            [Description("Layer or standalone table name (matches list_layers)")] string layer,
+            [Description("JSON object of field:value pairs to set")] string attributes,
+            [Description("SQL WHERE clause selecting rows to update (or use 'oids')")] string? where = null,
+            [Description("Comma-separated ObjectIDs to update (or use 'where')")] string? oids = null,
+            [Description("Optional: map name. Default: active map.")] string? map = null)
+        {
+            var args = new Dictionary<string, string>
+            {
+                ["layer"] = layer,
+                ["attributes"] = attributes
+            };
+            if (!string.IsNullOrWhiteSpace(where)) args["where"] = where;
+            if (!string.IsNullOrWhiteSpace(oids)) args["oids"] = oids;
+            if (!string.IsNullOrWhiteSpace(map)) args["map"] = map;
+            var r = await _client!.OpAsync("pro.updateFeatures", args);
+            return FormatResult(r, "pro.updateFeatures");
+        }
+
+        [McpServerTool, Description(
+            "Delete features/rows matching a WHERE clause or an explicit ObjectID " +
+            "list (exactly one of 'where'/'oids' required; capped at 10,000 rows). " +
+            "Deletes go into Pro's undo-able edit session — call save_edits to " +
+            "persist, or discard_edits to roll back.")]
+        public static async Task<string> DeleteFeatures(
+            [Description("Layer or standalone table name (matches list_layers)")] string layer,
+            [Description("SQL WHERE clause selecting rows to delete (or use 'oids')")] string? where = null,
+            [Description("Comma-separated ObjectIDs to delete (or use 'where')")] string? oids = null,
+            [Description("Optional: map name. Default: active map.")] string? map = null)
+        {
+            var args = new Dictionary<string, string> { ["layer"] = layer };
+            if (!string.IsNullOrWhiteSpace(where)) args["where"] = where;
+            if (!string.IsNullOrWhiteSpace(oids)) args["oids"] = oids;
+            if (!string.IsNullOrWhiteSpace(map)) args["map"] = map;
+            var r = await _client!.OpAsync("pro.deleteFeatures", args);
+            return FormatResult(r, "pro.deleteFeatures");
+        }
+
+        [McpServerTool, Description(
+            "Add polyline features to an existing polyline layer in the active " +
+            "map. Same contract as add_point_features/add_polygon_features: each " +
+            "feature has 'vertices' ([x,y] pairs, at least 2, IN THE LAYER'S " +
+            "SPATIAL REFERENCE) and optional 'attributes'. Example: " +
+            "[{\"vertices\": [[-78.71, 35.74], [-78.70, 35.73]], " +
+            "\"attributes\": {\"Name\": \"Route A\"}}]")]
+        public static async Task<string> AddPolylineFeatures(
+            [Description("Polyline layer name, matching what list_layers returns")] string layer,
+            [Description("JSON array of polyline definitions — each has vertices ([x,y] pairs) and optional attributes")] string features)
+        {
+            var r = await _client!.OpAsync("pro.addPolylineFeatures", new()
+            {
+                ["layer"] = layer,
+                ["features"] = features
+            });
+            return FormatResult(r, "pro.addPolylineFeatures");
+        }
+
+        [McpServerTool, Description(
+            "Save all pending edits in Pro's edit session to disk. Use after " +
+            "update_features / delete_features / add_*_features when the changes " +
+            "should be permanent.")]
+        public static async Task<string> SaveEdits()
+        {
+            var r = await _client!.OpAsync("pro.saveEdits");
+            return FormatResult(r, "pro.saveEdits");
+        }
+
+        [McpServerTool, Description(
+            "Discard ALL pending (unsaved) edits in Pro's edit session — rolls " +
+            "back every update/delete/add since the last save. Destructive to " +
+            "pending work; check has_edits first if unsure.")]
+        public static async Task<string> DiscardEdits()
+        {
+            var r = await _client!.OpAsync("pro.discardEdits");
+            return FormatResult(r, "pro.discardEdits");
+        }
+
+        [McpServerTool, Description("Check whether Pro has unsaved edits in its edit session.")]
+        public static async Task<string> HasEdits()
+        {
+            var r = await _client!.OpAsync("pro.hasEdits");
+            return FormatResult(r, "pro.hasEdits");
+        }
+
+        // ─── Map Administration ──────────────────────────────────────────
+
+        [McpServerTool, Description(
+            "Create a new map in the project (and open its view by default, " +
+            "making it the active map). Uses the project's default basemap.")]
+        public static async Task<string> CreateMap(
+            [Description("Name for the new map")] string name,
+            [Description("Optional: open a view pane for it (default true)")] bool open = true)
+        {
+            var r = await _client!.OpAsync("pro.createMap", new()
+            {
+                ["name"] = name,
+                ["open"] = open.ToString().ToLowerInvariant()
+            });
+            return FormatResult(r, "pro.createMap");
+        }
+
+        [McpServerTool, Description(
+            "Open (activate) a map view pane for a named map. Most mutation tools " +
+            "target the ACTIVE map — use this to switch which map that is.")]
+        public static async Task<string> OpenMapView(
+            [Description("Map name (see list_maps)")] string name)
+        {
+            var r = await _client!.OpAsync("pro.openMapView", new() { ["name"] = name });
+            return FormatResult(r, "pro.openMapView");
+        }
+
+        [McpServerTool, Description(
+            "Set a map's basemap to a named Esri basemap (replaces current " +
+            "basemap layers). The error message lists valid names if yours " +
+            "doesn't match; common ones: Imagery, Streets, Topographic, " +
+            "LightGray, DarkGray, Oceans, OpenStreetMap, Terrain, None.")]
+        public static async Task<string> SetBasemap(
+            [Description("Basemap name (e.g. 'Imagery', 'Topographic', 'None')")] string basemap,
+            [Description("Optional: map name. Default: active map.")] string? map = null)
+        {
+            var args = new Dictionary<string, string> { ["basemap"] = basemap };
+            if (!string.IsNullOrWhiteSpace(map)) args["map"] = map;
+            var r = await _client!.OpAsync("pro.setBasemap", args);
+            return FormatResult(r, "pro.setBasemap");
+        }
+
+        [McpServerTool, Description(
+            "Set or clear a layer's definition query. Unlike a selection, a " +
+            "definition query persistently filters what the layer displays AND " +
+            "what geoprocessing sees, until cleared. Pass an empty/omitted " +
+            "'where' to clear. Example: layer='Wetlands', where=\"ACRES > 0.5\".")]
+        public static async Task<string> SetDefinitionQuery(
+            [Description("Layer or standalone table name (matches list_layers)")] string layer,
+            [Description("SQL WHERE clause; omit or pass empty to CLEAR the query")] string? where = null,
+            [Description("Optional: map name. Default: active map.")] string? map = null)
+        {
+            var args = new Dictionary<string, string> { ["layer"] = layer };
+            if (!string.IsNullOrWhiteSpace(where)) args["where"] = where;
+            if (!string.IsNullOrWhiteSpace(map)) args["map"] = map;
+            var r = await _client!.OpAsync("pro.setDefinitionQuery", args);
+            return FormatResult(r, "pro.setDefinitionQuery");
+        }
+
+        [McpServerTool, Description(
+            "Set a layer's transparency: 0 = fully opaque, 100 = invisible. " +
+            "Useful for overlay cartography (e.g., 40-60 for analysis results " +
+            "over a basemap).")]
+        public static async Task<string> SetLayerTransparency(
+            [Description("Layer name, matching what list_layers returns")] string layer,
+            [Description("Transparency percent 0-100")] double transparency,
+            [Description("Optional: map name. Default: active map.")] string? map = null)
+        {
+            var args = new Dictionary<string, string>
+            {
+                ["layer"] = layer,
+                ["transparency"] = transparency.ToString(System.Globalization.CultureInfo.InvariantCulture)
+            };
+            if (!string.IsNullOrWhiteSpace(map)) args["map"] = map;
+            var r = await _client!.OpAsync("pro.setLayerTransparency", args);
+            return FormatResult(r, "pro.setLayerTransparency");
+        }
+
+        [McpServerTool, Description(
+            "Turn feature labels on/off for a layer, optionally setting what they " +
+            "show: pass 'field' for the simple case (labels display that field) " +
+            "or 'expression' for full Arcade control (e.g., " +
+            "'$feature.NAME + \\\" (\\\" + $feature.ACRES + \\\")\\\"').")]
+        public static async Task<string> SetLabeling(
+            [Description("Feature layer name, matching what list_layers returns")] string layer,
+            [Description("true to show labels, false to hide")] bool visible,
+            [Description("Optional: field name to label with (shortcut for expression '$feature.<field>')")] string? field = null,
+            [Description("Optional: full Arcade label expression (overrides 'field')")] string? expression = null,
+            [Description("Optional: map name. Default: active map.")] string? map = null)
+        {
+            var args = new Dictionary<string, string>
+            {
+                ["layer"] = layer,
+                ["visible"] = visible.ToString().ToLowerInvariant()
+            };
+            if (!string.IsNullOrWhiteSpace(field)) args["field"] = field;
+            if (!string.IsNullOrWhiteSpace(expression)) args["expression"] = expression;
+            if (!string.IsNullOrWhiteSpace(map)) args["map"] = map;
+            var r = await _client!.OpAsync("pro.setLabeling", args);
+            return FormatResult(r, "pro.setLabeling");
+        }
+
+        // ─── Layout Furniture ────────────────────────────────────────────
+
+        [McpServerTool, Description(
+            "Add a legend to a layout, bound to a map frame (auto-lists the " +
+            "frame's visible layers). Position/size in inches from page TOP-LEFT. " +
+            "Defaults: x=0.5, y=0.5, 2.5x3.5in.")]
+        public static async Task<string> AddLegend(
+            [Description("Layout name (see list_layouts)")] string layoutName,
+            [Description("Optional: map frame name (default: the layout's first frame)")] string? frameName = null,
+            [Description("Optional: x of top-left in inches")] double? xInches = null,
+            [Description("Optional: y of top-left in inches")] double? yInches = null,
+            [Description("Optional: width in inches")] double? widthInches = null,
+            [Description("Optional: height in inches")] double? heightInches = null)
+        {
+            var args = BuildSurroundArgs(layoutName, frameName, xInches, yInches, widthInches, heightInches);
+            var r = await _client!.OpAsync("pro.addLegend", args);
+            return FormatResult(r, "pro.addLegend");
+        }
+
+        [McpServerTool, Description(
+            "Add a north arrow to a layout, bound to a map frame (rotates with " +
+            "the frame). Position/size in inches from page TOP-LEFT. Defaults " +
+            "suit letter-landscape top-right (x=10.2, y=0.4, 0.5x0.8in).")]
+        public static async Task<string> AddNorthArrow(
+            [Description("Layout name (see list_layouts)")] string layoutName,
+            [Description("Optional: map frame name (default: first frame)")] string? frameName = null,
+            [Description("Optional: style item name (default 'ESRI North 1')")] string? style = null,
+            [Description("Optional: x of top-left in inches")] double? xInches = null,
+            [Description("Optional: y of top-left in inches")] double? yInches = null,
+            [Description("Optional: width in inches")] double? widthInches = null,
+            [Description("Optional: height in inches")] double? heightInches = null)
+        {
+            var args = BuildSurroundArgs(layoutName, frameName, xInches, yInches, widthInches, heightInches);
+            if (!string.IsNullOrWhiteSpace(style)) args["style"] = style;
+            var r = await _client!.OpAsync("pro.addNorthArrow", args);
+            return FormatResult(r, "pro.addNorthArrow");
+        }
+
+        [McpServerTool, Description(
+            "Add a scale bar to a layout, bound to a map frame (tracks the " +
+            "frame's scale). Position/size in inches from page TOP-LEFT. Defaults " +
+            "suit letter-landscape bottom-left (x=1, y=7.7, 3x0.5in).")]
+        public static async Task<string> AddScaleBar(
+            [Description("Layout name (see list_layouts)")] string layoutName,
+            [Description("Optional: map frame name (default: first frame)")] string? frameName = null,
+            [Description("Optional: style item name (default 'Alternating Scale Bar 1')")] string? style = null,
+            [Description("Optional: x of top-left in inches")] double? xInches = null,
+            [Description("Optional: y of top-left in inches")] double? yInches = null,
+            [Description("Optional: width in inches")] double? widthInches = null,
+            [Description("Optional: height in inches")] double? heightInches = null)
+        {
+            var args = BuildSurroundArgs(layoutName, frameName, xInches, yInches, widthInches, heightInches);
+            if (!string.IsNullOrWhiteSpace(style)) args["style"] = style;
+            var r = await _client!.OpAsync("pro.addScaleBar", args);
+            return FormatResult(r, "pro.addScaleBar");
+        }
+
+        [McpServerTool, Description(
+            "Add a NEW free text element to a layout (title, subtitle, credits). " +
+            "Position in inches from page TOP-LEFT (the text anchors at that " +
+            "point). To change text of an EXISTING element use set_layout_text.")]
+        public static async Task<string> AddLayoutText(
+            [Description("Layout name (see list_layouts)")] string layoutName,
+            [Description("Text content")] string text,
+            [Description("Optional: element name (auto-generated if omitted)")] string? name = null,
+            [Description("Optional: x of anchor in inches (default 1)")] double? xInches = null,
+            [Description("Optional: y of anchor in inches (default 0.4)")] double? yInches = null,
+            [Description("Optional: font size in points (default 24)")] double? fontSize = null,
+            [Description("Optional: font family (default Arial)")] string? font = null)
+        {
+            var inv = System.Globalization.CultureInfo.InvariantCulture;
+            var args = new Dictionary<string, string>
+            {
+                ["layoutName"] = layoutName,
+                ["text"] = text
+            };
+            if (!string.IsNullOrWhiteSpace(name)) args["name"] = name;
+            if (xInches.HasValue) args["xInches"] = xInches.Value.ToString(inv);
+            if (yInches.HasValue) args["yInches"] = yInches.Value.ToString(inv);
+            if (fontSize.HasValue) args["fontSize"] = fontSize.Value.ToString(inv);
+            if (!string.IsNullOrWhiteSpace(font)) args["font"] = font;
+            var r = await _client!.OpAsync("pro.addLayoutText", args);
+            return FormatResult(r, "pro.addLayoutText");
+        }
+
+        [McpServerTool, Description(
+            "Point a layout map frame's camera at a layer's extent OR an explicit " +
+            "bounding box — how you control what area the printed map shows. " +
+            "Provide 'layer' (zoom to that layer) or xmin/ymin/xmax/ymax.")]
+        public static async Task<string> SetMapFrameExtent(
+            [Description("Layout name (see list_layouts)")] string layoutName,
+            [Description("Optional: map frame name (default: first frame)")] string? frameName = null,
+            [Description("Optional: layer name to zoom the frame to")] string? layer = null,
+            [Description("Optional: west edge (with ymin/xmax/ymax)")] double? xmin = null,
+            [Description("Optional: south edge")] double? ymin = null,
+            [Description("Optional: east edge")] double? xmax = null,
+            [Description("Optional: north edge")] double? ymax = null,
+            [Description("Optional: WKID of the envelope coords (default: frame map SR)")] int? wkid = null)
+        {
+            var inv = System.Globalization.CultureInfo.InvariantCulture;
+            var args = new Dictionary<string, string> { ["layoutName"] = layoutName };
+            if (!string.IsNullOrWhiteSpace(frameName)) args["frameName"] = frameName;
+            if (!string.IsNullOrWhiteSpace(layer)) args["layer"] = layer;
+            if (xmin.HasValue) args["xmin"] = xmin.Value.ToString(inv);
+            if (ymin.HasValue) args["ymin"] = ymin.Value.ToString(inv);
+            if (xmax.HasValue) args["xmax"] = xmax.Value.ToString(inv);
+            if (ymax.HasValue) args["ymax"] = ymax.Value.ToString(inv);
+            if (wkid.HasValue) args["wkid"] = wkid.Value.ToString(inv);
+            var r = await _client!.OpAsync("pro.setMapFrameExtent", args);
+            return FormatResult(r, "pro.setMapFrameExtent");
+        }
+
+        // ─── Symbology ───────────────────────────────────────────────────
+
+        [McpServerTool, Description(
+            "Set a feature layer's renderer. rendererType options: " +
+            "'simple' (one symbol — use fillR/fillG/fillB 0-255, optional " +
+            "outline colors, size for points, lineWidth for lines); " +
+            "'uniqueValues' (one color per distinct value of 'field'); " +
+            "'graduatedColors' (numeric 'field' classified into 'breakCount' " +
+            "classes with a color ramp, default Natural Breaks). " +
+            "Optional 'colorRamp' names a Pro color ramp (e.g. 'Yellow to Red', " +
+            "'Viridis'). For renderer types beyond these, use execute_python " +
+            "with arcpy.mp. Verify results visually with capture_map_view.")]
+        public static async Task<string> SetLayerRenderer(
+            [Description("Feature layer name, matching what list_layers returns")] string layer,
+            [Description("'simple', 'uniqueValues', or 'graduatedColors'")] string rendererType,
+            [Description("Field name (required for uniqueValues/graduatedColors)")] string? field = null,
+            [Description("Optional: color ramp name for uniqueValues/graduatedColors")] string? colorRamp = null,
+            [Description("Optional: class count for graduatedColors (default 5)")] int? breakCount = null,
+            [Description("Optional: fill/marker/line red 0-255 (simple)")] int? fillR = null,
+            [Description("Optional: fill/marker/line green 0-255 (simple)")] int? fillG = null,
+            [Description("Optional: fill/marker/line blue 0-255 (simple)")] int? fillB = null,
+            [Description("Optional: point marker size in points (simple, default 8)")] double? size = null,
+            [Description("Optional: line width in points (simple, default 1.5)")] double? lineWidth = null,
+            [Description("Optional: map name. Default: active map.")] string? map = null)
+        {
+            var inv = System.Globalization.CultureInfo.InvariantCulture;
+            var args = new Dictionary<string, string>
+            {
+                ["layer"] = layer,
+                ["rendererType"] = rendererType
+            };
+            if (!string.IsNullOrWhiteSpace(field)) args["field"] = field;
+            if (!string.IsNullOrWhiteSpace(colorRamp)) args["colorRamp"] = colorRamp;
+            if (breakCount.HasValue) args["breakCount"] = breakCount.Value.ToString(inv);
+            if (fillR.HasValue) args["fillR"] = fillR.Value.ToString(inv);
+            if (fillG.HasValue) args["fillG"] = fillG.Value.ToString(inv);
+            if (fillB.HasValue) args["fillB"] = fillB.Value.ToString(inv);
+            if (size.HasValue) args["size"] = size.Value.ToString(inv);
+            if (lineWidth.HasValue) args["lineWidth"] = lineWidth.Value.ToString(inv);
+            if (!string.IsNullOrWhiteSpace(map)) args["map"] = map;
+            var r = await _client!.OpAsync("pro.setLayerRenderer", args);
+            return FormatResult(r, "pro.setLayerRenderer");
+        }
+
+        [McpServerTool, Description(
+            "Get a summary of a feature layer's current renderer (type, " +
+            "classification field, class count).")]
+        public static async Task<string> GetLayerSymbology(
+            [Description("Feature layer name, matching what list_layers returns")] string layer,
+            [Description("Optional: map name. Default: active map.")] string? map = null)
+        {
+            var args = new Dictionary<string, string> { ["layer"] = layer };
+            if (!string.IsNullOrWhiteSpace(map)) args["map"] = map;
+            var r = await _client!.OpAsync("pro.getLayerSymbology", args);
+            return FormatResult(r, "pro.getLayerSymbology");
+        }
+
+        // ─── Catalog / Data Discovery ────────────────────────────────────
+
+        [McpServerTool, Description(
+            "List the contents of a file geodatabase WITHOUT needing anything in " +
+            "a map: feature classes (with geometry type + SR), tables, rasters, " +
+            "and feature datasets. Defaults to the project's default GDB — where " +
+            "run_model and run_gp_tool outputs land — so use this to verify " +
+            "geoprocessing actually produced its outputs.")]
+        public static async Task<string> ListGdbContents(
+            [Description("Optional: path to a .gdb folder. Default: project default geodatabase.")] string? gdbPath = null)
+        {
+            var args = new Dictionary<string, string>();
+            if (!string.IsNullOrWhiteSpace(gdbPath)) args["gdbPath"] = gdbPath;
+            var r = await _client!.OpAsync("pro.listGdbContents", args);
+            return FormatResult(r, "pro.listGdbContents");
+        }
+
+        [McpServerTool, Description(
+            "Describe a dataset by full path (e.g. 'F:/proj/data.gdb/Wetlands') " +
+            "without adding it to a map: fields, geometry type, spatial " +
+            "reference, extent, and row count. File-geodatabase paths only; for " +
+            "shapefiles or rasters use execute_python with arcpy.Describe.")]
+        public static async Task<string> DescribeDataset(
+            [Description("Full path to a feature class or table inside a .gdb")] string path)
+        {
+            var r = await _client!.OpAsync("pro.describeDataset", new() { ["path"] = path });
+            return FormatResult(r, "pro.describeDataset");
+        }
+
+        // ─── Advanced ────────────────────────────────────────────────────
+
+        [McpServerTool, Description(
+            "ADVANCED escape hatch: send a raw bridge op with a JSON args object. " +
+            "Lets you reach Add-In ops that don't have a dedicated MCP tool yet " +
+            "(e.g., after the Add-In is updated but before this server is " +
+            "rebuilt). All arg values must be strings. Returns the raw bridge " +
+            "response. Unknown ops return 'op not found: <op>'.")]
+        public static async Task<string> BridgeOp(
+            [Description("Bridge op name, e.g. 'pro.getProjectInfo'")] string op,
+            [Description("Optional: JSON object of string arguments, e.g. {\"layer\": \"Roads\"}")] string? argsJson = null)
+        {
+            Dictionary<string, string>? args = null;
+            if (!string.IsNullOrWhiteSpace(argsJson))
+            {
+                try
+                {
+                    var node = System.Text.Json.Nodes.JsonNode.Parse(argsJson)?.AsObject()
+                        ?? throw new FormatException("argsJson must be a JSON object");
+                    args = new Dictionary<string, string>();
+                    foreach (var kv in node)
+                    {
+                        args[kv.Key] = kv.Value is System.Text.Json.Nodes.JsonValue v &&
+                                       v.TryGetValue<string>(out var s)
+                            ? s
+                            : kv.Value?.ToJsonString() ?? "";
+                    }
+                }
+                catch (Exception ex)
+                {
+                    return JsonSerializer.Serialize(
+                        new FormatErrorPayload(false, op, $"Invalid argsJson: {ex.Message}"),
+                        IndentedJsonContext.Default.FormatErrorPayload);
+                }
+            }
+            var r = await _client!.OpAsync(op, args);
+            return FormatResult(r, op);
+        }
+
+        private static Dictionary<string, string> BuildSurroundArgs(
+            string layoutName, string? frameName,
+            double? xInches, double? yInches, double? widthInches, double? heightInches)
+        {
+            var inv = System.Globalization.CultureInfo.InvariantCulture;
+            var args = new Dictionary<string, string> { ["layoutName"] = layoutName };
+            if (!string.IsNullOrWhiteSpace(frameName)) args["frameName"] = frameName;
+            if (xInches.HasValue) args["xInches"] = xInches.Value.ToString(inv);
+            if (yInches.HasValue) args["yInches"] = yInches.Value.ToString(inv);
+            if (widthInches.HasValue) args["widthInches"] = widthInches.Value.ToString(inv);
+            if (heightInches.HasValue) args["heightInches"] = heightInches.Value.ToString(inv);
+            return args;
         }
 
         // ─── Helpers ─────────────────────────────────────────────────────
