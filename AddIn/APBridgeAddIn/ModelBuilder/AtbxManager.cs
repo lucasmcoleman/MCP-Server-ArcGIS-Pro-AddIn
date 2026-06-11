@@ -182,13 +182,35 @@ namespace APBridgeAddIn.ModelBuilder
                 varNames[id] = name;
             }
 
-            // Build inputs list (Parameter variables)
+            // Variables produced by some process (direction:"out"). A Parameter
+            // variable that is ALSO produced is an OUTPUT parameter (ModelBuilder's
+            // 'P' badge on a derived output) — it must NOT be listed in inputs, or
+            // a describe→update round-trip turns it into a bogus input and severs
+            // its output-parameter status. It's emitted on the producing step's
+            // output declaration with "parameter": true instead.
+            var producedVarIds = new HashSet<string>();
+            foreach (var p in processes)
+            {
+                if (p?["params"] is not JsonObject pParams) continue;
+                foreach (var slot in pParams)
+                {
+                    if (slot.Value is JsonObject so &&
+                        TryGetString(so["direction"]) == "out")
+                    {
+                        var outId = TryGetString(so["element_id"]);
+                        if (outId != null) producedVarIds.Add(outId);
+                    }
+                }
+            }
+
+            // Build inputs list (Parameter variables not produced by any process)
             var inputs = new JsonArray();
             foreach (var v in variables)
             {
                 var id = TryGetString(v?["id"]);
                 if (id == null) continue;
                 if (TryGetString(v?["connection_type"]) != "Parameter") continue;
+                if (producedVarIds.Contains(id)) continue; // output parameter — emitted on its step
 
                 var input = new JsonObject
                 {
@@ -310,6 +332,23 @@ namespace APBridgeAddIn.ModelBuilder
                             var elementId = TryGetString(paramObj["element_id"]);
                             var value = TryGetString(paramObj["value"]);
 
+                            // Multi-input slots (Merge.inputs etc.) store element_id
+                            // as a JSON array — surface ALL names, or a round-trip
+                            // silently deletes every input but the first.
+                            JsonArray? multiRefNames = null;
+                            if (paramObj["element_id"] is JsonArray idArr)
+                            {
+                                var names = idArr.Select(n => TryGetString(n))
+                                    .Where(s => !string.IsNullOrEmpty(s))
+                                    .Select(s => varNames.GetValueOrDefault(s!, $"var_{s}"))
+                                    .ToList();
+                                if (names.Count > 1)
+                                {
+                                    multiRefNames = new JsonArray();
+                                    foreach (var n in names) multiRefNames.Add(n);
+                                }
+                            }
+
                             if (direction == "out" && elementId != null)
                             {
                                 var outputName = varNames.GetValueOrDefault(elementId, $"output_{elementId}");
@@ -330,7 +369,17 @@ namespace APBridgeAddIn.ModelBuilder
                                     : null;
                                 if (outputValue != null)
                                     outputObj["value"] = outputValue;
+                                // Output parameter ('P' badge on a derived output):
+                                // round-trips via this flag; the writer restores
+                                // param_name + connection_type on the variable.
+                                if (varMap.ContainsKey(elementId) &&
+                                    TryGetString(varMap[elementId]["connection_type"]) == "Parameter")
+                                    outputObj["parameter"] = true;
                                 parameters[param.Key] = outputObj;
+                            }
+                            else if (multiRefNames != null)
+                            {
+                                parameters[param.Key] = new JsonObject { ["ref"] = multiRefNames };
                             }
                             else if (elementId != null)
                             {
@@ -377,6 +426,32 @@ namespace APBridgeAddIn.ModelBuilder
                     }
                     if (environments.Count > 0)
                         step["environments"] = environments;
+                }
+
+                // Preconditions: ordering-only dependencies (no data link). Emitted
+                // as variable names; the writer maps them back to element ids. Lost
+                // preconditions silently re-order execution, so round-trip them.
+                var preNode = p?["precondition"] ?? p?["preconditions"];
+                if (preNode != null)
+                {
+                    var preArr = new JsonArray();
+                    if (preNode is JsonArray pa)
+                    {
+                        foreach (var pn in pa)
+                        {
+                            var pid2 = TryGetString(pn);
+                            if (!string.IsNullOrEmpty(pid2))
+                                preArr.Add(varNames.GetValueOrDefault(pid2!, $"var_{pid2}"));
+                        }
+                    }
+                    else
+                    {
+                        var pid2 = TryGetString(preNode);
+                        if (!string.IsNullOrEmpty(pid2))
+                            preArr.Add(varNames.GetValueOrDefault(pid2!, $"var_{pid2}"));
+                    }
+                    if (preArr.Count > 0)
+                        step["preconditions"] = preArr;
                 }
 
                 steps.Add(step);
@@ -478,8 +553,11 @@ namespace APBridgeAddIn.ModelBuilder
                 else                                { tool = "unknown";             kind = ToolKind.Unknown; }
                 var name = Resolve(TryGetString(p?["title"]), $"Step_{pid}");
 
-                // Parse params preserving JSON insertion order (= tool-declared slot order).
-                var paramsDict = new Dictionary<string, ModelParam>();
+                // Parse params preserving JSON insertion order (= tool-declared slot
+                // order). Case-insensitive keys: agent-authored definitions may use
+                // non-canonical casing ("In_Features") and the executor's signature
+                // walk must still find them.
+                var paramsDict = new Dictionary<string, ModelParam>(StringComparer.OrdinalIgnoreCase);
                 var paramsNode = p?["params"];
                 if (paramsNode is JsonObject paramsObj)
                 {
@@ -492,6 +570,20 @@ namespace APBridgeAddIn.ModelBuilder
                             var elementId = TryGetString(pvo["element_id"]);
                             var literal = TryGetString(pvo["value"]);
 
+                            // element_id may be a JSON ARRAY when multiple inputs
+                            // feed one slot (Merge.inputs etc.) — capture all ids,
+                            // not just the first, or round-trip + execution silently
+                            // drop the extra inputs.
+                            List<string>? elementIds = null;
+                            if (pvo["element_id"] is JsonArray idArr)
+                            {
+                                elementIds = idArr.Select(n => TryGetString(n))
+                                    .Where(s => !string.IsNullOrEmpty(s))
+                                    .Select(s => s!)
+                                    .ToList();
+                                if (elementIds.Count < 2) elementIds = null;
+                            }
+
                             if (direction == "out" && elementId != null)
                             {
                                 paramsDict[slot.Key] = new ModelParam { OutputVariableId = elementId };
@@ -499,7 +591,11 @@ namespace APBridgeAddIn.ModelBuilder
                             }
                             else if (elementId != null)
                             {
-                                paramsDict[slot.Key] = new ModelParam { RefVariableId = elementId };
+                                paramsDict[slot.Key] = new ModelParam
+                                {
+                                    RefVariableId = elementId,
+                                    RefVariableIds = elementIds
+                                };
                             }
                             else if (literal != null)
                             {
@@ -512,13 +608,61 @@ namespace APBridgeAddIn.ModelBuilder
                         }
                         else if (pv is JsonValue jv)
                         {
-                            paramsDict[slot.Key] = new ModelParam { LiteralValue = jv.GetValue<string>() };
+                            paramsDict[slot.Key] = new ModelParam { LiteralValue = TryGetString(jv) ?? "" };
                         }
                         else
                         {
                             paramsDict[slot.Key] = new ModelParam { LiteralValue = "" };
                         }
                     }
+                }
+
+                // Preconditions: explicit ordering edges with no data link. Stored
+                // as a process-level element-id list (single id or array). Without
+                // these the topo sort can run a consumer before the selection /
+                // AddField / Delete step it depends on.
+                var preconditionIds = new List<string>();
+                var preNode = p?["precondition"] ?? p?["preconditions"];
+                if (preNode is JsonArray preArr)
+                {
+                    foreach (var pn in preArr)
+                    {
+                        var pidRef = TryGetString(pn);
+                        if (!string.IsNullOrEmpty(pidRef)) preconditionIds.Add(pidRef!);
+                    }
+                }
+                else if (preNode != null)
+                {
+                    var pidRef = TryGetString(preNode);
+                    if (!string.IsNullOrEmpty(pidRef)) preconditionIds.Add(pidRef!);
+                }
+
+                // Per-step environment overrides (extent, cellSize, mask, ...).
+                // Same {element_id}/{value} slot shapes as params. RunModelCore
+                // merges these over the default run environments per step.
+                Dictionary<string, ModelParam>? envDict = null;
+                if (p?["environments"] is JsonObject envObj)
+                {
+                    envDict = new Dictionary<string, ModelParam>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var env in envObj)
+                    {
+                        if (env.Value is JsonObject evo)
+                        {
+                            var envRef = TryGetString(evo["element_id"]);
+                            var envVal = TryGetString(evo["value"]);
+                            if (envRef != null)
+                                envDict[env.Key] = new ModelParam { RefVariableId = envRef };
+                            else if (envVal != null)
+                                envDict[env.Key] = new ModelParam { LiteralValue = envVal };
+                            else
+                                envDict[env.Key] = new ModelParam { RawValue = evo.DeepClone() };
+                        }
+                        else if (env.Value is JsonValue evv)
+                        {
+                            envDict[env.Key] = new ModelParam { LiteralValue = TryGetString(evv) ?? "" };
+                        }
+                    }
+                    if (envDict.Count == 0) envDict = null;
                 }
 
                 processList.Add(new ModelProcess
@@ -533,6 +677,8 @@ namespace APBridgeAddIn.ModelBuilder
                     // callers (and the executor's FirstOrDefault check) stay correct.
                     IsIterator = kind != ToolKind.GpTool,
                     Params = paramsDict,
+                    PreconditionVariableIds = preconditionIds,
+                    Environments = envDict,
                 });
             }
 
@@ -548,10 +694,17 @@ namespace APBridgeAddIn.ModelBuilder
             }
             foreach (var proc in processList)
             {
-                foreach (var (_, pm) in proc.Params)
+                // Collect every variable this process depends on: all param refs
+                // (including each id of a multi-input slot) plus preconditions.
+                var dependsOnVarIds = proc.Params.Values
+                    .SelectMany(pm => pm.AllRefIds)
+                    .Concat(proc.PreconditionVariableIds)
+                    .Concat(proc.Environments?.Values.SelectMany(pm => pm.AllRefIds)
+                            ?? Enumerable.Empty<string>());
+
+                foreach (var refId in dependsOnVarIds)
                 {
-                    if (pm.RefVariableId != null &&
-                        producers.TryGetValue(pm.RefVariableId, out var producerId) &&
+                    if (producers.TryGetValue(refId, out var producerId) &&
                         producerId != proc.Id)
                     {
                         depCount[proc.Id]++;
@@ -593,10 +746,20 @@ namespace APBridgeAddIn.ModelBuilder
         #region Create Operations
 
         /// <summary>
-        /// Creates a new empty .atbx toolbox file.
+        /// Creates a new empty .atbx toolbox file. Refuses to overwrite an
+        /// existing toolbox unless <paramref name="overwrite"/> is explicitly
+        /// true — FileMode.Create would silently truncate the ZIP and destroy
+        /// every model inside it, which is unrecoverable data loss from a
+        /// name collision an agent can easily make.
         /// </summary>
-        public static void CreateToolbox(string path, string displayName)
+        public static void CreateToolbox(string path, string displayName, bool overwrite = false)
         {
+            if (File.Exists(path) && !overwrite)
+                throw new Exception(
+                    $"Toolbox already exists: {path}. It may contain models — creating it again " +
+                    "would destroy them. Pass overwrite=true only if you intend to replace it, " +
+                    "or use list_models to inspect the existing toolbox.");
+
             var alias = new string(displayName.Where(c => char.IsLetterOrDigit(c)).ToArray()) + "atbx";
 
             var manifest = new JsonObject
@@ -784,17 +947,20 @@ namespace APBridgeAddIn.ModelBuilder
             var processes = modelNode["processes"]?.AsArray()
                 ?? throw new Exception($"Model '{modelName}' has no processes array");
 
+            // Fallback display name must be "Step_<id>" to match what
+            // DescribeModel/WalkModel show for title-less processes — otherwise
+            // an agent copies "Step_5" from describe_model and we'd only match "5".
             JsonObject? targetProcess = null;
             foreach (var p in processes)
             {
                 if (p is not JsonObject po) continue;
-                var name = ResolveTitle(TryGetString(po["title"]), TryGetString(po["id"]) ?? "");
+                var name = ResolveTitle(TryGetString(po["title"]), $"Step_{TryGetString(po["id"]) ?? "?"}");
                 if (name == stepName) { targetProcess = po; break; }
             }
             if (targetProcess == null)
                 throw new Exception(
                     $"No step named '{stepName}' in model '{modelName}'. " +
-                    $"Available step names: {string.Join(", ", processes.Select(p => ResolveTitle(TryGetString(p?["title"]), TryGetString(p?["id"]) ?? "?")))}");
+                    $"Available step names: {string.Join(", ", processes.Select(p => ResolveTitle(TryGetString(p?["title"]), $"Step_{TryGetString(p?["id"]) ?? "?"}")))}");
 
             var paramsObj = targetProcess["params"]?.AsObject()
                 ?? throw new Exception($"Step '{stepName}' has no params object");
@@ -848,7 +1014,8 @@ namespace APBridgeAddIn.ModelBuilder
             }
             else if (input is JsonValue jv)
             {
-                newSlot = new JsonObject { ["value"] = jv.GetValue<string>() };
+                // TryGetString handles JSON numbers/bools (agents pass 100, true)
+                newSlot = new JsonObject { ["value"] = TryGetString(jv) ?? "" };
             }
             else
             {
@@ -936,8 +1103,8 @@ namespace APBridgeAddIn.ModelBuilder
                 // params) breaks validation. Only echo back what the caller
                 // sent. See DescribeModel for the matching read-side change.
                 var type = TryGetString(input?["type"]);
-                var defaultVal = input?["default"]?.GetValue<string>();
-                var displayName = input?["displayName"]?.GetValue<string>() ?? name;
+                var defaultVal = TryGetString(input?["default"]); // numbers OK (e.g., default: 100)
+                var displayName = TryGetString(input?["displayName"]) ?? name;
                 var dependencies = input?["dependencies"]?.AsArray();
                 var compositeTypes = input?["compositeTypes"]?.AsArray();
                 var id = nextId++.ToString();
@@ -1024,21 +1191,37 @@ namespace APBridgeAddIn.ModelBuilder
                 currentX += xSpacing;
             }
 
-            // Process each step
-            currentX = 50;
-            currentY += ySpacing;
-            int stepRow = 0;
-
+            // ---- Pass 1 over steps: validate kinds, canonicalize output slots,
+            // and reserve ids for every process + output variable. Doing this
+            // BEFORE resolving any refs lets a step reference an output declared
+            // by a LATER step (agents reorder steps freely; stored order is not
+            // required to be dependency order). Id assignment order (process id,
+            // then that step's outputs in parameter order) matches the previous
+            // single-pass behavior exactly, so valid models generate identical
+            // files.
+            var stepPlans = new List<StepPlan>();
             foreach (var step in steps)
             {
-                var stepName = step?["name"]?.GetValue<string>() ?? $"Step{nextId}";
-                var tool = step?["tool"]?.GetValue<string>() ?? "unknown";
-                // Step kind drives the process header shape (system_tool vs
-                // tool_type+path). Absent kind defaults to "gpTool" so every
-                // existing caller's payload continues to write as before.
-                var kind = step?["kind"]?.GetValue<string>() ?? "gpTool";
-                var parameters = step?["parameters"]?.AsObject();
-                var environments = step?["environments"]?.AsObject();
+                var pStepName = TryGetString(step?["name"]) ?? $"Step{nextId}";
+                var pTool = TryGetString(step?["tool"]) ?? "unknown";
+                var pKind = TryGetString(step?["kind"]) ?? "gpTool";
+
+                // The writer can faithfully represent only these three kinds.
+                // Iterators (and unknown kinds) used to fall through to the
+                // system_tool branch, silently corrupting the model — update_model
+                // would "succeed" and Pro would fail to load the result.
+                bool kindOk =
+                    pKind.Equals("gpTool", StringComparison.OrdinalIgnoreCase) ||
+                    pKind.Equals("scriptTool", StringComparison.OrdinalIgnoreCase) ||
+                    pKind.Equals("nestedModel", StringComparison.OrdinalIgnoreCase);
+                if (!kindOk)
+                    throw new Exception(
+                        $"Step '{pStepName}' has kind '{pKind}', which create_model/update_model cannot " +
+                        "faithfully write (the step would be silently corrupted into a bogus system_tool). " +
+                        "Models containing iterators must be edited with the surgical tools " +
+                        "(set_step_parameter / set_parameter_default) or in Pro's ModelBuilder.");
+
+                var pParameters = step?["parameters"]?.AsObject();
 
                 // Canonicalize the output-slot key for this tool. When the
                 // user supplies an output under a non-canonical key (e.g.,
@@ -1053,11 +1236,11 @@ namespace APBridgeAddIn.ModelBuilder
                 // the canonical key isn't already occupied (if both exist
                 // the user has a conflicting payload — leave it for Pro to
                 // flag rather than silently merging).
-                if (parameters != null &&
-                    GpToolCatalog.OutputSlots.TryGetValue(tool, out var canonOut))
+                var canonOutResolved = GpToolCatalog.ResolveOutputSlot(pTool);
+                if (pParameters != null && canonOutResolved is { } canonOut)
                 {
                     string? wrongKey = null;
-                    foreach (var p in parameters)
+                    foreach (var p in pParameters)
                     {
                         if (p.Value is JsonObject po && po["output"] != null
                             && !string.Equals(p.Key, canonOut.Slot, StringComparison.OrdinalIgnoreCase))
@@ -1066,19 +1249,111 @@ namespace APBridgeAddIn.ModelBuilder
                             break;
                         }
                     }
-                    if (wrongKey != null && !parameters.ContainsKey(canonOut.Slot))
+                    if (wrongKey != null && !pParameters.ContainsKey(canonOut.Slot))
                     {
-                        var node = parameters[wrongKey]?.DeepClone();
-                        parameters.Remove(wrongKey);
-                        if (node != null) parameters[canonOut.Slot] = node;
+                        var node = pParameters[wrongKey]?.DeepClone();
+                        pParameters.Remove(wrongKey);
+                        if (node != null) pParameters[canonOut.Slot] = node;
                     }
                 }
 
-                var processId = nextId++.ToString();
-                rcMap[$"model.element{processId}"] = stepName;
+                var plan = new StepPlan
+                {
+                    Step = step,
+                    Name = pStepName,
+                    Tool = pTool,
+                    Kind = pKind,
+                    Parameters = pParameters,
+                    Environments = step?["environments"]?.AsObject(),
+                    ProcessId = nextId++.ToString()
+                };
+                rcMap[$"model.element{plan.ProcessId}"] = pStepName;
+
+                // Reserve output-variable ids and create the variables now so
+                // later (or earlier) steps can ref them by name in pass 2.
+                if (pParameters != null)
+                {
+                    foreach (var param in pParameters)
+                    {
+                        if (param.Value is not JsonObject paramObj || paramObj["output"] == null)
+                            continue;
+
+                        var outputName = TryGetString(paramObj["output"]) ?? $"Output{nextId}";
+                        var outputType = TryGetString(paramObj["type"]) ?? "DEFeatureClass";
+                        // GPComposite is Pro's multi-type slot wrapper —
+                        // appropriate on INPUT params but on a derived OUTPUT
+                        // variable it hard-crashes Pro on .atbx open. Coerce to
+                        // the tool's canonical concrete DE* type when known.
+                        if (string.Equals(outputType, "GPComposite", StringComparison.OrdinalIgnoreCase)
+                            && GpToolCatalog.ResolveOutputSlot(pTool) is { } outCoerce)
+                        {
+                            outputType = outCoerce.Type;
+                        }
+                        var outputValue = TryGetString(paramObj["value"]);
+                        // "parameter": true marks an OUTPUT PARAMETER (ModelBuilder's
+                        // 'P' badge on a derived output) — restore param_name +
+                        // connection_type so the model's public interface survives
+                        // a describe→update round-trip.
+                        bool isOutputParam = false;
+                        if (paramObj["parameter"] is JsonValue pv2)
+                        {
+                            if (pv2.TryGetValue<bool>(out var b2)) isOutputParam = b2;
+                            else isOutputParam = string.Equals(TryGetString(pv2), "true", StringComparison.OrdinalIgnoreCase);
+                        }
+
+                        var outputId = nextId++.ToString();
+                        nameToId[outputName] = outputId;
+
+                        var outputVar = new JsonObject
+                        {
+                            ["id"] = outputId,
+                            ["title"] = $"$rc:model.element{outputId}",
+                            ["datatype"] = new JsonObject { ["type"] = outputType }
+                        };
+                        if (outputValue != null)
+                            outputVar["value"] = outputValue;
+                        else
+                            outputVar["derived"] = "true";
+                        if (isOutputParam)
+                        {
+                            outputVar["param_name"] = outputName;
+                            outputVar["connection_type"] = "Parameter";
+                            var outContent = new JsonObject
+                            {
+                                ["displayname"] = $"$rc:{outputName.ToLowerInvariant()}.title",
+                                ["direction"] = "out",
+                                ["type"] = "derived",
+                                ["datatype"] = new JsonObject { ["type"] = outputType }
+                            };
+                            contentParams[outputName] = outContent;
+                            rcMap[$"{outputName.ToLowerInvariant()}.title"] = outputName;
+                        }
+                        variables.Add(outputVar);
+                        rcMap[$"model.element{outputId}"] = outputName;
+
+                        plan.Outputs.Add((param.Key, outputId, outputName));
+                    }
+                }
+
+                stepPlans.Add(plan);
+            }
+
+            // ---- Pass 2: build process objects with all refs resolvable ----
+            currentX = 50;
+            currentY += ySpacing;
+            int stepRow = 0;
+
+            foreach (var plan in stepPlans)
+            {
+                var stepName = plan.Name;
+                var tool = plan.Tool;
+                var kind = plan.Kind;
+                var parameters = plan.Parameters;
+                var environments = plan.Environments;
+                var step = plan.Step;
+                var processId = plan.ProcessId;
 
                 var processParams = new JsonObject();
-                string? outputVarId = null;
 
                 if (parameters != null)
                 {
@@ -1093,8 +1368,27 @@ namespace APBridgeAddIn.ModelBuilder
 
                         if (paramVal is JsonObject paramObj)
                         {
+                            // Multi-input reference: {"ref": ["A", "B", ...]} —
+                            // written back as a JSON element_id ARRAY, the native
+                            // ATBX shape for Merge/Union/Append-style slots.
+                            if (paramObj["ref"] is JsonArray refArr)
+                            {
+                                var idArr = new JsonArray();
+                                foreach (var rn in refArr)
+                                {
+                                    var rName = TryGetString(rn)
+                                        ?? throw new Exception($"Step '{stepName}': ref array entries must be strings");
+                                    if (!nameToId.TryGetValue(rName, out var rId))
+                                        throw new Exception($"Reference '{rName}' not found. Available: {string.Join(", ", nameToId.Keys)}");
+                                    idArr.Add(rId);
+                                    diagramLinks.Add((rId, processId));
+                                }
+                                processParams[param.Key] = new JsonObject { ["element_id"] = idArr };
+                                continue;
+                            }
+
                             // Reference to another variable
-                            var refName = paramObj["ref"]?.GetValue<string>();
+                            var refName = TryGetString(paramObj["ref"]);
                             if (refName != null)
                             {
                                 if (!nameToId.TryGetValue(refName, out var refId))
@@ -1108,59 +1402,26 @@ namespace APBridgeAddIn.ModelBuilder
                                 continue;
                             }
 
-                            // Output declaration
-                            var outputName = paramObj["output"]?.GetValue<string>();
+                            // Output declaration — variable already created and id
+                            // reserved in pass 1; just wire the slot.
+                            var outputName = TryGetString(paramObj["output"]);
                             if (outputName != null)
                             {
-                                var outputType = paramObj["type"]?.GetValue<string>() ?? "DEFeatureClass";
-                                // GPComposite is Pro's multi-type slot wrapper —
-                                // appropriate on INPUT params (e.g., CalculateField.in_table
-                                // accepts TableView | RasterLayer | MosaicLayer) but on a
-                                // derived OUTPUT variable it hard-crashes Pro on .atbx open.
-                                // Coerce to the tool's canonical concrete DE* type when
-                                // known; leave alone for unknown tools.
-                                if (string.Equals(outputType, "GPComposite", StringComparison.OrdinalIgnoreCase)
-                                    && GpToolCatalog.OutputSlots.TryGetValue(tool, out var outCoerce))
-                                {
-                                    outputType = outCoerce.Type;
-                                }
-                                // Accept an optional "value" — the explicit path the model
-                                // author wants this output written to. Without this, every
-                                // output round-trips as `derived` (no path), which forces
-                                // run_model to rely on env defaults to materialize it. The
-                                // ribbon Run dialog lets users type an output path; agents
-                                // need the same surface. When supplied, drop the "derived"
-                                // flag — explicit path is the opposite of derived.
-                                var outputValue = paramObj["value"]?.GetValue<string>();
-                                var outputId = nextId++.ToString();
-                                nameToId[outputName] = outputId;
-
-                                var outputVar = new JsonObject
-                                {
-                                    ["id"] = outputId,
-                                    ["title"] = $"$rc:model.element{outputId}",
-                                    ["datatype"] = new JsonObject { ["type"] = outputType }
-                                };
-                                if (outputValue != null)
-                                    outputVar["value"] = outputValue;
-                                else
-                                    outputVar["derived"] = "true";
-                                variables.Add(outputVar);
-                                rcMap[$"model.element{outputId}"] = outputName;
+                                var planned = plan.Outputs.FirstOrDefault(o => o.SlotKey == param.Key);
+                                if (planned.OutputId == null)
+                                    throw new Exception($"Internal error: output '{outputName}' on step '{stepName}' was not planned in pass 1");
 
                                 processParams[param.Key] = new JsonObject
                                 {
                                     ["direction"] = "out",
-                                    ["element_id"] = outputId
+                                    ["element_id"] = planned.OutputId
                                 };
-
-                                outputVarId = outputId;
-                                diagramLinks.Add((processId, outputId));
+                                diagramLinks.Add((processId, planned.OutputId));
                                 continue;
                             }
 
                             // Value object
-                            var value = paramObj["value"]?.GetValue<string>();
+                            var value = TryGetString(paramObj["value"]); // numbers/bools coerced
                             if (value != null)
                             {
                                 processParams[param.Key] = new JsonObject { ["value"] = value };
@@ -1172,8 +1433,8 @@ namespace APBridgeAddIn.ModelBuilder
                         }
                         else
                         {
-                            // Literal string value
-                            var strVal = paramVal.GetValue<string>();
+                            // Literal scalar value — agents pass numbers/bools too
+                            var strVal = TryGetString(paramVal) ?? "";
                             processParams[param.Key] = new JsonObject { ["value"] = strVal };
                         }
                     }
@@ -1220,11 +1481,29 @@ namespace APBridgeAddIn.ModelBuilder
                         }
                         else if (env.Value != null)
                         {
-                            envObj[env.Key] = new JsonObject { ["value"] = env.Value.GetValue<string>() };
+                            envObj[env.Key] = new JsonObject { ["value"] = TryGetString(env.Value) ?? "" };
                         }
                     }
                     if (envObj.Count > 0)
                         process["environments"] = envObj;
+                }
+
+                // Preconditions: variable names → element ids. Round-trips the
+                // ordering-only dependencies that describe_model surfaces as
+                // "preconditions"; without this they'd be silently stripped.
+                if (step?["preconditions"] is JsonArray preNames && preNames.Count > 0)
+                {
+                    var preIds = new JsonArray();
+                    foreach (var pn in preNames)
+                    {
+                        var pName = TryGetString(pn);
+                        if (string.IsNullOrEmpty(pName)) continue;
+                        if (!nameToId.TryGetValue(pName!, out var pId))
+                            throw new Exception($"Precondition '{pName}' on step '{stepName}' not found. Available: {string.Join(", ", nameToId.Keys)}");
+                        preIds.Add(pId);
+                    }
+                    if (preIds.Count > 0)
+                        process["precondition"] = preIds;
                 }
 
                 processes.Add(process);
@@ -1234,11 +1513,13 @@ namespace APBridgeAddIn.ModelBuilder
                 double py = currentY + (stepRow / 3) * ySpacing * 2;
                 diagramNodes.Add((processId, stepName, "RoundRect", px, py));
 
-                // Output variable node if created
-                if (outputVarId != null)
+                // Output variable nodes (one per declared output)
+                int outIdx = 0;
+                foreach (var (_, outId, outName) in plan.Outputs)
                 {
-                    diagramNodes.Add((outputVarId, nameToId.First(kv => kv.Value == outputVarId).Key,
-                        "Ellipse", px + xSpacing * 0.6, py));
+                    diagramNodes.Add((outId, outName, "Ellipse",
+                        px + xSpacing * 0.6, py + outIdx * ySpacing * 0.5));
+                    outIdx++;
                 }
 
                 stepRow++;
@@ -1297,6 +1578,22 @@ namespace APBridgeAddIn.ModelBuilder
                 diagramMeta.ToJsonString(JsonOpts),
                 diagramXml
             );
+        }
+
+        /// <summary>
+        /// Pass-1 plan for one step in GenerateModelFiles: ids reserved, output
+        /// variables created, parameters canonicalized — pass 2 resolves refs.
+        /// </summary>
+        private sealed class StepPlan
+        {
+            public JsonNode? Step { get; init; }
+            public string Name { get; init; } = "";
+            public string Tool { get; init; } = "";
+            public string Kind { get; init; } = "";
+            public JsonObject? Parameters { get; init; }
+            public JsonObject? Environments { get; init; }
+            public string ProcessId { get; init; } = "";
+            public List<(string SlotKey, string OutputId, string OutputName)> Outputs { get; } = new();
         }
 
         #endregion
@@ -1436,7 +1733,21 @@ namespace APBridgeAddIn.ModelBuilder
         /// canvas-open models. Verified 2026-06-08 by Desktop's diagnostic:
         /// closing all MB canvas tabs makes the deadlock disappear entirely.
         /// </summary>
+        // Serializes all .atbx writes process-wide. The pipe server handles
+        // connections concurrently, so two write ops could otherwise interleave
+        // their read-mutate-replace cycles on the same file and lose one of the
+        // mutations (or trip File.Replace on the other's temp file).
+        private static readonly object _atbxWriteLock = new();
+
         private static void WriteAtbxAtomically(string atbxPath, Action<ZipArchive> mutate)
+        {
+            lock (_atbxWriteLock)
+            {
+                WriteAtbxAtomicallyCore(atbxPath, mutate);
+            }
+        }
+
+        private static void WriteAtbxAtomicallyCore(string atbxPath, Action<ZipArchive> mutate)
         {
             var originalBytes = File.ReadAllBytes(atbxPath);
 
@@ -1536,10 +1847,21 @@ namespace APBridgeAddIn.ModelBuilder
     /// </summary>
     internal class ModelParam
     {
-        public string? RefVariableId { get; init; }     // input: {element_id: X}
+        public string? RefVariableId { get; init; }     // input: {element_id: X} (first id when multiple)
+        // ATBX stores element_id as a JSON ARRAY when multiple inputs feed one
+        // slot (Merge.inputs, Union.in_features, Append.inputs, ...). All ids,
+        // in stored order; null/absent for single-ref slots. RefVariableId is
+        // always RefVariableIds[0] when this is set.
+        public List<string>? RefVariableIds { get; init; }
         public string? OutputVariableId { get; init; }  // output: {direction: out, element_id: X}
         public string? LiteralValue { get; init; }      // {value: "X"} or bare string
         public JsonNode? RawValue { get; init; }        // complex pass-through (e.g., environments dict)
+
+        /// <summary>All referenced variable ids: the multi-ref list when present, else the single ref.</summary>
+        public IEnumerable<string> AllRefIds =>
+            RefVariableIds ?? (RefVariableId != null
+                ? new List<string> { RefVariableId }
+                : (IEnumerable<string>)Array.Empty<string>());
     }
 
     /// <summary>
@@ -1569,7 +1891,11 @@ namespace APBridgeAddIn.ModelBuilder
         public string Tool { get; init; } = "";
         public ToolKind Kind { get; init; } = ToolKind.GpTool;
         public bool IsIterator { get; init; }
-        public Dictionary<string, ModelParam> Params { get; init; } = new();
+        public Dictionary<string, ModelParam> Params { get; init; } = new(StringComparer.OrdinalIgnoreCase);
+        /// <summary>Variable ids this process is precondition-ordered after (no data link).</summary>
+        public List<string> PreconditionVariableIds { get; init; } = new();
+        /// <summary>Per-step GP environment overrides, keyed by env name; null when none.</summary>
+        public Dictionary<string, ModelParam>? Environments { get; init; }
     }
 
     /// <summary>

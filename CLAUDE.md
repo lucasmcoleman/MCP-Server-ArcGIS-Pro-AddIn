@@ -64,7 +64,7 @@ Deploy by copying that file to `C:\Users\<you>\Documents\ArcGIS\AddIns\ArcGISPro
 pwsh ./build-mcp-server.ps1
 ```
 
-This invokes `dotnet publish -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -o McpServer/ArcGisMcpServer/publish`, producing `publish/ArcGisMcpServer.exe`. The script **refuses to publish if any `ArcGisMcpServer.exe` is running** — any attached Claude Code session holds the file lock. Exit the MCP client first.
+This invokes `dotnet publish -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:PublishTrimmed=true -o McpServer/ArcGisMcpServer/publish`, producing `publish/ArcGisMcpServer.exe`. (Trimming is why ProTools uses `WithTools<T>()` + source-generated JSON contexts — reflection-based serialization paths get trimmed away.) The script **refuses to publish if any `ArcGisMcpServer.exe` is running** — any attached Claude Code session holds the file lock. Exit the MCP client first.
 
 The `.mcp.json` at the repo root points directly at the published exe, so a fresh build is picked up by the next Claude Code start. Plain `dotnet build` (without the publish script) is fine for syntax validation.
 

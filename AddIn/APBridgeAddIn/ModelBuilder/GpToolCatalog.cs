@@ -15,6 +15,29 @@ namespace APBridgeAddIn.ModelBuilder
     internal static class GpToolCatalog
     {
         /// <summary>
+        /// Resolution chain for positional signatures: hand-pinned
+        /// <see cref="Signatures"/> first (curated, wins on conflict), then
+        /// <see cref="SystemToolboxCatalog"/> (parsed from Pro's installed system
+        /// toolboxes at runtime — covers ~1700 tools). Null only for tools
+        /// neither source knows (custom script tools, unlicensed extensions).
+        /// </summary>
+        public static string[]? ResolveSignature(string tool)
+        {
+            if (Signatures.TryGetValue(tool, out var pinned)) return pinned;
+            return SystemToolboxCatalog.GetSignature(tool);
+        }
+
+        /// <summary>
+        /// Resolution chain for canonical output slots: hand-pinned
+        /// <see cref="OutputSlots"/> first, then the system catalog.
+        /// </summary>
+        public static (string Slot, string Type)? ResolveOutputSlot(string tool)
+        {
+            if (OutputSlots.TryGetValue(tool, out var pinned)) return pinned;
+            return SystemToolboxCatalog.GetOutputSlot(tool);
+        }
+
+        /// <summary>
         /// Ordered slot names per <c>alias.toolName</c>. The executor uses
         /// this to remap a user's named-parameter dict back to the positional
         /// array <c>Geoprocessing.ExecuteToolAsync</c> requires; the writer
