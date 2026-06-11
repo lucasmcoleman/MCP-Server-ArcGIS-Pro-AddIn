@@ -902,10 +902,12 @@ namespace ArcGisMcpServer.Tools
             "CONTRACT: print() output is captured to 'stdout'; assign a variable " +
             "named `result` to return a JSON-serializable value; exceptions " +
             "return ok=false with the full traceback (read it and self-correct). " +
-            "State does NOT persist between calls (fresh namespace each time). " +
-            "Each call has ~2-5s GP framework overhead; batch related work into " +
-            "one call. Long-running code blocks Pro's GP queue — keep calls " +
-            "under a few minutes.")]
+            "State does NOT persist between calls (fresh namespace each time); " +
+            "batch related work into one call. Long-running code blocks Pro's GP " +
+            "queue — keep calls under a few minutes. NOTE: for ~3 minutes after " +
+            "ArcGIS Pro launches, calls are refused with a 'warming up' error " +
+            "(calling Python too early can wedge Pro's GP for the whole session) " +
+            "— just wait and retry as instructed.")]
         public static async Task<string> ExecutePython(
             [Description("Python source code. arcpy is pre-imported. Set `result = ...` to return data; print() for logs.")] string code)
         {

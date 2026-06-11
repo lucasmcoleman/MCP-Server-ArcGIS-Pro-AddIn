@@ -367,3 +367,5 @@ FodyWeavers.xsd
 
 # MCP server published single-file exe (rebuilt locally via build-mcp-server.ps1)
 McpServer/ArcGisMcpServer/publish/
+McpServer/ArcGisMcpServer/publish-http/
+
