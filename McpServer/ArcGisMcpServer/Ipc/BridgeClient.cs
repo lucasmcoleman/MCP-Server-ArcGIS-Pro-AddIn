@@ -125,6 +125,14 @@ namespace ArcGisMcpServer.Ipc
             // swallows exception messages (the agent would see only a generic
             // "an error occurred"), while a returned IpcResponse flows through
             // FormatResult and reaches the agent with actionable next steps.
+            if (lastEx is BridgePinException)
+                return new IpcResponse(false,
+                    $"{lastEx.Message} The pin is strict so this server never routes to a " +
+                    "different Pro instance. If the project is still loading, retry in ~30s. " +
+                    "Otherwise open that project in an ArcGIS Pro instance (or fix/unset the " +
+                    "ARCGIS_PROJECT env var and restart the MCP server). Use list_bridges to " +
+                    "see live instances.",
+                    null);
             return new IpcResponse(false,
                 $"bridge unreachable for op '{req.Op}' after {attempts} attempt(s): {lastEx?.Message}. " +
                 "This usually means ArcGIS Pro is not running, or the APBridge Add-In isn't loaded. " +

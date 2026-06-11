@@ -1500,6 +1500,45 @@ namespace ArcGisMcpServer.Tools
             return FormatResult(r, op);
         }
 
+        [McpServerTool, Description(
+            "List live ArcGIS Pro instances this MCP server can see (one bridge " +
+            "per Pro process), without contacting any of them. Shows each " +
+            "instance's PID, open project, pipe name, and which one THIS server " +
+            "routes to ('selected'). Routing: if the ARCGIS_PROJECT env var is " +
+            "set on this server, it is pinned strictly to the Pro instance with " +
+            "that project open (requests fail rather than touch a different " +
+            "instance); otherwise the most-recently-started instance is used. " +
+            "Run this first when multiple Pro windows may be open, or to " +
+            "diagnose 'pinned project not open' errors.")]
+        public static string ListBridges()
+        {
+            // Pure registry read — works even when no Pro instance is running,
+            // which is exactly when an agent most needs to see what's going on.
+            var entries = BridgeDiscovery.ReadAllLive();
+            var selected = BridgeDiscovery.SelectCurrent(entries);
+            var pin = BridgeDiscovery.PinnedProject;
+
+            var note = pin == null
+                ? (entries.Count > 1
+                    ? "No ARCGIS_PROJECT pin: this server follows the most-recently-started instance, " +
+                      "which can change if another Pro launches. Set ARCGIS_PROJECT to pin."
+                    : "No ARCGIS_PROJECT pin set.")
+                : (selected == null
+                    ? $"PINNED to '{pin}' but that project is not open in any live instance — requests will fail until it is."
+                    : $"PINNED to '{pin}': all requests route to pid {selected.Pid} only.");
+
+            var payload = new BridgeListPayload(
+                pin,
+                entries
+                    .OrderByDescending(e => e.StartedUtc)
+                    .Select(e => new BridgeInstanceInfo(
+                        e.Pid, e.ProjectName, e.ProjectPath, e.PipeName, e.StartedUtc,
+                        Selected: ReferenceEquals(e, selected)))
+                    .ToList(),
+                note);
+            return JsonSerializer.Serialize(payload, IndentedJsonContext.Default.BridgeListPayload);
+        }
+
         private static Dictionary<string, string> BuildSurroundArgs(
             string layoutName, string? frameName,
             double? xInches, double? yInches, double? widthInches, double? heightInches)

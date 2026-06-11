@@ -1,6 +1,6 @@
 # ArcGIS Pro MCP Bridge
 
-An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that lets MCP clients — Claude Code, GitHub Copilot Agent Mode, M365 Copilot Studio, Anthropic API integrations, anything that speaks MCP — drive **ArcGIS Pro** in real time. The server brokers calls over a named pipe to an in-process Pro Add-In, exposing **82 tools** spanning layer introspection, map operations, editing, symbology, project lifecycle, geoprocessing (with dynamic tool-schema discovery), ModelBuilder, layout production, an in-process **Python/arcpy escape hatch**, and **map-view capture** so the agent can literally see the map it's making.
+An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that lets MCP clients — Claude Code, GitHub Copilot Agent Mode, M365 Copilot Studio, Anthropic API integrations, anything that speaks MCP — drive **ArcGIS Pro** in real time. The server brokers calls over a named pipe to an in-process Pro Add-In, exposing **83 tools** spanning layer introspection, map operations, editing, symbology, project lifecycle, geoprocessing (with dynamic tool-schema discovery), ModelBuilder, layout production, an in-process **Python/arcpy escape hatch**, and **map-view capture** so the agent can literally see the map it's making.
 
 Two transports are supported in the same binary:
 - **stdio** (default) — for local clients that spawn the server as a subprocess (`.mcp.json` in Claude Code, etc.)
@@ -11,11 +11,11 @@ Two transports are supported in the same binary:
 ## What it does
 
 - **Drive Pro from natural language.** Ask the agent to "buffer the West Coast states by 50 miles, dissolve, calculate area in square miles, then export a PDF" and it chains the right MCP tools together.
-- **82 first-class tools** across 12 domains (full list below). All return structured JSON, not opaque strings — agents can introspect errors and chain operations programmatically.
+- **83 first-class tools** across 12 domains (full list below). All return structured JSON, not opaque strings — agents can introspect errors and chain operations programmatically.
 - **The agent can SEE the map.** `capture_map_view` exports the live map view to PNG; combined with symbology/labeling/layout tools this closes the see-act-verify loop for cartography.
 - **Full arcpy access.** `execute_python` runs arbitrary Python in-process in Pro's embedded interpreter — `arcpy.mp.ArcGISProject('CURRENT')` manipulates the open project, stdout is captured, tracebacks come back for self-correction.
 - **GP tool self-service.** `describe_gp_tool` / `search_gp_tools` read Pro's installed system-toolbox metadata at runtime, so the agent gets exact positional signatures, types, coded-value domains, and defaults for ~1,700 system tools instead of guessing.
-- **Multi-Pro routing.** Each Pro instance binds a per-PID pipe and writes a registry entry; the MCP server picks the right one (most-recent-started, or by `ARCGIS_PROJECT` env var).
+- **Multi-Pro routing — one agent per Pro instance.** Each Pro instance binds a per-PID pipe and writes a registry entry. Set `ARCGIS_PROJECT` to strictly pin an agent's server to the instance holding that project (no silent fallback to the wrong Pro); unpinned servers follow the most-recently-started instance. `list_bridges` enumerates what's live.
 - **Survives Pro restarts mid-session.** The MCP server re-discovers the live pipe on every request, so closing and reopening Pro doesn't require restarting your MCP client.
 - **Robust error handling.** Silent failures fail loud (`Layer not found: X` instead of `0`); slow operations don't time out prematurely (default 120s); typed-return tools surface bridge errors as structured JSON instead of getting swallowed by the MCP SDK's generic-error wrapper.
 
@@ -56,9 +56,20 @@ See [`CHANGELOG.md`](CHANGELOG.md) for the evolution from a basic pipe demo to t
 ```
 
 **Discovery contract:** Each Pro instance, on Add-In load, writes a JSON file at `%LOCALAPPDATA%\ArcGisMcpBridge\<PID>.json` describing its `pid`, `pipeName`, `projectPath`, `projectName`, and `startedUtc`. On every MCP tool call, `BridgeDiscovery.Discover()` reads that directory, filters out dead PIDs (cleaning them up), and selects:
-1. Bridge whose `projectName` matches `$env:ARCGIS_PROJECT` (case-insensitive), if set.
+1. If `$env:ARCGIS_PROJECT` is set, the pin is **strict**: only a bridge with that project open is eligible (case-insensitive; bare name, `name.aprx`, or full path all match). No match → the request fails with a structured error listing the live instances — a pinned server never silently routes to a different Pro.
 2. Otherwise, the most-recently-started live bridge.
-3. Falls back to the legacy hard-coded `ArcGisProBridgePipe` if no entries exist (back-compat with pre-discovery Add-Ins).
+3. Unpinned with no entries: falls back to the legacy hard-coded `ArcGisProBridgePipe` (back-compat with pre-discovery Add-Ins).
+
+### Multiple agents, multiple Pro instances
+
+One agent per Pro instance is the supported concurrency model. Open each project in its **own Pro process** (e.g., double-click each `.aprx`), then pin each agent's MCP server in its workspace `.mcp.json`:
+
+```jsonc
+// workspace A                                  // workspace B
+"env": { "ARCGIS_PROJECT": "ProjectA" }         "env": { "ARCGIS_PROJECT": "ProjectB" }
+```
+
+Each agent is deterministically routed to its own Pro instance for the life of the session — including across Pro restarts (discovery re-resolves on every call, matching by project name rather than PID). The `list_bridges` tool shows every live instance and which one the calling server routes to. Two agents inside the *same* Pro instance is not supported: most view/edit operations target the single active map view, and Pro serializes UI-thread and GP work internally anyway.
 
 ---
 
@@ -71,6 +82,7 @@ All tools return JSON strings. Success returns the operation's data payload; fai
 |---|---|
 | `ping` | Validate MCP server is alive (server-local, doesn't hit Pro) |
 | `echo` | Round-trip test (server-local) |
+| `list_bridges` | Enumerate live Pro instances + which one this server routes to (server-local) |
 | `get_active_map_name` | Name of the active map view |
 | `get_current_extent` | Viewport extent + SR (clamped to ±180/±90 for geographic SRs) |
 | `get_view_diagnostics` | Raw Map/Extent/Camera state — for debugging projection/extent oddities |
@@ -335,7 +347,7 @@ Tunable from the `env` block of `.mcp.json` or the parent shell:
 | `MCP_AUTH_TOKEN` | _(required in HTTP mode)_ | Bearer token expected in the `X-Api-Key` header. Server refuses to start in HTTP mode without it. Use a 256-bit random string. |
 | `ASPNETCORE_URLS` | `http://0.0.0.0:5000` | HTTP listen URL(s). Override to bind loopback-only (`http://127.0.0.1:5000`) when running behind a same-host proxy. |
 | `ARCGIS_MCP_PIPE_NAME` | _(unset)_ | Hard-code the pipe name, bypassing discovery. Use only for containers / non-standard deployments. |
-| `ARCGIS_PROJECT` | _(unset)_ | When set, discovery prefers a bridge whose `projectName` matches (case-insensitive). Lets a Claude session pin to a specific .aprx. |
+| `ARCGIS_PROJECT` | _(unset)_ | Strict pin: route only to the Pro instance with this project open (bare name, `name.aprx`, or full path; case-insensitive). No match → requests fail with a structured error instead of falling back. Lets each agent session own one Pro instance. |
 | `ARCGIS_MCP_MAX_RETRIES` | `3` | Retries after the first attempt (for transient errors only — timeouts no longer retry, see below) |
 | `ARCGIS_MCP_CONNECT_TIMEOUT_MS` | `5000` | Named-pipe `ConnectAsync` timeout |
 | `ARCGIS_MCP_REQUEST_TIMEOUT_MS` | `120000` | End-to-end per-request timeout. Raised from 30s to 120s to handle slow Pro ops like `create_project` on a fresh template. |
@@ -361,7 +373,7 @@ Two ways:
   }
 }
 ```
-The MCP server will pick a bridge whose live registry entry matches `MyProject.aprx`. Multiple Claude Code sessions can each pin to different projects this way.
+The MCP server routes exclusively to the bridge whose live registry entry matches (the `.aprx` suffix is optional on either side). Multiple Claude Code sessions can each pin to a different project — one agent per Pro instance. If the pinned project isn't open anywhere, tool calls return a structured "pinned project not open" error naming the live instances (`list_bridges` shows the same view) rather than silently driving a different Pro.
 
 **Pipe-name pinning** — for containers or scripted bridges:
 ```json
