@@ -121,16 +121,26 @@ namespace ArcGisMcpServer.Ipc
                 }
             }
 
-            throw new IOException(
-                $"bridge unreachable for op '{req.Op}' after {attempts} attempt(s): {lastEx?.Message}",
-                lastEx);
+            // Structured response instead of a thrown IOException: the MCP SDK
+            // swallows exception messages (the agent would see only a generic
+            // "an error occurred"), while a returned IpcResponse flows through
+            // FormatResult and reaches the agent with actionable next steps.
+            return new IpcResponse(false,
+                $"bridge unreachable for op '{req.Op}' after {attempts} attempt(s): {lastEx?.Message}. " +
+                "This usually means ArcGIS Pro is not running, or the APBridge Add-In isn't loaded. " +
+                "Ask the user to start ArcGIS Pro (the bridge registers itself a few seconds after " +
+                "the project loads), then retry. Pro restarts are picked up automatically.",
+                null);
         }
 
         private async Task<IpcResponse> SendOnceAsync(IpcRequest req, CancellationToken ct)
         {
             var pipeName = _pipeNameResolver();
+            // CurrentUserOnly pairs with the server's flag: verifies the pipe is
+            // owned by the same user, preventing a planted look-alike pipe from
+            // intercepting bridge traffic.
             using var client = new NamedPipeClientStream(".", pipeName,
-                PipeDirection.InOut, PipeOptions.Asynchronous);
+                PipeDirection.InOut, PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
             await client.ConnectAsync(_options.ConnectTimeoutMs, ct);
 
             using var reader = new StreamReader(client, Encoding.UTF8, leaveOpen: true);
