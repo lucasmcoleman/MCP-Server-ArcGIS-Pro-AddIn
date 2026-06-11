@@ -763,6 +763,12 @@ namespace APBridgeAddIn
                 case "pro.updateModel":
                     return HandleUpdateModel(req.Args);
 
+                case "pro.setParameterDefault":
+                    return HandleSetParameterDefault(req.Args);
+
+                case "pro.setStepParameter":
+                    return HandleSetStepParameter(req.Args);
+
                 case "pro.runModel":
                     return await HandleRunModel(req.Args);
 
@@ -2103,7 +2109,13 @@ namespace APBridgeAddIn
 
             var defNode = JsonNode.Parse(definition);
             var modelName = defNode?["name"]?.GetValue<string>() ?? "unknown";
-            return new(true, null, new { modelName, toolboxPath = path, created = true });
+            return new(true, null, new
+            {
+                modelName,
+                toolboxPath = path,
+                created = true,
+                hint = "Refresh the toolbox in Pro's Catalog pane to see the new model."
+            });
         }
 
         private static IpcResponse HandleUpdateModel(Dictionary<string, string>? args)
@@ -2125,95 +2137,79 @@ namespace APBridgeAddIn
         }
 
         /// <summary>
-        /// Declared parameter signatures for common system GP tools, keyed by
-        /// <c>"toolboxAlias.toolName"</c>. Order matches each tool's positional
-        /// signature in the ArcGIS Pro 3.x docs. When the step-by-step model
-        /// executor encounters one of these tools, it walks this list in order
-        /// and fills each position by looking up the slot name in the process's
-        /// stored params (using arcpy's <c>"#"</c> sentinel for slots the model
-        /// omits, so the GP engine uses each tool's declared default).
-        ///
-        /// Without this name-to-position mapping, the executor packs values
-        /// densely in JSON insertion order — which silently corrupts the call
-        /// when a model omits an optional slot before an included one. Example:
-        /// <c>management.Project</c> with <c>{in_dataset, out_dataset, out_coor_system,
-        /// preserve_shape, vertical}</c> in JSON order dense-packs as positions
-        /// 0..4, but the real signature has <c>transform_method</c> at slot 3 and
-        /// <c>in_coor_system</c> at slot 4, so <c>"false"</c> from preserve_shape
-        /// lands in transform_method (→ ERROR 000365) and <c>"false"</c> from
-        /// vertical lands in in_coor_system (→ WARNING 230002).
-        ///
-        /// Pro SDK exposes no introspection API for tool signatures — the docs
-        /// just say "look it up". Extend this dictionary as new tools are
-        /// encountered in real models. For tools not listed here, the executor
-        /// falls back to dense-packing (the old behavior) and the resulting
-        /// shift will surface as misnamed-slot errors that pinpoint the tool.
+        /// Surgical write — updates only one input parameter's default value
+        /// inside an existing model. See <see cref="AtbxManager.SetParameterDefault"/>
+        /// for the byte-identical-everything-else guarantee.
         /// </summary>
-        private static readonly Dictionary<string, string[]> GpToolSignatures =
-            new(StringComparer.OrdinalIgnoreCase)
+        private static IpcResponse HandleSetParameterDefault(Dictionary<string, string>? args)
+        {
+            if (args == null ||
+                !args.TryGetValue("toolboxPath", out string? path) ||
+                string.IsNullOrWhiteSpace(path) ||
+                !args.TryGetValue("modelName", out string? modelName) ||
+                string.IsNullOrWhiteSpace(modelName) ||
+                !args.TryGetValue("parameterName", out string? paramName) ||
+                string.IsNullOrWhiteSpace(paramName))
+                return new(false, "args 'toolboxPath', 'modelName' & 'parameterName' required", null);
+
+            // Empty default is meaningful (clears existing default); accept absent
+            // arg as empty rather than rejecting.
+            args.TryGetValue("defaultValue", out string? defaultValue);
+
+            if (!File.Exists(path))
+                return new(false, $"Toolbox not found: {path}", null);
+
+            try
             {
-                ["management.Project"] = new[]
-                {
-                    "in_dataset", "out_dataset", "out_coor_system",
-                    "transform_method", "in_coor_system",
-                    "preserve_shape", "max_deviation", "vertical"
-                },
-                ["management.CopyFeatures"] = new[]
-                {
-                    "in_features", "out_feature_class",
-                    "config_keyword", "spatial_grid_1", "spatial_grid_2", "spatial_grid_3"
-                },
-                ["analysis.PairwiseErase"] = new[]
-                {
-                    "in_features", "erase_features", "out_feature_class", "cluster_tolerance"
-                },
-                ["analysis.SummarizeWithin"] = new[]
-                {
-                    "in_polygons", "in_sum_features", "out_feature_class",
-                    "keep_all_polygons", "sum_fields", "sum_shape", "shape_unit",
-                    "group_field", "add_min_maj", "add_group_percent", "out_group_table"
-                },
-                ["management.SelectLayerByLocation"] = new[]
-                {
-                    "in_layer", "overlap_type", "select_features",
-                    "search_distance", "selection_type", "invert_spatial_relationship"
-                },
-                ["management.SelectLayerByAttribute"] = new[]
-                {
-                    "in_layer_or_view", "selection_type", "where_clause",
-                    "invert_where_clause"
-                },
-                ["management.CalculateField"] = new[]
-                {
-                    "in_table", "field", "expression", "expression_type",
-                    "code_block", "field_type", "enforce_domains"
-                },
-                ["management.JoinField"] = new[]
-                {
-                    "in_data", "in_field", "join_table", "join_field",
-                    "fields", "fm_option", "field_mapping", "index_join_fields"
-                },
-                ["management.AddField"] = new[]
-                {
-                    "in_table", "field_name", "field_type",
-                    "field_precision", "field_scale", "field_length", "field_alias",
-                    "field_is_nullable", "field_is_required", "field_domain"
-                },
-                ["analysis.Buffer"] = new[]
-                {
-                    "in_features", "out_feature_class", "buffer_distance_or_field",
-                    "line_side", "line_end_type", "dissolve_option", "dissolve_field", "method"
-                },
-                ["analysis.Clip"] = new[]
-                {
-                    "in_features", "clip_features", "out_feature_class", "cluster_tolerance"
-                },
-                ["analysis.Intersect"] = new[]
-                {
-                    "in_features", "out_feature_class", "join_attributes",
-                    "cluster_tolerance", "output_type"
-                },
-            };
+                AtbxManager.SetParameterDefault(path, modelName, paramName, defaultValue ?? "");
+                return new(true, null, new { modelName, parameterName = paramName, defaultValue = defaultValue ?? "", modified = true });
+            }
+            catch (Exception ex)
+            {
+                return new(false, ex.Message, null);
+            }
+        }
+
+        /// <summary>
+        /// Surgical write — updates only one step's one parameter inside an
+        /// existing model. See <see cref="AtbxManager.SetStepParameter"/>.
+        /// </summary>
+        private static IpcResponse HandleSetStepParameter(Dictionary<string, string>? args)
+        {
+            if (args == null ||
+                !args.TryGetValue("toolboxPath", out string? path) ||
+                string.IsNullOrWhiteSpace(path) ||
+                !args.TryGetValue("modelName", out string? modelName) ||
+                string.IsNullOrWhiteSpace(modelName) ||
+                !args.TryGetValue("stepName", out string? stepName) ||
+                string.IsNullOrWhiteSpace(stepName) ||
+                !args.TryGetValue("paramKey", out string? paramKey) ||
+                string.IsNullOrWhiteSpace(paramKey) ||
+                !args.TryGetValue("paramValue", out string? paramValueJson) ||
+                string.IsNullOrWhiteSpace(paramValueJson))
+                return new(false, "args 'toolboxPath', 'modelName', 'stepName', 'paramKey' & 'paramValue' required", null);
+
+            if (!File.Exists(path))
+                return new(false, $"Toolbox not found: {path}", null);
+
+            try
+            {
+                AtbxManager.SetStepParameter(path, modelName, stepName, paramKey, paramValueJson);
+                return new(true, null, new { modelName, stepName, paramKey, modified = true });
+            }
+            catch (Exception ex)
+            {
+                return new(false, ex.Message, null);
+            }
+        }
+
+        // GP tool positional signatures live in ModelBuilder/GpToolCatalog.cs
+        // so the writer (AtbxManager) can consult the same data to canonicalize
+        // user-supplied parameter keys before they reach Pro's load-time
+        // normalizer. For the rationale behind needing positional signatures at
+        // all (Pro SDK exposes no introspection API; dense-packing
+        // dict-insertion-order silently corrupts calls when a model omits an
+        // optional slot before an included one), see the GpToolCatalog summary.
 
         /// <summary>
         /// Runs a ModelBuilder model with the given parameter dict. ModelBuilder models
@@ -2425,15 +2421,28 @@ namespace APBridgeAddIn
                 lock (job.Lock) job.TotalSteps = graph.Processes.Count;
             }
 
-            // Reject iterators / nested sub-models — step-by-step semantics don't
-            // apply. Agents needing iteration should compose run_gp_tool calls.
-            var iterator = graph.Processes.FirstOrDefault(p => p.IsIterator);
-            if (iterator != null)
+            // Reject anything outside GpTool — script tools, nested models,
+            // legacy iterators. Step-by-step execution covers only system GP
+            // tools today; the other kinds round-trip cleanly through
+            // describe_model / create_model / update_model but need Pro's
+            // ribbon to actually run. Each ToolKind produces a slightly
+            // different message so the agent knows which substitution to try.
+            var nonGp = graph.Processes.FirstOrDefault(p => p.Kind != APBridgeAddIn.ModelBuilder.ToolKind.GpTool);
+            if (nonGp != null)
             {
+                var hint = nonGp.Kind switch
+                {
+                    APBridgeAddIn.ModelBuilder.ToolKind.ScriptTool =>
+                        "Custom script tools must be run via Pro's ribbon or with run_gp_tool against the script tool's name.",
+                    APBridgeAddIn.ModelBuilder.ToolKind.NestedModel =>
+                        "Run the nested model directly via run_model (recurse) or via Pro's ribbon.",
+                    APBridgeAddIn.ModelBuilder.ToolKind.Iterator =>
+                        "Iterator semantics aren't supported by step-by-step execution; compose run_gp_tool calls.",
+                    _ => "Unknown step kind; expose the tool's actual signature so the bridge can dispatch it."
+                };
                 return new(false,
-                    $"Model '{modelName}' contains iterator or nested model '{iterator.Name}' " +
-                    $"(tool '{iterator.Tool}'). Step-by-step execution doesn't support these yet — " +
-                    $"compose run_gp_tool calls instead.",
+                    $"Model '{modelName}' contains a non-GP step '{nonGp.Name}' " +
+                    $"(kind '{nonGp.Kind}', tool '{nonGp.Tool}'). " + hint,
                     null);
             }
 
@@ -2509,18 +2518,18 @@ namespace APBridgeAddIn
                 // expects.
                 // Build positional value array. Two strategies:
                 //
-                //   1) Known tool: walk GpToolSignatures[proc.Tool] in declared order
-                //      and fill each position from proc.Params by slot NAME. For slots
-                //      the model omitted (sparse storage), insert "#" so arcpy uses
-                //      the tool's declared default. This is the correct contract for
-                //      GP system tools.
+                //   1) Known tool: walk GpToolCatalog.Signatures[proc.Tool] in declared
+                //      order and fill each position from proc.Params by slot NAME. For
+                //      slots the model omitted (sparse storage), insert "#" so arcpy
+                //      uses the tool's declared default. This is the correct contract
+                //      for GP system tools.
                 //
                 //   2) Unknown tool: fall back to dense-packing by JSON insertion
                 //      order. Same as the old behavior — wrong for any tool that
                 //      omits optional slots before included ones, but the resulting
                 //      misalignment surfaces as obvious slot-mismatch errors that
                 //      point at which tool to add to the signature table.
-                var slotOrder = GpToolSignatures.TryGetValue(proc.Tool, out var sig)
+                var slotOrder = GpToolCatalog.Signatures.TryGetValue(proc.Tool, out var sig)
                     ? sig.AsEnumerable()
                     : proc.Params.Keys;
 
