@@ -23,7 +23,10 @@ using System.Threading.Tasks;
 
 namespace APBridgeAddIn
 {
-    internal class ProBridgeService : IDisposable
+    // Partial: new capability families live in sibling ProBridgeService.*.cs files
+    // (View, Editing, MapAdmin, Layout, Symbology, Catalog, Python, GpCatalog) so
+    // this dispatcher file stays navigable.
+    internal partial class ProBridgeService : IDisposable
     {
         private readonly string _pipeName;
         private CancellationTokenSource _cts;
@@ -42,61 +45,103 @@ namespace APBridgeAddIn
             try { _cts?.Cancel(); _serverLoop?.Wait(2000); } catch { }
         }
 
+        /// <summary>
+        /// Accept loop. Spins up a fresh listener instance immediately after each
+        /// connection is accepted, and serves every accepted connection on its own
+        /// task. Concurrency matters even for a single MCP client: BridgeClient
+        /// opens one connection PER REQUEST, so with a single-instance server a
+        /// long-running op (multi-minute run_gp_tool) would leave no listener
+        /// behind — even pro.ping and pro.getRunStatus polls would burn their
+        /// connect timeout and fail until the long op finished. Actual ArcGIS Pro
+        /// work is still serialized by QueuedTask.Run on Pro's MCT; concurrency
+        /// here only overlaps IPC handling and pure file ops.
+        /// </summary>
         private async Task RunAsync(CancellationToken ct)
         {
             while (!ct.IsCancellationRequested)
             {
+                NamedPipeServerStream? server = null;
                 try
                 {
-                    using var server = new NamedPipeServerStream(_pipeName,
-                        PipeDirection.InOut, 1, PipeTransmissionMode.Message,
-                        PipeOptions.Asynchronous);
+                    // CurrentUserOnly: restricts the pipe ACL to the user running
+                    // Pro. Without it the default DACL lets other local users
+                    // connect and drive geoprocessing as this user.
+                    server = new NamedPipeServerStream(_pipeName,
+                        PipeDirection.InOut,
+                        NamedPipeServerStream.MaxAllowedServerInstances,
+                        PipeTransmissionMode.Message,
+                        PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
                     await server.WaitForConnectionAsync(ct);
-                    using var reader = new StreamReader(server, Encoding.UTF8, leaveOpen: true);
-                    using var writer = new StreamWriter(server, new UTF8Encoding(false), leaveOpen: true)
-                        { AutoFlush = true };
 
-                    while (server.IsConnected && !ct.IsCancellationRequested)
-                    {
-                        var line = await reader.ReadLineAsync();
-                        if (line == null) break;
-
-                        IpcRequest req;
-                        try
-                        {
-                            req = JsonSerializer.Deserialize<IpcRequest>(line);
-                        }
-                        catch (Exception ex)
-                        {
-                            await SendAsync(writer, new IpcResponse(false, $"parse:{ex.Message}", null));
-                            continue;
-                        }
-
-                        try
-                        {
-                            var resp = await HandleAsync(req, ct);
-                            if (!resp.Ok)
-                                LogNonSuccess(req, resp.Error);
-                            await SendAsync(writer, resp);
-                        }
-                        catch (Exception ex)
-                        {
-                            LogException(req, ex);
-                            await SendAsync(writer, new IpcResponse(false,
-                                $"{ex.GetType().Name}: {ex.Message ?? "<no message>"}", null));
-                        }
-                    }
+                    var conn = server;
+                    server = null; // ownership transferred to the serving task
+                    _ = Task.Run(() => ServeConnectionAsync(conn, ct), CancellationToken.None);
                 }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested)
                 {
+                    server?.Dispose();
                     break; // Clean shutdown
                 }
                 catch (Exception)
                 {
                     // Pipe broke or other transient error — restart the listener.
                     // Small delay prevents tight spin if errors repeat.
+                    server?.Dispose();
                     try { await Task.Delay(100, ct); } catch { break; }
                 }
+            }
+        }
+
+        /// <summary>
+        /// Serves one accepted pipe connection: reads line-delimited JSON requests
+        /// until the client disconnects, dispatching each through HandleAsync.
+        /// Multiple instances of this method run concurrently (one per client
+        /// connection); QueuedTask serializes the actual Pro SDK work.
+        /// </summary>
+        private static async Task ServeConnectionAsync(NamedPipeServerStream server, CancellationToken ct)
+        {
+            try
+            {
+                using var _ = server;
+                using var reader = new StreamReader(server, Encoding.UTF8, leaveOpen: true);
+                using var writer = new StreamWriter(server, new UTF8Encoding(false), leaveOpen: true)
+                    { AutoFlush = true };
+
+                while (server.IsConnected && !ct.IsCancellationRequested)
+                {
+                    var line = await reader.ReadLineAsync();
+                    if (line == null) break;
+
+                    IpcRequest req;
+                    try
+                    {
+                        req = JsonSerializer.Deserialize<IpcRequest>(line);
+                    }
+                    catch (Exception ex)
+                    {
+                        await SendAsync(writer, new IpcResponse(false, $"parse:{ex.Message}", null));
+                        continue;
+                    }
+
+                    try
+                    {
+                        var resp = await HandleAsync(req, ct);
+                        if (!resp.Ok)
+                            LogNonSuccess(req, resp.Error);
+                        await SendAsync(writer, resp);
+                    }
+                    catch (Exception ex)
+                    {
+                        LogException(req, ex);
+                        await SendAsync(writer, new IpcResponse(false,
+                            $"{ex.GetType().Name}: {ex.Message ?? "<no message>"}", null));
+                    }
+                }
+            }
+            catch
+            {
+                // Connection-level failure (client vanished mid-write, pipe broke).
+                // The accept loop keeps listening; nothing to do here.
             }
         }
 
@@ -158,8 +203,7 @@ namespace APBridgeAddIn
                     int count = await QueuedTask.Run(() =>
                     {
                         var map = ResolveMap(mapName);
-                        var member = FindMapMemberByName(map, layerName)
-                            ?? throw new InvalidOperationException($"Layer or table not found: {layerName}");
+                        var member = RequireMapMember(map, layerName);
                         // Both FeatureClass (for FeatureLayer) and Table (for
                         // StandaloneTable) expose GetCount(); FeatureClass inherits
                         // from Table, so the count_features semantics extend
@@ -181,12 +225,16 @@ namespace APBridgeAddIn
 
                     await QueuedTask.Run(async () =>
                     {
-                        var fl = MapView.Active?.Map?.GetLayersAsFlattenedList()
-                            .OfType<FeatureLayer>()
-                            .FirstOrDefault(l => l.Name.Equals(layerName, StringComparison.OrdinalIgnoreCase));
-                        if (fl == null)
-                            throw new InvalidOperationException($"Layer not found: {layerName}");
-                        await MapView.Active!.ZoomToAsync(fl);
+                        var map = MapView.Active?.Map
+                            ?? throw new InvalidOperationException("No active map view");
+                        // Any layer type zooms (raster, group, service...) — not
+                        // just FeatureLayer; ZoomToAsync accepts the Layer base.
+                        var target = map.GetLayersAsFlattenedList()
+                            .FirstOrDefault(l => l.Name.Equals(layerName, StringComparison.OrdinalIgnoreCase))
+                            ?? throw new InvalidOperationException(
+                                $"Layer not found: {layerName}. Available: " +
+                                string.Join(", ", map.GetLayersAsFlattenedList().Select(l => l.Name)));
+                        await MapView.Active!.ZoomToAsync(target);
                     });
                     return new(true, null, new { done = true });
                 }
@@ -204,8 +252,7 @@ namespace APBridgeAddIn
                     var selectionInfo = await QueuedTask.Run<object>(() =>
                     {
                         var map = ResolveMap(sbaMapName);
-                        var member = FindMapMemberByName(map, layerName)
-                            ?? throw new InvalidOperationException($"Layer or table not found: {layerName}");
+                        var member = RequireMapMember(map, layerName);
                         // Both FeatureLayer and StandaloneTable expose Select(QueryFilter),
                         // but the methods are declared on the subclasses (not on MapMember),
                         // so dispatch explicitly. Returns a Selection on either path.
@@ -233,8 +280,7 @@ namespace APBridgeAddIn
                     var data = await QueuedTask.Run<object>(() =>
                     {
                         var map = ResolveMap(lfMapName);
-                        var member = FindMapMemberByName(map, lfLayerName)
-                            ?? throw new InvalidOperationException($"Layer or table not found: {lfLayerName}");
+                        var member = RequireMapMember(map, lfLayerName);
 
                         // FeatureClass.GetDefinition() returns FeatureClassDefinition;
                         // Table.GetDefinition() returns TableDefinition. The former
@@ -270,8 +316,7 @@ namespace APBridgeAddIn
                     var data = await QueuedTask.Run<object>(() =>
                     {
                         var map = ResolveMap(lpMapName);
-                        var member = FindMapMemberByName(map, lpLayerName)
-                            ?? throw new InvalidOperationException($"Layer or table not found: {lpLayerName}");
+                        var member = RequireMapMember(map, lpLayerName);
 
                         // Build properties dict incrementally — different member types
                         // expose different things; wrap each accessor in try/catch so
@@ -375,8 +420,7 @@ namespace APBridgeAddIn
                     var data = await QueuedTask.Run<object>(() =>
                     {
                         var map = ResolveMap(raMapName);
-                        var member = FindMapMemberByName(map, raLayerName)
-                            ?? throw new InvalidOperationException($"Layer or table not found: {raLayerName}");
+                        var member = RequireMapMember(map, raLayerName);
 
                         // FeatureClass for feature layers, Table for standalone tables.
                         // Both share GetDefinition()/GetFields() via TableDefinition;
@@ -483,8 +527,7 @@ namespace APBridgeAddIn
                     var data = await QueuedTask.Run<object>(() =>
                     {
                         var map = ResolveMap(gsfMapName);
-                        var member = FindMapMemberByName(map, gsfLayerName)
-                            ?? throw new InvalidOperationException($"Layer or table not found: {gsfLayerName}");
+                        var member = RequireMapMember(map, gsfLayerName);
 
                         using var table = GetTableFromMember(member)
                             ?? throw new InvalidOperationException(
@@ -1000,6 +1043,107 @@ namespace APBridgeAddIn
                     });
                 }
 
+                // ─── GP Tool Discovery ──────────────────────────────────────
+                case "pro.describeGpTool":
+                    return HandleDescribeGpTool(req.Args);
+
+                case "pro.searchGpTools":
+                    return HandleSearchGpTools(req.Args);
+
+                // ─── Python Escape Hatch ────────────────────────────────────
+                case "pro.executePython":
+                    return await HandleExecutePython(req.Args);
+
+                // ─── View / Camera / Bookmarks ──────────────────────────────
+                case "pro.captureMapView":
+                    return await HandleCaptureMapView(req.Args);
+
+                case "pro.zoomToExtent":
+                    return await HandleZoomToExtent(req.Args);
+
+                case "pro.zoomToScale":
+                    return await HandleZoomToScale(req.Args);
+
+                case "pro.zoomToSelected":
+                    return await HandleZoomToSelected();
+
+                case "pro.listBookmarks":
+                    return await HandleListBookmarks(req.Args);
+
+                case "pro.zoomToBookmark":
+                    return await HandleZoomToBookmark(req.Args);
+
+                case "pro.createBookmark":
+                    return await HandleCreateBookmark(req.Args);
+
+                // ─── Editing ────────────────────────────────────────────────
+                case "pro.updateFeatures":
+                    return await HandleUpdateFeatures(req.Args);
+
+                case "pro.deleteFeatures":
+                    return await HandleDeleteFeatures(req.Args);
+
+                case "pro.addPolylineFeatures":
+                    return await HandleAddPolylineFeatures(req.Args);
+
+                case "pro.saveEdits":
+                    return await HandleEditSession("save");
+
+                case "pro.discardEdits":
+                    return await HandleEditSession("discard");
+
+                case "pro.hasEdits":
+                    return await HandleEditSession("query");
+
+                // ─── Map Administration ─────────────────────────────────────
+                case "pro.createMap":
+                    return await HandleCreateMap(req.Args);
+
+                case "pro.openMapView":
+                    return await HandleOpenMapView(req.Args);
+
+                case "pro.setBasemap":
+                    return await HandleSetBasemap(req.Args);
+
+                case "pro.setDefinitionQuery":
+                    return await HandleSetDefinitionQuery(req.Args);
+
+                case "pro.setLayerTransparency":
+                    return await HandleSetLayerTransparency(req.Args);
+
+                case "pro.setLabeling":
+                    return await HandleSetLabeling(req.Args);
+
+                // ─── Layout Furniture ───────────────────────────────────────
+                case "pro.addLegend":
+                    return await HandleAddLegend(req.Args);
+
+                case "pro.addNorthArrow":
+                    return await HandleAddNorthArrow(req.Args);
+
+                case "pro.addScaleBar":
+                    return await HandleAddScaleBar(req.Args);
+
+                case "pro.addLayoutText":
+                    return await HandleAddLayoutText(req.Args);
+
+                case "pro.setMapFrameExtent":
+                    return await HandleSetMapFrameExtent(req.Args);
+
+                // ─── Symbology ──────────────────────────────────────────────
+                case "pro.setLayerRenderer":
+                    return await HandleSetLayerRenderer(req.Args);
+
+                case "pro.getLayerSymbology":
+                    return await HandleGetLayerSymbology(req.Args);
+
+                // ─── Catalog / Data Discovery ───────────────────────────────
+                case "pro.listGdbContents":
+                    return await HandleListGdbContents(req.Args);
+
+                case "pro.describeDataset":
+                    return await HandleDescribeDataset(req.Args);
+
                 default:
                     return new(false, $"op not found: {req.Op}", null);
             }
@@ -1031,9 +1175,13 @@ namespace APBridgeAddIn
                     ?? throw new InvalidOperationException(
                         "No active map and no 'map' parameter provided. Open a map view in Pro or specify 'map' explicitly.");
             }
-            var mapItem = Project.Current.GetItems<MapProjectItem>()
+            var project = Project.Current
+                ?? throw new InvalidOperationException("No project currently open in ArcGIS Pro");
+            var available = project.GetItems<MapProjectItem>().ToList();
+            var mapItem = available
                 .FirstOrDefault(m => m.Name.Equals(mapName, StringComparison.OrdinalIgnoreCase))
-                ?? throw new InvalidOperationException($"Map not found: {mapName}");
+                ?? throw new InvalidOperationException(
+                    $"Map not found: {mapName}. Available maps: {string.Join(", ", available.Select(m => m.Name))}");
             return mapItem.GetMap();
         }
 
@@ -1044,6 +1192,24 @@ namespace APBridgeAddIn
         /// First match wins — for duplicate names across groups, layer order in
         /// the TOC determines priority.
         /// </summary>
+        /// <summary>
+        /// Like <see cref="FindMapMemberByName"/> but throws with the full list of
+        /// available layer/table names on a miss — an agent that typo'd a name can
+        /// self-correct from the error instead of needing a list_layers round trip.
+        /// </summary>
+        private static ArcGIS.Desktop.Mapping.MapMember RequireMapMember(
+            ArcGIS.Desktop.Mapping.Map map, string name)
+        {
+            var member = FindMapMemberByName(map, name);
+            if (member != null) return member;
+            var available = map.GetLayersAsFlattenedList().Select(l => l.Name)
+                .Concat(map.StandaloneTables.Select(t => t.Name))
+                .ToList();
+            throw new InvalidOperationException(
+                $"Layer or table not found: {name}. Available in map '{map.Name}': " +
+                (available.Count > 0 ? string.Join(", ", available) : "<none>"));
+        }
+
         private static ArcGIS.Desktop.Mapping.MapMember? FindMapMemberByName(
             ArcGIS.Desktop.Mapping.Map map, string name)
         {
@@ -1291,8 +1457,7 @@ namespace APBridgeAddIn
                     // Single-target mode: clear selection on the named feature layer
                     // OR standalone table. Both expose ClearSelection() on their
                     // subclasses (not on MapMember), so dispatch.
-                    var member = FindMapMemberByName(map, layerName)
-                        ?? throw new InvalidOperationException($"Layer or table not found: {layerName}");
+                    var member = RequireMapMember(map, layerName);
                     switch (member)
                     {
                         case FeatureLayer flCs: flCs.ClearSelection(); break;
@@ -1511,6 +1676,16 @@ namespace APBridgeAddIn
                 var outDir = Path.Combine(location, name);
                 if (Directory.Exists(outDir))
                 {
+                    // Safety: only delete a directory that actually looks like the
+                    // project we'd be replacing (contains <name>.aprx). Without
+                    // this check, overwrite=true pointed at the wrong location
+                    // recursively deletes an arbitrary folder.
+                    var aprx = Path.Combine(outDir, $"{name}.aprx");
+                    if (!File.Exists(aprx))
+                        return new(false,
+                            $"Refusing to overwrite '{outDir}' — it does not contain {name}.aprx, " +
+                            "so it doesn't look like the project being replaced. Delete it manually " +
+                            "if that's really what you want.", null);
                     try { Directory.Delete(outDir, recursive: true); }
                     catch (Exception ex)
                     {
@@ -1603,12 +1778,13 @@ namespace APBridgeAddIn
                 return new(false, "arg 'url' required", null);
 
             args.TryGetValue("name", out string? layerName);
+            args.TryGetValue("map", out string? mapName);
 
             return await QueuedTask.Run<IpcResponse>(() =>
             {
-                var map = MapView.Active?.Map;
-                if (map == null)
-                    return new(false, "No active map view", null);
+                ArcGIS.Desktop.Mapping.Map map;
+                try { map = ResolveMap(mapName); }
+                catch (InvalidOperationException ex) { return new(false, ex.Message, null); }
 
                 Uri uri;
                 try { uri = new Uri(url); }
@@ -1645,12 +1821,13 @@ namespace APBridgeAddIn
                 return new(false, "arg 'path' required", null);
 
             args.TryGetValue("name", out string? layerName);
+            args.TryGetValue("map", out string? mapName);
 
             return await QueuedTask.Run<IpcResponse>(() =>
             {
-                var map = MapView.Active?.Map;
-                if (map == null)
-                    return new(false, "No active map view", null);
+                ArcGIS.Desktop.Mapping.Map map;
+                try { map = ResolveMap(mapName); }
+                catch (InvalidOperationException ex) { return new(false, ex.Message, null); }
 
                 Uri uri;
                 try { uri = new Uri(path); }
@@ -2016,9 +2193,13 @@ namespace APBridgeAddIn
 
         private static async Task<IpcResponse> HandleListToolboxes()
         {
+            if (Project.Current == null)
+                return new(false, "No project currently open in ArcGIS Pro", null);
+
             var toolboxes = await QueuedTask.Run(() =>
             {
-                var items = Project.Current.GetItems<GeoprocessingProjectItem>();
+                var items = Project.Current?.GetItems<GeoprocessingProjectItem>()
+                    ?? Enumerable.Empty<GeoprocessingProjectItem>();
                 return items.Select(item => new Dictionary<string, string>
                 {
                     ["name"] = item.Name,
@@ -2081,7 +2262,17 @@ namespace APBridgeAddIn
             if (!path.EndsWith(".atbx", StringComparison.OrdinalIgnoreCase))
                 path += ".atbx";
 
-            AtbxManager.CreateToolbox(path, tbxName);
+            bool overwrite = args.TryGetValue("overwrite", out string? ow)
+                             && bool.TryParse(ow, out var owb) && owb;
+
+            try
+            {
+                AtbxManager.CreateToolbox(path, tbxName, overwrite);
+            }
+            catch (Exception ex)
+            {
+                return new(false, ex.Message, null);
+            }
 
             // Add to project
             await QueuedTask.Run(() =>
@@ -2287,6 +2478,10 @@ namespace APBridgeAddIn
                         {
                             job.Status = "failed";
                             job.Error = resp.Error ?? "unknown failure";
+                            // Async failures must reach mcp-bridge.log too — the
+                            // in-memory job dies with Pro, and the sync path's
+                            // LogNonSuccess hook never sees this response.
+                            LogNonSuccess(new IpcRequest($"pro.runModelAsync[job {job.JobId}]", args), resp.Error);
                             // Pull failedStep/tool out of the response data shape
                             // that RunModelCore returns on a step failure.
                             if (resp.Data is { } d)
@@ -2306,6 +2501,7 @@ namespace APBridgeAddIn
                 }
                 catch (Exception ex)
                 {
+                    LogException(new IpcRequest($"pro.runModelAsync[job {job.JobId}]", args), ex);
                     lock (job.Lock)
                     {
                         job.Status = "failed";
@@ -2340,8 +2536,19 @@ namespace APBridgeAddIn
             if (!_runJobs.TryGetValue(jobId, out var job))
                 return new(false, $"Job '{jobId}' not found (expired or never existed)", null);
 
+            // Incremental message reads: pass messagesFrom=<count from last poll>
+            // to receive only new messages. Long model runs accumulate hundreds
+            // of GP messages; re-transmitting the full list every poll bloats
+            // the agent's context for no benefit.
+            int messagesFrom = 0;
+            if (args.TryGetValue("messagesFrom", out string? mfStr) &&
+                int.TryParse(mfStr, NumberStyles.Integer, CultureInfo.InvariantCulture, out int mf) &&
+                mf > 0)
+                messagesFrom = mf;
+
             lock (job.Lock)
             {
+                var skip = Math.Min(messagesFrom, job.Messages.Count);
                 return new(true, null, new
                 {
                     jobId = job.JobId,
@@ -2354,7 +2561,9 @@ namespace APBridgeAddIn
                     failedStep = job.FailedStep,
                     failedTool = job.FailedTool,
                     error = job.Error,
-                    messages = job.Messages.ToList()
+                    totalMessages = job.Messages.Count,
+                    messagesFrom = skip,
+                    messages = job.Messages.Skip(skip).ToList()
                 });
             }
         }
@@ -2453,8 +2662,10 @@ namespace APBridgeAddIn
                 var paramsNode = JsonNode.Parse(paramsJson)?.AsObject();
                 if (paramsNode != null)
                 {
+                    // CoerceScalarToString: agents pass JSON numbers/bools for
+                    // numeric model parameters; GetValue<string>() would throw.
                     foreach (var kv in paramsNode)
-                        namedValues[kv.Key] = kv.Value?.GetValue<string>() ?? "";
+                        namedValues[kv.Key] = CoerceScalarToString(kv.Value);
                 }
             }
 
@@ -2503,6 +2714,12 @@ namespace APBridgeAddIn
 
             var env = DefaultRunEnvironments();
             var allMessages = new List<object>();
+            int completedSteps = 0;
+            // Derived-output names assigned this run. Distinct variable names can
+            // sanitize to the same GDB name ("Clip Output" vs "Clip_Output");
+            // with overwriteoutput pinned true the later step would silently
+            // replace the earlier step's data. Uniquify on collision.
+            var usedDerivedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
             foreach (var proc in graph.Processes)
             {
@@ -2529,9 +2746,8 @@ namespace APBridgeAddIn
                 //      omits optional slots before included ones, but the resulting
                 //      misalignment surfaces as obvious slot-mismatch errors that
                 //      point at which tool to add to the signature table.
-                var slotOrder = GpToolCatalog.Signatures.TryGetValue(proc.Tool, out var sig)
-                    ? sig.AsEnumerable()
-                    : proc.Params.Keys;
+                var sig = GpToolCatalog.ResolveSignature(proc.Tool);
+                var slotOrder = sig != null ? sig.AsEnumerable() : proc.Params.Keys;
 
                 // Pre-pass: record outputs whose slot is NOT in the tool signature.
                 // Some tools (notably selection tools — SelectLayerByLocation,
@@ -2598,12 +2814,32 @@ namespace APBridgeAddIn
                             var varName = graph.Variables.TryGetValue(pm.OutputVariableId, out var ov)
                                 ? SanitizeGdbName(ov.Name)
                                 : $"output_{pm.OutputVariableId}";
+                            // Collision-proof: "Clip Output" and "Clip_Output" both
+                            // sanitize to Clip_Output; suffix until unique this run.
+                            var baseName = varName;
+                            int dupSuffix = 2;
+                            while (!usedDerivedNames.Add(varName))
+                                varName = $"{baseName}_{dupSuffix++}";
                             outPath = string.IsNullOrEmpty(scratchGdb)
                                 ? varName
                                 : $"{scratchGdb}\\{varName}";
                             runtimeValues[pm.OutputVariableId] = outPath;
                         }
                         values.Add(outPath);
+                    }
+                    else if (pm.RefVariableIds is { Count: > 1 })
+                    {
+                        // Multi-input slot (Merge.inputs, Union.in_features, ...):
+                        // join all resolved values with ';' — arcpy's multivalue
+                        // string syntax. Unresolved members are skipped (their GP
+                        // error will surface at execution if they mattered).
+                        var parts = new List<string>();
+                        foreach (var rid in pm.RefVariableIds)
+                        {
+                            if (runtimeValues.TryGetValue(rid, out var rv) && !string.IsNullOrEmpty(rv))
+                                parts.Add(rv);
+                        }
+                        values.Add(string.Join(";", parts));
                     }
                     else if (pm.RefVariableId != null)
                     {
@@ -2634,8 +2870,31 @@ namespace APBridgeAddIn
                     }
                 }
 
+                // Per-step environment overrides (extent, cellSize, mask,
+                // outputCoordinateSystem, ...) merged over the run defaults.
+                // Pro's own engine honors these; ignoring them silently produces
+                // different results than a ribbon run (e.g., un-clipped extents).
+                var stepEnv = env;
+                if (proc.Environments is { Count: > 0 })
+                {
+                    var merged = new List<KeyValuePair<string, string>>(env);
+                    foreach (var (envKey, envParam) in proc.Environments)
+                    {
+                        string? envVal = null;
+                        if (envParam.RefVariableId != null)
+                            runtimeValues.TryGetValue(envParam.RefVariableId, out envVal);
+                        else if (envParam.LiteralValue != null)
+                            envVal = SubstituteModelVars(envParam.LiteralValue, graph, runtimeValues);
+                        if (string.IsNullOrEmpty(envVal)) continue;
+
+                        merged.RemoveAll(kv => kv.Key.Equals(envKey, StringComparison.OrdinalIgnoreCase));
+                        merged.Add(new KeyValuePair<string, string>(envKey, envVal));
+                    }
+                    stepEnv = merged;
+                }
+
                 var valueArray = Geoprocessing.MakeValueArray(values.ToArray());
-                var stepResult = await Geoprocessing.ExecuteToolAsync(proc.Tool, valueArray, env);
+                var stepResult = await Geoprocessing.ExecuteToolAsync(proc.Tool, valueArray, stepEnv);
 
                 if (stepResult.IsFailed)
                 {
@@ -2659,9 +2918,10 @@ namespace APBridgeAddIn
 
                     return new(false,
                         $"Step '{proc.Name}' ({proc.Tool}) failed: {msgs}",
-                        new { failedStep = proc.Name, tool = proc.Tool, completedSteps = allMessages.Count });
+                        new { failedStep = proc.Name, tool = proc.Tool, completedSteps });
                 }
 
+                completedSteps++;
                 foreach (var m in stepResult.Messages)
                     allMessages.Add(new { step = proc.Name, type = m.Type.ToString(), text = m.Text });
 
@@ -2738,9 +2998,15 @@ namespace APBridgeAddIn
         {
             if (string.IsNullOrEmpty(literal) || !literal.Contains('%'))
                 return literal;
+            // [^%]+ rather than an identifier pattern: ModelBuilder variable
+            // names routinely contain spaces ("Output Features"), parentheses,
+            // and other punctuation — %Output Features% must still substitute.
+            // Names that don't match any variable are left in place unchanged,
+            // so SQL wildcards like 'LIKE ''%foo%''' survive: the inner text
+            // only gets replaced when it exactly matches a variable name.
             return System.Text.RegularExpressions.Regex.Replace(
                 literal,
-                @"%([A-Za-z_][A-Za-z0-9_]*)%",
+                @"%([^%]+)%",
                 match =>
                 {
                     var varName = match.Groups[1].Value;
@@ -2815,8 +3081,35 @@ namespace APBridgeAddIn
                     paramValues.Add(FlattenGpParam(p));
             }
 
+            // Optional per-call environment overrides merged over the defaults:
+            // {"extent": "...", "outputCoordinateSystem": "...", "cellSize": "30",
+            //  "mask": "StudyArea", "parallelProcessingFactor": "75%"} etc.
+            // Keys pass through verbatim as GP env names.
+            IEnumerable<KeyValuePair<string, string>> env = DefaultRunEnvironments();
+            if (args.TryGetValue("environments", out string? envJson) && !string.IsNullOrWhiteSpace(envJson))
+            {
+                try
+                {
+                    var envNode = JsonNode.Parse(envJson)?.AsObject()
+                        ?? throw new InvalidOperationException("environments must be a JSON object");
+                    var merged = new List<KeyValuePair<string, string>>(DefaultRunEnvironments());
+                    foreach (var kv in envNode)
+                    {
+                        var val = CoerceScalarToString(kv.Value);
+                        if (string.IsNullOrEmpty(val)) continue;
+                        merged.RemoveAll(e => e.Key.Equals(kv.Key, StringComparison.OrdinalIgnoreCase));
+                        merged.Add(new KeyValuePair<string, string>(kv.Key, val));
+                    }
+                    env = merged;
+                }
+                catch (Exception ex)
+                {
+                    return new(false, $"Invalid environments JSON: {ex.Message}", null);
+                }
+            }
+
             var valueArray = Geoprocessing.MakeValueArray(paramValues.ToArray());
-            var result = await Geoprocessing.ExecuteToolAsync(toolName, valueArray, DefaultRunEnvironments());
+            var result = await Geoprocessing.ExecuteToolAsync(toolName, valueArray, env);
 
             if (result.IsFailed)
             {
@@ -2835,7 +3128,25 @@ namespace APBridgeAddIn
             }
 
             var outputMessages = result.Messages.Select(m => new { type = m.Type.ToString(), text = m.Text }).ToList();
-            return new(true, null, new { success = true, messages = outputMessages });
+
+            // Surface the tool's output values so the agent knows where results
+            // landed (derived output paths, counts from GetCount, etc.) without
+            // having to parse them out of message text.
+            List<string>? outputValues = null;
+            try
+            {
+                outputValues = result.Values?.Where(v => !string.IsNullOrEmpty(v)).ToList();
+                if (outputValues is { Count: 0 }) outputValues = null;
+            }
+            catch { /* some tools expose no values — fine */ }
+
+            return new(true, null, new
+            {
+                success = true,
+                returnValue = result.ReturnValue,
+                outputs = outputValues,
+                messages = outputMessages
+            });
         }
 
         // ─── Logging ────────────────────────────────────────────────────────
@@ -2890,16 +3201,35 @@ namespace APBridgeAddIn
             catch { /* best effort — never break the IPC loop to log */ }
         }
 
+        /// <summary>
+        /// Converts any JSON scalar to its GP-friendly string form. LLM callers
+        /// routinely emit JSON numbers and booleans where arcpy expects strings
+        /// (<c>[..., 100, true]</c>); <c>JsonValue.GetValue&lt;string&gt;()</c>
+        /// throws InvalidOperationException on those, killing the whole op.
+        /// Numbers/bools serialize to their raw literal ("100", "true"), which
+        /// is exactly what arcpy's value parser wants.
+        /// </summary>
+        internal static string CoerceScalarToString(JsonNode? node)
+        {
+            if (node is null) return "";
+            if (node is JsonValue v)
+            {
+                if (v.TryGetValue<string>(out var s)) return s;
+                return v.ToJsonString(); // number → "100", bool → "true"
+            }
+            return node.ToJsonString();
+        }
+
         private static string FlattenGpParam(JsonNode? node)
         {
             if (node is null) return "";
-            if (node is JsonValue v) return v.GetValue<string>();
+            if (node is JsonValue) return CoerceScalarToString(node);
             if (node is JsonArray arr)
             {
                 return string.Join(";", arr.Select(row =>
                     row is JsonArray inner
-                        ? string.Join(" ", inner.Select(t => t?.GetValue<string>() ?? ""))
-                        : (row?.GetValue<string>() ?? "")));
+                        ? string.Join(" ", inner.Select(CoerceScalarToString))
+                        : CoerceScalarToString(row)));
             }
             return node.ToJsonString();
         }
