@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <NoWarn>CS8632</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- AtbxManager and friends are compiled in by source inclusion rather
+         than project reference: the Add-In csproj drags in Pro SDK assemblies
+         that only exist inside ArcGIS Pro, but the ModelBuilder file layer is
+         pure System.* and tests fine out of process. -->
+    <Compile Include="..\..\AddIn\APBridgeAddIn\ModelBuilder\AtbxManager.cs" Link="AtbxManager.cs" />
+    <Compile Include="..\..\AddIn\APBridgeAddIn\ModelBuilder\GpToolCatalog.cs" Link="GpToolCatalog.cs" />
+    <Compile Include="..\..\AddIn\APBridgeAddIn\ModelBuilder\SystemToolboxCatalog.cs" Link="SystemToolboxCatalog.cs" />
+  </ItemGroup>
+
+</Project>

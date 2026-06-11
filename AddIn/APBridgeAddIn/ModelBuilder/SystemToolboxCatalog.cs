@@ -75,18 +75,31 @@ namespace APBridgeAddIn.ModelBuilder
 
         private static string? ToolboxesRoot()
         {
+            // Env override first — used by out-of-process tests and unusual installs.
+            var overrideDir = Environment.GetEnvironmentVariable("ARCGIS_PRO_TOOLBOXES_DIR");
+            if (!string.IsNullOrWhiteSpace(overrideDir) && Directory.Exists(overrideDir))
+                return overrideDir;
+
             try
             {
                 // The Add-In runs inside ArcGISPro.exe — resolve the install
                 // relative to the host process rather than hardcoding paths.
                 var exe = Process.GetCurrentProcess().MainModule?.FileName;
-                if (exe == null) return null;
-                var binDir = Path.GetDirectoryName(exe);
-                if (binDir == null) return null;
-                var root = Path.GetFullPath(Path.Combine(binDir, "..", "Resources", "ArcToolBox", "toolboxes"));
-                return Directory.Exists(root) ? root : null;
+                var binDir = exe != null ? Path.GetDirectoryName(exe) : null;
+                if (binDir != null)
+                {
+                    var root = Path.GetFullPath(Path.Combine(binDir, "..", "Resources", "ArcToolBox", "toolboxes"));
+                    if (Directory.Exists(root)) return root;
+                }
             }
-            catch { return null; }
+            catch { }
+
+            // Standard install path fallback (also makes the catalog usable from
+            // out-of-process tooling/tests that aren't hosted in ArcGISPro.exe).
+            var standard = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+                "ArcGIS", "Pro", "Resources", "ArcToolBox", "toolboxes");
+            return Directory.Exists(standard) ? standard : null;
         }
 
         /// <summary>Scan toolbox.content of every *.tbx dir once to map alias → dir.</summary>
