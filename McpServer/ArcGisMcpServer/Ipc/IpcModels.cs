@@ -28,6 +28,23 @@ namespace ArcGisMcpServer.Ipc
         [property: JsonPropertyName("error")] string Error
     );
 
+    // Payload for the list_bridges tool: one entry per live Pro instance,
+    // plus the routing context (pin + which entry the next request will hit).
+    public record BridgeInstanceInfo(
+        [property: JsonPropertyName("pid")] int Pid,
+        [property: JsonPropertyName("projectName")] string? ProjectName,
+        [property: JsonPropertyName("projectPath")] string? ProjectPath,
+        [property: JsonPropertyName("pipeName")] string PipeName,
+        [property: JsonPropertyName("startedUtc")] string StartedUtc,
+        [property: JsonPropertyName("selected")] bool Selected
+    );
+
+    public record BridgeListPayload(
+        [property: JsonPropertyName("pinnedProject")] string? PinnedProject,
+        [property: JsonPropertyName("bridges")] List<BridgeInstanceInfo> Bridges,
+        [property: JsonPropertyName("note")] string Note
+    );
+
     // Compact source-generated context for types that cross the named-pipe
     // IPC boundary. The pipe protocol is line-delimited JSON (one message
     // per line), so any indentation would break framing.
@@ -43,5 +60,6 @@ namespace ArcGisMcpServer.Ipc
     [JsonSourceGenerationOptions(WriteIndented = true)]
     [JsonSerializable(typeof(JsonElement))]
     [JsonSerializable(typeof(FormatErrorPayload))]
+    [JsonSerializable(typeof(BridgeListPayload))]
     internal partial class IndentedJsonContext : JsonSerializerContext { }
 }
