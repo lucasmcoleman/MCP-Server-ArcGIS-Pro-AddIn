@@ -275,14 +275,23 @@ namespace APBridgeAddIn.ModelBuilder
             {
                 var processId = TryGetString(p?["id"]);
                 var title = TryGetString(p?["title"]);
-                var tool = TryGetString(p?["system_tool"])
-                    ?? TryGetString(p?["model_tool"])
-                    ?? "unknown";
+                // Same four-shape detection as WalkModel — keep them in lockstep.
+                var systemTool = TryGetString(p?["system_tool"]);
+                var modelTool  = TryGetString(p?["model_tool"]);
+                var toolType   = TryGetString(p?["tool_type"]);
+                var toolPath   = TryGetString(p?["path"]);
+                string tool; string kind;
+                if (systemTool != null) { tool = systemTool;             kind = "gpTool"; }
+                else if (toolType == "ScriptTool") { tool = toolPath ?? "unknown"; kind = "scriptTool"; }
+                else if (toolType == "ModelTool")  { tool = toolPath ?? "unknown"; kind = "nestedModel"; }
+                else if (modelTool != null)        { tool = modelTool;              kind = "iterator"; }
+                else                                { tool = "unknown";             kind = "unknown"; }
 
                 var step = new JsonObject
                 {
                     ["name"] = ResolveName(title, $"Step_{processId}"),
-                    ["tool"] = tool
+                    ["tool"] = tool,
+                    ["kind"] = kind
                 };
 
                 // Translate parameters
@@ -452,8 +461,21 @@ namespace APBridgeAddIn.ModelBuilder
                 var pid = TryGetString(p?["id"]);
                 if (pid == null) continue;
                 var systemTool = TryGetString(p?["system_tool"]);
-                var modelTool = TryGetString(p?["model_tool"]);
-                var tool = systemTool ?? modelTool ?? "unknown";
+                var modelTool  = TryGetString(p?["model_tool"]);
+                var toolType   = TryGetString(p?["tool_type"]);
+                var toolPath   = TryGetString(p?["path"]);
+                // Process header takes one of four shapes:
+                //   {system_tool:"alias.toolName"}             → built-in GP tool
+                //   {tool_type:"ScriptTool", path:"Name"}      → custom script tool by name
+                //   {tool_type:"ModelTool",  path:"Name"}      → nested model by name
+                //   {model_tool:"..."}                         → legacy iterator (and very old nested-model encoding)
+                ToolKind kind;
+                string tool;
+                if (systemTool != null) { tool = systemTool;             kind = ToolKind.GpTool; }
+                else if (toolType == "ScriptTool") { tool = toolPath ?? "unknown"; kind = ToolKind.ScriptTool; }
+                else if (toolType == "ModelTool")  { tool = toolPath ?? "unknown"; kind = ToolKind.NestedModel; }
+                else if (modelTool != null)        { tool = modelTool;              kind = ToolKind.Iterator; }
+                else                                { tool = "unknown";             kind = ToolKind.Unknown; }
                 var name = Resolve(TryGetString(p?["title"]), $"Step_{pid}");
 
                 // Parse params preserving JSON insertion order (= tool-declared slot order).
@@ -504,9 +526,12 @@ namespace APBridgeAddIn.ModelBuilder
                     Id = pid,
                     Name = name,
                     Tool = tool,
-                    // model_tool with no system_tool ⇒ iterator or nested sub-model;
-                    // step-by-step execution doesn't have semantics for either.
-                    IsIterator = systemTool == null && modelTool != null,
+                    Kind = kind,
+                    // Step-by-step execution doesn't have semantics for anything
+                    // outside GpTool. The executor's iterator-reject path covers
+                    // all non-GP kinds; keep IsIterator true for them so existing
+                    // callers (and the executor's FirstOrDefault check) stay correct.
+                    IsIterator = kind != ToolKind.GpTool,
                     Params = paramsDict,
                 });
             }
@@ -617,35 +642,223 @@ namespace APBridgeAddIn.ModelBuilder
             var (toolModel, toolContent, toolContentRc, diagram, diagramXml) =
                 GenerateModelFiles(def, modelName);
 
-            // Write to the .atbx ZIP
-            using var fileStream = new FileStream(atbxPath, FileMode.Open, FileAccess.ReadWrite);
-            using var zip = new ZipArchive(fileStream, ZipArchiveMode.Update);
+            // Write to the .atbx ZIP via temp + atomic-rename. See
+            // WriteAtbxAtomically for the rationale (canvas-open deadlock).
+            WriteAtbxAtomically(atbxPath, zip =>
+            {
+                // CRITICAL: Read the existing manifest BEFORE any writes. In
+                // ZipArchive Update mode, reading a pre-existing entry after
+                // writing to the archive can silently return an empty stream.
+                var existingManifestJson = ReadEntryTextOrDefault(zip, "toolbox.content",
+                    "{\"version\":\"1.0\",\"toolsets\":{\"<root>\":{\"tools\":[]}}}");
 
-            // CRITICAL: Read the existing manifest BEFORE any writes. In
-            // ZipArchive Update mode, reading a pre-existing entry after
-            // writing to the archive can silently return an empty stream.
-            var existingManifestJson = ReadEntryTextOrDefault(zip, "toolbox.content",
-                "{\"version\":\"1.0\",\"toolsets\":{\"<root>\":{\"tools\":[]}}}");
+                var folder = $"{modelName}.tool";
 
-            var folder = $"{modelName}.tool";
+                // Remove existing entries if overwriting
+                RemoveEntryIfExists(zip, $"{folder}/tool.model");
+                RemoveEntryIfExists(zip, $"{folder}/tool.content");
+                RemoveEntryIfExists(zip, $"{folder}/tool.content.rc");
+                RemoveEntryIfExists(zip, $"{folder}/tool.model.diagram");
+                RemoveEntryIfExists(zip, $"{folder}/tool.model.diagram.xml");
+                RemoveEntryIfExists(zip, "toolbox.content");
 
-            // Remove existing entries if overwriting
-            RemoveEntryIfExists(zip, $"{folder}/tool.model");
-            RemoveEntryIfExists(zip, $"{folder}/tool.content");
-            RemoveEntryIfExists(zip, $"{folder}/tool.content.rc");
-            RemoveEntryIfExists(zip, $"{folder}/tool.model.diagram");
-            RemoveEntryIfExists(zip, $"{folder}/tool.model.diagram.xml");
-            RemoveEntryIfExists(zip, "toolbox.content");
+                WriteStringEntry(zip, $"{folder}/tool.model", toolModel);
+                WriteStringEntry(zip, $"{folder}/tool.content", toolContent);
+                WriteStringEntry(zip, $"{folder}/tool.content.rc", toolContentRc);
+                WriteStringEntry(zip, $"{folder}/tool.model.diagram", diagram);
+                WriteStringEntry(zip, $"{folder}/tool.model.diagram.xml", diagramXml);
 
-            WriteStringEntry(zip, $"{folder}/tool.model", toolModel);
-            WriteStringEntry(zip, $"{folder}/tool.content", toolContent);
-            WriteStringEntry(zip, $"{folder}/tool.content.rc", toolContentRc);
-            WriteStringEntry(zip, $"{folder}/tool.model.diagram", diagram);
-            WriteStringEntry(zip, $"{folder}/tool.model.diagram.xml", diagramXml);
+                // Compute updated manifest from the pre-read content, then write.
+                var updatedManifest = AddToolToManifestJson(existingManifestJson, modelName);
+                WriteStringEntry(zip, "toolbox.content", updatedManifest.ToJsonString(JsonOpts));
+            });
+        }
 
-            // Compute updated manifest from the pre-read content, then write.
-            var updatedManifest = AddToolToManifestJson(existingManifestJson, modelName);
-            WriteStringEntry(zip, "toolbox.content", updatedManifest.ToJsonString(JsonOpts));
+        /// <summary>
+        /// Surgical write: sets (or clears) the default value of a model input
+        /// parameter without regenerating the whole model. Touches only the one
+        /// variable's <c>value</c> field inside <c>tool.model</c>; every other
+        /// variable, every process, the diagram, and every other ZIP entry
+        /// stay byte-identical. Designed so a one-field edit cannot re-trigger
+        /// any of the round-trip behaviors that <see cref="UpdateModel"/>
+        /// inherits from <see cref="GenerateModelFiles"/> (slot canonicalization,
+        /// `_2` suffix on name collisions, etc.).
+        ///
+        /// Pass an empty <paramref name="defaultValue"/> to clear an existing
+        /// default. Throws if the parameter doesn't exist or isn't a Parameter
+        /// variable (e.g., caller targeted a derived output by mistake).
+        /// </summary>
+        public static void SetParameterDefault(string atbxPath, string modelName, string parameterName, string defaultValue)
+        {
+            var entryPath = $"{modelName}.tool/tool.model";
+            WriteAtbxAtomically(atbxPath, zip =>
+            {
+                // Read first, then mutate, then remove + rewrite. Same pattern as
+                // CreateModel: in Update mode, reading a pre-existing entry after
+                // writing has corrupted entries in our past — read everything we
+                // need up front.
+                var modelText = ReadEntryTextOrDefault(zip, entryPath, "");
+                if (string.IsNullOrWhiteSpace(modelText))
+                    throw new Exception($"Model '{modelName}' not found in toolbox");
+                var modelNode = JsonNode.Parse(modelText)
+                    ?? throw new Exception($"Model '{modelName}' tool.model is not valid JSON");
+
+                var variables = modelNode["variables"]?.AsArray()
+                    ?? throw new Exception($"Model '{modelName}' has no variables array");
+
+                JsonNode? target = null;
+                foreach (var v in variables)
+                {
+                    if (v == null) continue;
+                    if (TryGetString(v["param_name"]) == parameterName)
+                    {
+                        target = v;
+                        break;
+                    }
+                }
+                if (target == null)
+                    throw new Exception(
+                        $"No input parameter named '{parameterName}' in model '{modelName}'. " +
+                        $"Available parameter names: {string.Join(", ", variables.Where(v => TryGetString(v?["connection_type"]) == "Parameter").Select(v => TryGetString(v?["param_name"]) ?? "?"))}");
+                if (TryGetString(target["connection_type"]) != "Parameter")
+                    throw new Exception(
+                        $"Variable '{parameterName}' exists but is not a model Parameter — " +
+                        $"set_parameter_default only modifies exposed input parameters. " +
+                        $"Use set_step_parameter for step-level values.");
+
+                target["value"] = defaultValue ?? "";
+
+                RemoveEntryIfExists(zip, entryPath);
+                WriteStringEntry(zip, entryPath, modelNode.ToJsonString(JsonOpts));
+            });
+        }
+
+        /// <summary>
+        /// Surgical write: sets the value of one parameter on one step without
+        /// regenerating the whole model. Same byte-identical-everything-else
+        /// guarantee as <see cref="SetParameterDefault"/>.
+        ///
+        /// <paramref name="paramValue"/> is a JSON value with one of three shapes:
+        ///   <c>{"ref": "VariableName"}</c> → wires the param to that variable
+        ///     (looked up by name); writes <c>{"element_id": &lt;id&gt;}</c>.
+        ///   <c>{"value": "literal"}</c> or a bare string → writes
+        ///     <c>{"value": ...}</c>.
+        /// Output declarations (<c>{"output": ..., "type": ..., "value": ...}</c>)
+        /// are NOT accepted here — adding or removing a step's output reshapes
+        /// the graph; that's <c>add_step</c>/<c>remove_step</c> territory.
+        /// </summary>
+        public static void SetStepParameter(string atbxPath, string modelName, string stepName, string paramKey, string paramValueJson)
+        {
+            var entryPath = $"{modelName}.tool/tool.model";
+            var rcPath    = $"{modelName}.tool/tool.content.rc";
+            WriteAtbxAtomically(atbxPath, zip => SetStepParameterInZip(zip, entryPath, rcPath, modelName, stepName, paramKey, paramValueJson));
+        }
+
+        private static void SetStepParameterInZip(ZipArchive zip, string entryPath, string rcPath, string modelName, string stepName, string paramKey, string paramValueJson)
+        {
+            var modelText = ReadEntryTextOrDefault(zip, entryPath, "");
+            if (string.IsNullOrWhiteSpace(modelText))
+                throw new Exception($"Model '{modelName}' not found in toolbox");
+            var modelNode = JsonNode.Parse(modelText)
+                ?? throw new Exception($"Model '{modelName}' tool.model is not valid JSON");
+            var rcText = ReadEntryTextOrDefault(zip, rcPath, "{}");
+            var rcNode = JsonNode.Parse(rcText);
+
+            // Build a name → rc-key map so we can resolve a process whose title
+            // is a $rc reference back to its rendered display name.
+            var displayNames = new Dictionary<string, string>();
+            if (rcNode?["map"] is JsonObject rcMap)
+                foreach (var kv in rcMap)
+                    displayNames[kv.Key] = TryGetString(kv.Value) ?? "";
+
+            string ResolveTitle(string? titleRef, string fallback)
+            {
+                if (titleRef != null && titleRef.StartsWith("$rc:"))
+                {
+                    var key = titleRef[4..];
+                    if (displayNames.TryGetValue(key, out var name)) return name;
+                }
+                return fallback;
+            }
+
+            var processes = modelNode["processes"]?.AsArray()
+                ?? throw new Exception($"Model '{modelName}' has no processes array");
+
+            JsonObject? targetProcess = null;
+            foreach (var p in processes)
+            {
+                if (p is not JsonObject po) continue;
+                var name = ResolveTitle(TryGetString(po["title"]), TryGetString(po["id"]) ?? "");
+                if (name == stepName) { targetProcess = po; break; }
+            }
+            if (targetProcess == null)
+                throw new Exception(
+                    $"No step named '{stepName}' in model '{modelName}'. " +
+                    $"Available step names: {string.Join(", ", processes.Select(p => ResolveTitle(TryGetString(p?["title"]), TryGetString(p?["id"]) ?? "?")))}");
+
+            var paramsObj = targetProcess["params"]?.AsObject()
+                ?? throw new Exception($"Step '{stepName}' has no params object");
+            if (!paramsObj.ContainsKey(paramKey))
+                throw new Exception(
+                    $"Step '{stepName}' has no parameter '{paramKey}'. " +
+                    $"Available: {string.Join(", ", paramsObj.Select(kv => kv.Key))}");
+
+            // Parse the user-supplied param value JSON. Accept either an object
+            // shape {ref:...} / {value:...} or a bare string (treated as value).
+            var input = JsonNode.Parse(paramValueJson)
+                ?? throw new Exception("paramValue must be a non-null JSON value");
+
+            JsonNode newSlot;
+            if (input is JsonObject inObj)
+            {
+                if (inObj.ContainsKey("output"))
+                    throw new Exception(
+                        "set_step_parameter does not accept output declarations — " +
+                        "adding or changing a step's derived output reshapes the model graph. " +
+                        "Use add_step / remove_step for that.");
+
+                if (inObj["ref"] is JsonNode refNode)
+                {
+                    var refName = TryGetString(refNode)
+                        ?? throw new Exception("'ref' must be a string variable name");
+                    var variables = modelNode["variables"]?.AsArray()
+                        ?? throw new Exception("Model has no variables array");
+                    string? refId = null;
+                    foreach (var v in variables)
+                    {
+                        if (v == null) continue;
+                        var pname = TryGetString(v["param_name"]);
+                        if (pname == refName) { refId = TryGetString(v["id"]); break; }
+                        // Also check rc-resolved title for derived outputs.
+                        var resolved = ResolveTitle(TryGetString(v["title"]), pname ?? "");
+                        if (resolved == refName) { refId = TryGetString(v["id"]); break; }
+                    }
+                    if (refId == null)
+                        throw new Exception($"ref '{refName}' does not match any variable in the model");
+                    newSlot = new JsonObject { ["element_id"] = refId };
+                }
+                else if (inObj["value"] is JsonNode valNode)
+                {
+                    newSlot = new JsonObject { ["value"] = TryGetString(valNode) ?? "" };
+                }
+                else
+                {
+                    throw new Exception("paramValue object must contain either 'ref' or 'value'");
+                }
+            }
+            else if (input is JsonValue jv)
+            {
+                newSlot = new JsonObject { ["value"] = jv.GetValue<string>() };
+            }
+            else
+            {
+                throw new Exception("paramValue must be a JSON object or a string literal");
+            }
+
+            paramsObj[paramKey] = newSlot;
+
+            RemoveEntryIfExists(zip, entryPath);
+            WriteStringEntry(zip, entryPath, modelNode.ToJsonString(JsonOpts));
         }
 
         /// <summary>
@@ -668,22 +881,22 @@ namespace APBridgeAddIn.ModelBuilder
             var (toolModel, toolContent, toolContentRc, diagram, diagramXml) =
                 GenerateModelFiles(def, modelName);
 
-            using var fileStream = new FileStream(atbxPath, FileMode.Open, FileAccess.ReadWrite);
-            using var zip = new ZipArchive(fileStream, ZipArchiveMode.Update);
+            WriteAtbxAtomically(atbxPath, zip =>
+            {
+                var folder = $"{modelName}.tool";
 
-            var folder = $"{modelName}.tool";
+                RemoveEntryIfExists(zip, $"{folder}/tool.model");
+                RemoveEntryIfExists(zip, $"{folder}/tool.content");
+                RemoveEntryIfExists(zip, $"{folder}/tool.content.rc");
+                RemoveEntryIfExists(zip, $"{folder}/tool.model.diagram");
+                RemoveEntryIfExists(zip, $"{folder}/tool.model.diagram.xml");
 
-            RemoveEntryIfExists(zip, $"{folder}/tool.model");
-            RemoveEntryIfExists(zip, $"{folder}/tool.content");
-            RemoveEntryIfExists(zip, $"{folder}/tool.content.rc");
-            RemoveEntryIfExists(zip, $"{folder}/tool.model.diagram");
-            RemoveEntryIfExists(zip, $"{folder}/tool.model.diagram.xml");
-
-            WriteStringEntry(zip, $"{folder}/tool.model", toolModel);
-            WriteStringEntry(zip, $"{folder}/tool.content", toolContent);
-            WriteStringEntry(zip, $"{folder}/tool.content.rc", toolContentRc);
-            WriteStringEntry(zip, $"{folder}/tool.model.diagram", diagram);
-            WriteStringEntry(zip, $"{folder}/tool.model.diagram.xml", diagramXml);
+                WriteStringEntry(zip, $"{folder}/tool.model", toolModel);
+                WriteStringEntry(zip, $"{folder}/tool.content", toolContent);
+                WriteStringEntry(zip, $"{folder}/tool.content.rc", toolContentRc);
+                WriteStringEntry(zip, $"{folder}/tool.model.diagram", diagram);
+                WriteStringEntry(zip, $"{folder}/tool.model.diagram.xml", diagramXml);
+            });
         }
 
         /// <summary>
@@ -820,8 +1033,46 @@ namespace APBridgeAddIn.ModelBuilder
             {
                 var stepName = step?["name"]?.GetValue<string>() ?? $"Step{nextId}";
                 var tool = step?["tool"]?.GetValue<string>() ?? "unknown";
+                // Step kind drives the process header shape (system_tool vs
+                // tool_type+path). Absent kind defaults to "gpTool" so every
+                // existing caller's payload continues to write as before.
+                var kind = step?["kind"]?.GetValue<string>() ?? "gpTool";
                 var parameters = step?["parameters"]?.AsObject();
                 var environments = step?["environments"]?.AsObject();
+
+                // Canonicalize the output-slot key for this tool. When the
+                // user supplies an output under a non-canonical key (e.g.,
+                // `out_features` on management.CalculateGeometryAttributes
+                // whose real slot is `updated_features`), Pro's load-time
+                // normalizer rewrites the slot and stamps its default UI
+                // label ("Updated Features") as the variable name, orphaning
+                // every downstream `ref` to the user-supplied output name.
+                // Rewriting to the canonical slot up front means Pro never
+                // runs the normalizer and the user-supplied output name
+                // stays put. Only acts when the tool is in OutputSlots AND
+                // the canonical key isn't already occupied (if both exist
+                // the user has a conflicting payload — leave it for Pro to
+                // flag rather than silently merging).
+                if (parameters != null &&
+                    GpToolCatalog.OutputSlots.TryGetValue(tool, out var canonOut))
+                {
+                    string? wrongKey = null;
+                    foreach (var p in parameters)
+                    {
+                        if (p.Value is JsonObject po && po["output"] != null
+                            && !string.Equals(p.Key, canonOut.Slot, StringComparison.OrdinalIgnoreCase))
+                        {
+                            wrongKey = p.Key;
+                            break;
+                        }
+                    }
+                    if (wrongKey != null && !parameters.ContainsKey(canonOut.Slot))
+                    {
+                        var node = parameters[wrongKey]?.DeepClone();
+                        parameters.Remove(wrongKey);
+                        if (node != null) parameters[canonOut.Slot] = node;
+                    }
+                }
 
                 var processId = nextId++.ToString();
                 rcMap[$"model.element{processId}"] = stepName;
@@ -862,6 +1113,17 @@ namespace APBridgeAddIn.ModelBuilder
                             if (outputName != null)
                             {
                                 var outputType = paramObj["type"]?.GetValue<string>() ?? "DEFeatureClass";
+                                // GPComposite is Pro's multi-type slot wrapper —
+                                // appropriate on INPUT params (e.g., CalculateField.in_table
+                                // accepts TableView | RasterLayer | MosaicLayer) but on a
+                                // derived OUTPUT variable it hard-crashes Pro on .atbx open.
+                                // Coerce to the tool's canonical concrete DE* type when
+                                // known; leave alone for unknown tools.
+                                if (string.Equals(outputType, "GPComposite", StringComparison.OrdinalIgnoreCase)
+                                    && GpToolCatalog.OutputSlots.TryGetValue(tool, out var outCoerce))
+                                {
+                                    outputType = outCoerce.Type;
+                                }
                                 // Accept an optional "value" — the explicit path the model
                                 // author wants this output written to. Without this, every
                                 // output round-trips as `derived` (no path), which forces
@@ -917,13 +1179,32 @@ namespace APBridgeAddIn.ModelBuilder
                     }
                 }
 
+                // Process header shape varies by step kind:
+                //   gpTool      → {system_tool: "alias.toolName"}
+                //   scriptTool  → {tool_type: "ScriptTool", path: "Name"}
+                //   nestedModel → {tool_type: "ModelTool",  path: "Name"}
+                // Path values are names relative to the host toolbox, no
+                // extension. WalkModel mirrors the inverse mapping.
                 var process = new JsonObject
                 {
                     ["id"] = processId,
                     ["title"] = $"$rc:model.element{processId}",
-                    ["system_tool"] = tool,
                     ["params"] = processParams
                 };
+                if (string.Equals(kind, "scriptTool", StringComparison.OrdinalIgnoreCase))
+                {
+                    process["tool_type"] = "ScriptTool";
+                    process["path"] = tool;
+                }
+                else if (string.Equals(kind, "nestedModel", StringComparison.OrdinalIgnoreCase))
+                {
+                    process["tool_type"] = "ModelTool";
+                    process["path"] = tool;
+                }
+                else
+                {
+                    process["system_tool"] = tool;
+                }
 
                 // Handle environments
                 if (environments != null)
@@ -1146,6 +1427,66 @@ namespace APBridgeAddIn.ModelBuilder
         }
 
         /// <summary>
+        /// Performs all .atbx mutations against an in-memory copy of the file,
+        /// then atomically swaps the result over the live file. Avoids holding
+        /// the live file lock during the heavy ZipArchive Update operations,
+        /// which deadlocks against Pro when the file (or a model it contains)
+        /// is referenced by an open ModelBuilder canvas tab — including
+        /// indirect references via scriptTool / nestedModel steps in other
+        /// canvas-open models. Verified 2026-06-08 by Desktop's diagnostic:
+        /// closing all MB canvas tabs makes the deadlock disappear entirely.
+        /// </summary>
+        private static void WriteAtbxAtomically(string atbxPath, Action<ZipArchive> mutate)
+        {
+            var originalBytes = File.ReadAllBytes(atbxPath);
+
+            using var ms = new MemoryStream();
+            ms.Write(originalBytes, 0, originalBytes.Length);
+            ms.Position = 0;
+
+            using (var zip = new ZipArchive(ms, ZipArchiveMode.Update, leaveOpen: true))
+            {
+                mutate(zip);
+            }
+
+            var newBytes = ms.ToArray();
+
+            // Stage to a sibling temp file in the same directory so File.Replace
+            // can succeed (it requires source + destination on the same volume).
+            var dir = Path.GetDirectoryName(atbxPath) ?? ".";
+            var tempPath   = Path.Combine(dir, Path.GetFileName(atbxPath) + ".tmp." + Guid.NewGuid().ToString("N"));
+            var backupPath = Path.Combine(dir, Path.GetFileName(atbxPath) + ".bak." + Guid.NewGuid().ToString("N"));
+            try
+            {
+                File.WriteAllBytes(tempPath, newBytes);
+
+                try
+                {
+                    // Atomic swap. Works even when Pro has the .atbx open for
+                    // read because Replace uses MoveFileEx semantics that don't
+                    // require exclusive access on the destination.
+                    File.Replace(tempPath, atbxPath, backupPath);
+                }
+                catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)
+                {
+                    throw new Exception(
+                        $"Could not replace '{Path.GetFileName(atbxPath)}' — most likely Pro " +
+                        $"has it (or a model referencing it) open in a ModelBuilder canvas. " +
+                        $"Close all ModelBuilder canvas tabs and retry. ({ex.GetType().Name}: {ex.Message})",
+                        ex);
+                }
+
+                // File.Replace leaves the backup on disk; clean it up.
+                try { File.Delete(backupPath); } catch { /* best-effort */ }
+            }
+            finally
+            {
+                try { if (File.Exists(tempPath))   File.Delete(tempPath);   } catch { }
+                try { if (File.Exists(backupPath)) File.Delete(backupPath); } catch { }
+            }
+        }
+
+        /// <summary>
         /// Pure function: given a manifest JSON string, returns an updated manifest
         /// JsonNode with <paramref name="toolName"/> added to the &lt;root&gt; toolset's
         /// tools list (idempotent — no-op if already present).
@@ -1202,6 +1543,22 @@ namespace APBridgeAddIn.ModelBuilder
     }
 
     /// <summary>
+    /// What kind of tool a process invokes. The bridge can step-execute
+    /// <see cref="GpTool"/> directly; the other kinds need Pro's ribbon to run.
+    /// <see cref="Iterator"/> is the legacy <c>model_tool</c> path that
+    /// pre-dated <c>tool_type</c>; both ModelBuilder iterators and (older)
+    /// nested-model references land there.
+    /// </summary>
+    internal enum ToolKind
+    {
+        GpTool,
+        ScriptTool,
+        NestedModel,
+        Iterator,
+        Unknown
+    }
+
+    /// <summary>
     /// A single process (tool invocation) in the model. Params is ordered by JSON
     /// insertion — which empirically matches the GP tool's declared slot order.
     /// </summary>
@@ -1210,6 +1567,7 @@ namespace APBridgeAddIn.ModelBuilder
         public string Id { get; init; } = "";
         public string Name { get; init; } = "";
         public string Tool { get; init; } = "";
+        public ToolKind Kind { get; init; } = ToolKind.GpTool;
         public bool IsIterator { get; init; }
         public Dictionary<string, ModelParam> Params { get; init; } = new();
     }
