@@ -334,6 +334,15 @@ namespace APBridgeAddIn
                             // (for FeatureLayer) geometry type, feature count, source path.
                             props["isVisible"] = layer.IsVisible;
 
+                            try { props["transparency"] = layer.Transparency; } catch { }
+                            try
+                            {
+                                if (layer is BasicFeatureLayer bflDq &&
+                                    !string.IsNullOrEmpty(bflDq.DefinitionQuery))
+                                    props["definitionQuery"] = bflDq.DefinitionQuery;
+                            }
+                            catch { }
+
                             try
                             {
                                 var sr = layer.GetSpatialReference();
@@ -1136,6 +1145,13 @@ namespace APBridgeAddIn
 
                 case "pro.getLayerSymbology":
                     return await HandleGetLayerSymbology(req.Args);
+
+                // ─── Analysis ───────────────────────────────────────────────
+                case "pro.getFieldStatistics":
+                    return await HandleGetFieldStatistics(req.Args);
+
+                case "pro.selectByLocation":
+                    return await HandleSelectByLocation(req.Args);
 
                 // ─── Catalog / Data Discovery ───────────────────────────────
                 case "pro.listGdbContents":

@@ -107,6 +107,15 @@ Check ($he.ok) 'has_edits'
 $se = Op pro.saveEdits
 Check ($se.ok -and $se.data.savedEdits) 'save_edits'
 
+Write-Host "== analysis =="
+$fs = Op pro.getFieldStatistics @{ layer = 'McpEditTestPt'; field = 'NAME' }
+Check ($fs.ok -and $fs.data.totalRows -ge 1 -and $fs.data.topValues.Count -ge 1) 'get_field_statistics' ($fs | ConvertTo-Json -Compress -Depth 4)
+
+# alpha point sits exactly on a vertex of the scratch line — intersect selects it
+$sbl = Op pro.selectByLocation @{ layer = 'McpEditTestPt'; selectFeatures = 'McpEditTestLn' }
+Check ($sbl.ok -and $sbl.data.selectedCount -ge 1) 'select_by_location' ($sbl | ConvertTo-Json -Compress -Depth 3)
+Op pro.clearSelection | Out-Null
+
 Write-Host "== display properties =="
 $dq = Op pro.setDefinitionQuery @{ layer = 'McpEditTestPt'; where = 'OBJECTID > 0' }
 Check ($dq.ok -and -not $dq.data.cleared) 'set_definition_query'
