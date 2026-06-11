@@ -1376,6 +1376,62 @@ namespace ArcGisMcpServer.Tools
             return FormatResult(r, "pro.getLayerSymbology");
         }
 
+        // ─── Analysis ────────────────────────────────────────────────────
+
+        [McpServerTool, Description(
+            "Scan one field of a layer/table and return its value profile: " +
+            "total/null counts, distinct count, the most frequent values with " +
+            "counts, and min/max/mean for numeric fields. Use BEFORE writing a " +
+            "WHERE clause (see actual values, not guessed ones) or choosing a " +
+            "symbology field. Optional 'where' pre-filters the scan.")]
+        public static async Task<string> GetFieldStatistics(
+            [Description("Layer or standalone table name (matches list_layers)")] string layer,
+            [Description("Field name to profile")] string field,
+            [Description("Optional: SQL WHERE clause to scan a subset")] string? where = null,
+            [Description("Optional: how many top values to return (default 20, max 100)")] int topN = 20,
+            [Description("Optional: map name. Default: active map.")] string? map = null)
+        {
+            var args = new Dictionary<string, string>
+            {
+                ["layer"] = layer,
+                ["field"] = field,
+                ["topN"] = topN.ToString(System.Globalization.CultureInfo.InvariantCulture)
+            };
+            if (!string.IsNullOrWhiteSpace(where)) args["where"] = where;
+            if (!string.IsNullOrWhiteSpace(map)) args["map"] = map;
+            var r = await _client!.OpAsync("pro.getFieldStatistics", args);
+            return FormatResult(r, "pro.getFieldStatistics");
+        }
+
+        [McpServerTool, Description(
+            "Select features in one layer based on their spatial relationship " +
+            "to another layer's features (intersect, within distance, contains, " +
+            "etc.). Returns the resulting selected count. Combine with " +
+            "select_by_attribute via selectionType (NEW_SELECTION, " +
+            "ADD_TO_SELECTION, REMOVE_FROM_SELECTION, SUBSET_SELECTION). " +
+            "Remember selections silently restrict later GP tool inputs — " +
+            "clear_selection when done.")]
+        public static async Task<string> SelectByLocation(
+            [Description("Target layer whose features get selected")] string layer,
+            [Description("Layer whose geometry does the selecting")] string selectFeatures,
+            [Description("Optional: spatial relationship — INTERSECT (default), WITHIN_A_DISTANCE, CONTAINS, WITHIN, COMPLETELY_CONTAINS, COMPLETELY_WITHIN, HAVE_THEIR_CENTER_IN, SHARE_A_LINE_SEGMENT_WITH, BOUNDARY_TOUCHES, CROSSED_BY_THE_OUTLINE_OF, ARE_IDENTICAL_TO")] string? overlapType = null,
+            [Description("Optional: distance for WITHIN_A_DISTANCE, e.g. '500 Meters'")] string? searchDistance = null,
+            [Description("Optional: NEW_SELECTION (default), ADD_TO_SELECTION, REMOVE_FROM_SELECTION, SUBSET_SELECTION")] string? selectionType = null,
+            [Description("Optional: invert the spatial relationship (default false)")] bool invert = false)
+        {
+            var args = new Dictionary<string, string>
+            {
+                ["layer"] = layer,
+                ["selectFeatures"] = selectFeatures
+            };
+            if (!string.IsNullOrWhiteSpace(overlapType)) args["overlapType"] = overlapType;
+            if (!string.IsNullOrWhiteSpace(searchDistance)) args["searchDistance"] = searchDistance;
+            if (!string.IsNullOrWhiteSpace(selectionType)) args["selectionType"] = selectionType;
+            if (invert) args["invert"] = "true";
+            var r = await _client!.OpAsync("pro.selectByLocation", args);
+            return FormatResult(r, "pro.selectByLocation");
+        }
+
         // ─── Catalog / Data Discovery ────────────────────────────────────
 
         [McpServerTool, Description(

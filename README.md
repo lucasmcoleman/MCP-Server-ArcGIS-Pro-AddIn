@@ -1,6 +1,6 @@
 # ArcGIS Pro MCP Bridge
 
-An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that lets MCP clients — Claude Code, GitHub Copilot Agent Mode, M365 Copilot Studio, Anthropic API integrations, anything that speaks MCP — drive **ArcGIS Pro** in real time. The server brokers calls over a named pipe to an in-process Pro Add-In, exposing 43 tools spanning layer introspection, map operations, project lifecycle, geoprocessing, ModelBuilder, and layout production.
+An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that lets MCP clients — Claude Code, GitHub Copilot Agent Mode, M365 Copilot Studio, Anthropic API integrations, anything that speaks MCP — drive **ArcGIS Pro** in real time. The server brokers calls over a named pipe to an in-process Pro Add-In, exposing **82 tools** spanning layer introspection, map operations, editing, symbology, project lifecycle, geoprocessing (with dynamic tool-schema discovery), ModelBuilder, layout production, an in-process **Python/arcpy escape hatch**, and **map-view capture** so the agent can literally see the map it's making.
 
 Two transports are supported in the same binary:
 - **stdio** (default) — for local clients that spawn the server as a subprocess (`.mcp.json` in Claude Code, etc.)
@@ -11,7 +11,10 @@ Two transports are supported in the same binary:
 ## What it does
 
 - **Drive Pro from natural language.** Ask the agent to "buffer the West Coast states by 50 miles, dissolve, calculate area in square miles, then export a PDF" and it chains the right MCP tools together.
-- **43 first-class tools** across 7 domains (full list below). All return structured JSON, not opaque strings — agents can introspect errors and chain operations programmatically.
+- **82 first-class tools** across 12 domains (full list below). All return structured JSON, not opaque strings — agents can introspect errors and chain operations programmatically.
+- **The agent can SEE the map.** `capture_map_view` exports the live map view to PNG; combined with symbology/labeling/layout tools this closes the see-act-verify loop for cartography.
+- **Full arcpy access.** `execute_python` runs arbitrary Python in-process in Pro's embedded interpreter — `arcpy.mp.ArcGISProject('CURRENT')` manipulates the open project, stdout is captured, tracebacks come back for self-correction.
+- **GP tool self-service.** `describe_gp_tool` / `search_gp_tools` read Pro's installed system-toolbox metadata at runtime, so the agent gets exact positional signatures, types, coded-value domains, and defaults for ~1,700 system tools instead of guessing.
 - **Multi-Pro routing.** Each Pro instance binds a per-PID pipe and writes a registry entry; the MCP server picks the right one (most-recent-started, or by `ARCGIS_PROJECT` env var).
 - **Survives Pro restarts mid-session.** The MCP server re-discovers the live pipe on every request, so closing and reopening Pro doesn't require restarting your MCP client.
 - **Robust error handling.** Silent failures fail loud (`Layer not found: X` instead of `0`); slow operations don't time out prematurely (default 120s); typed-return tools surface bridge errors as structured JSON instead of getting swallowed by the MCP SDK's generic-error wrapper.
@@ -111,7 +114,57 @@ All tools return JSON strings. Success returns the operation's data payload; fai
 ### Geoprocessing
 | Tool | Purpose |
 |---|---|
-| `run_gp_tool` | Run any GP tool (`analysis.Buffer`, `management.AddField`, etc.). Handles value-table parameters via two-level JSON arrays. |
+| `run_gp_tool` | Run any GP tool (`analysis.Buffer`, `management.AddField`, etc.). Positional params with `"#"` skip-sentinel, value-tables via two-level JSON arrays, optional per-call environment overrides (`extent`, `mask`, `cellSize`, ...). Returns derived output paths. |
+| `describe_gp_tool` | Exact positional signature + types + domains + defaults for any of ~1,700 system tools (parsed live from Pro's installed toolbox metadata) |
+| `search_gp_tools` | Keyword search across all system tool names |
+| `execute_python` | Run arbitrary Python in Pro's embedded interpreter — full arcpy + `'CURRENT'` project access, stdout capture, traceback surfacing. Refused with a retry hint during the ~3-min post-launch Python warm-up window. |
+
+### Vision & camera
+| Tool | Purpose |
+|---|---|
+| `capture_map_view` | Export the active map view to PNG — the agent's eyes |
+| `zoom_to_extent` / `zoom_to_scale` / `zoom_to_selected` | Camera control by bbox, scale denominator, or selection |
+| `list_bookmarks` / `zoom_to_bookmark` / `create_bookmark` | Spatial bookmarks |
+
+### Editing
+| Tool | Purpose |
+|---|---|
+| `update_features` | Set attribute values on rows matched by WHERE or OID list (transactional, undo-able, 10k cap) |
+| `delete_features` | Delete rows matched by WHERE or OID list (explicit filter required) |
+| `add_polyline_features` | Insert polylines from `[{vertices: [[x,y],...], attributes}]` JSON (completes the point/polygon/polyline trio) |
+| `save_edits` / `discard_edits` / `has_edits` | Edit-session control — edits persist only after `save_edits` |
+
+### Symbology & display
+| Tool | Purpose |
+|---|---|
+| `set_layer_renderer` | Simple (RGB fill/outline/size), unique-values, or graduated-colors renderers with color ramps |
+| `get_layer_symbology` | Summary of the current renderer |
+| `set_definition_query` | Persistently filter what a layer shows AND what GP sees |
+| `set_layer_transparency` | 0–100 transparency |
+| `set_labeling` | Labels on/off with a field shortcut or full Arcade expression |
+
+### Map administration
+| Tool | Purpose |
+|---|---|
+| `create_map` / `open_map_view` | Create maps; activate a map view (switches the implicit target of active-map tools) |
+| `set_basemap` | Swap basemap layers by Esri basemap name |
+
+### Analysis helpers
+| Tool | Purpose |
+|---|---|
+| `get_field_statistics` | One-pass field profile: null/distinct counts, top values by frequency, min/max/mean — for grounding WHERE clauses in real values |
+| `select_by_location` | Spatial selection (intersect, within-distance, contains, ...) returning the selected count |
+
+### Catalog / data discovery
+| Tool | Purpose |
+|---|---|
+| `list_gdb_contents` | Feature classes / tables / rasters in any file GDB — no map membership needed (verify GP outputs landed) |
+| `describe_dataset` | Schema + SR + extent + row count of any dataset by path |
+
+### Advanced
+| Tool | Purpose |
+|---|---|
+| `bridge_op` | Raw escape hatch: call any Add-In op by name with JSON args (reach new ops before the MCP server is rebuilt) |
 
 ### ModelBuilder
 | Tool | Purpose |
@@ -156,6 +209,9 @@ Three patterns cover most cases:
 | `list_layout_elements` | Map frames, text elements, etc. on a layout |
 | `set_layout_text` | Update a text element's content |
 | `add_map_frame_to_layout` | Place a map frame on a layout and bind it to a map |
+| `add_legend` / `add_north_arrow` / `add_scale_bar` | Map surrounds bound to a frame (system style items) |
+| `add_layout_text` | New free text element (title/credits) at top-left-inch coordinates |
+| `set_map_frame_extent` | Point a frame's camera at a layer or explicit envelope |
 | `export_layout` | PDF / PNG / JPG / TIFF / SVG export |
 
 ---
@@ -486,11 +542,22 @@ MCP-Server-ArcGIS-Pro-AddIn/
 │       ├── Config.daml                # Add-In manifest (GUID, version, autoLoad)
 │       ├── Module1.cs                 # Module init/uninit + project event subscriptions
 │       ├── Button1.cs                 # Optional UI button (start/stop bridge)
-│       ├── ProBridgeService.cs        # Named-pipe server + 28 op handlers
+│       ├── ProBridgeService.cs        # Concurrent named-pipe server + dispatcher + core handlers
+│       ├── ProBridgeService.View.cs   # capture_map_view, camera, bookmarks
+│       ├── ProBridgeService.Editing.cs    # update/delete features, polylines, edit session
+│       ├── ProBridgeService.MapAdmin.cs   # create map, basemap, def query, labeling
+│       ├── ProBridgeService.Layout.cs     # legend, north arrow, scale bar, text, frame extent
+│       ├── ProBridgeService.Symbology.cs  # renderers (simple/unique/graduated)
+│       ├── ProBridgeService.Catalog.cs    # GDB contents, dataset describe
+│       ├── ProBridgeService.Analysis.cs   # field statistics, select-by-location
+│       ├── ProBridgeService.Python.cs     # execute_python (CalculateValue channel + warm-up gate)
+│       ├── ProBridgeService.GpCatalog.cs  # describe/search GP tools
 │       ├── BridgeRegistry.cs          # Per-PID registry write/update/cleanup
 │       ├── IpcModels.cs               # IpcRequest / IpcResponse records
 │       ├── ModelBuilder/
-│       │   └── AtbxManager.cs         # Model JSON ↔ .atbx ZIP marshalling
+│       │   ├── AtbxManager.cs         # Model JSON ↔ .atbx ZIP marshalling
+│       │   ├── GpToolCatalog.cs       # Hand-pinned signatures (win over dynamic)
+│       │   └── SystemToolboxCatalog.cs# Runtime schemas from Pro's installed toolboxes
 │       └── APBridgeAddIn.csproj       # MSBuild project (Pro SDK targets)
 │
 ├── McpServer/
@@ -505,6 +572,11 @@ MCP-Server-ArcGIS-Pro-AddIn/
 │       ├── Dockerfile
 │       └── ArcGisMcpServer.csproj
 │
+├── tools/
+│   ├── Invoke-BridgeOp.ps1            # Direct named-pipe client (debug without MCP)
+│   └── Test-BridgeLive.ps1            # 41-check live smoke battery (run with Pro open)
+├── tests/
+│   └── AtbxTests/                     # Out-of-process .atbx round-trip suite (no Pro needed)
 ├── .mcp.json                          # MCP manifest (points at published exe)
 ├── build-mcp-server.ps1               # Single-file publish helper
 ├── restart-dev-cycle.ps1              # Wipe AssemblyCache + rebuild MCP in one shot

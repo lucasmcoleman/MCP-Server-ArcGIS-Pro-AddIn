@@ -110,7 +110,18 @@ ATBX files are plain ZIPs with a UTF-8 JSON layout — not SQLite. Each model li
 
 `AtbxManager.WalkModel` is the authoritative reader; `GenerateModelFiles` is the authoritative writer. Both round-trip the simplified JSON definition shape (the same shape `describe_model` returns and `create_model`/`update_model` accept).
 
+## Testing
+
+- **`dotnet run --project tests/AtbxTests -c Release`** — out-of-process round-trip suite for the ModelBuilder file layer (compiles AtbxManager + catalogs by source inclusion; no Pro needed). Run after any AtbxManager/GpToolCatalog/SystemToolboxCatalog change.
+- **`./tools/Test-BridgeLive.ps1`** — 41-check live smoke battery over the named pipe (Pro must be open, AFTER the Python warm-up window). Run after any Add-In deploy.
+- **`./tools/Invoke-BridgeOp.ps1 -Op pro.X -Args @{...}`** — one-off bridge op without the MCP server in the loop. This is how to test new ops when a Claude Code session holds the published exe lock.
+
 ## Things that bite
+
+- **Python-backed GP wedges if called too early after Pro launch.** A Python-touching GP call (CalculateValue, CalculateField w/ Python, script tools) in the first ~minutes of a Pro session can hang forever AND permanently wedge the GP Python lane for that session (native tools keep working). `pro.executePython` self-gates for 180s of Pro uptime and returns a retry hint; don't remove that gate. If the lane is wedged, only a Pro restart clears it.
+- **Out-of-project .pyt paths hang ExecuteToolAsync.** `ExecuteToolAsync(@"C:\path\bridge.pyt\Tool")` never returns in-proc (the identical .pyt runs fine via propy.bat). That's why `execute_python` rides `management.CalculateValue` (system-tool resolution) with base64 code in the code_block. Don't resurrect the deployed-toolbox design.
+- **Never launch Pro from an agent shell with `Start-Process`.** Pro inherits the shell's environment; a bloated/corrupt PATH breaks conda activation ("input line is too long") and Python init. Launch via `C:\Windows\explorer.exe "<path>.aprx"` so Pro gets Explorer's clean environment.
+- **Pro shutdown can hang at "Shutting down..."** (and silently refuses CloseMainWindow while GP calls are pending). Check `MainWindowTitle` before assuming the close worked.
 
 - **Never auto-kill ArcGIS Pro.** The standard rule is to ask the user to close Pro before any redeploy. The build script refuses to overwrite a running MCP exe; the Add-In bundle is the user's responsibility to copy in. Exception: when the user has explicitly granted permission for a specific task (e.g., overnight automation), launching Pro via `& "C:\Program Files\ArcGIS\Pro\bin\ArcGISPro.exe" "<aprx path>"` may still get stuck on Pro's Start Page or sign-in dialog — those modals require human clicks.
 - **`Geoprocessing.MakeEnvironmentArray` is a named-argument method, not a Dictionary-taker.** Passing `Dictionary<string,object>` positionally binds it to the first parameter (`workspace`) and produces a `RuntimeBinderException` about `MapMember`. Use named-arg syntax: `MakeEnvironmentArray(overwriteoutput: true, workspace: gdb)`.
