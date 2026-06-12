@@ -594,6 +594,7 @@ namespace APBridgeAddIn.ModelBuilder
                 {
                     Id = id,
                     Name = name,
+                    DisplayName = Resolve(title, name),
                     Type = TryGetString(v?["datatype"]?["type"]),
                     StoredValue = TryGetString(v?["value"]),
                     IsParameter = TryGetString(v?["connection_type"]) == "Parameter",
@@ -1908,6 +1909,10 @@ namespace APBridgeAddIn.ModelBuilder
     {
         public string Id { get; init; } = "";
         public string Name { get; init; } = "";
+        /// <summary>Resolved display title ("Output Workspace"). ModelBuilder's
+        /// %VarName% literal substitution uses THIS label, while Name carries
+        /// the underscored param_name — the executor must match both.</summary>
+        public string? DisplayName { get; init; }
         public string? Type { get; init; }
         public string? StoredValue { get; init; }
         public bool IsParameter { get; init; }
