@@ -475,6 +475,79 @@ namespace APBridgeAddIn.ModelBuilder
         }
 
         /// <summary>
+        /// Reads the declared parameter signature of ANY tool (script tool,
+        /// model tool) in an .atbx by parsing its tool.content. Returns slots
+        /// in declared order — which is the arcpy positional calling order —
+        /// or null when the toolbox isn't an .atbx ZIP / the tool isn't found
+        /// (legacy binary .tbx toolboxes can't be parsed this way).
+        ///
+        /// Slots flagged <c>IsDerivedOutput</c> are declared with
+        /// type:"derived" — arcpy EXCLUDES derived parameters from the calling
+        /// signature, so executors must skip them when building positional
+        /// value arrays (but still map their runtime value for downstream refs).
+        /// </summary>
+        public static List<ToolSlot>? GetToolSignature(string toolboxPath, string toolName)
+        {
+            try
+            {
+                using var zip = ZipFile.OpenRead(toolboxPath);
+                var content = ReadJsonEntry<JsonNode>(zip, $"{toolName}.tool/tool.content");
+                if (content?["params"] is not JsonObject paramsObj) return null;
+
+                var slots = new List<ToolSlot>();
+                foreach (var kv in paramsObj)
+                {
+                    var po = kv.Value as JsonObject;
+                    var slotType = TryGetString(po?["type"]);
+                    var direction = TryGetString(po?["direction"]);
+                    slots.Add(new ToolSlot
+                    {
+                        Name = kv.Key,
+                        IsOutput = string.Equals(direction, "out", StringComparison.OrdinalIgnoreCase),
+                        IsDerivedOutput = string.Equals(slotType, "derived", StringComparison.OrdinalIgnoreCase),
+                    });
+                }
+                return slots.Count > 0 ? slots : null;
+            }
+            catch
+            {
+                // Not a ZIP (.tbx), unreadable, malformed — caller falls back
+                // to the model's own param insertion order.
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Resolves a process 'path' reference (ScriptTool / ModelTool header)
+        /// to (toolboxPath, toolName). Three shapes occur in real models:
+        ///   "Name"                          → tool in the SAME toolbox
+        ///   "..\..\Other\Box.tbx\Name"      → relative to the .atbx treated
+        ///                                     as a DIRECTORY (one '..' exits
+        ///                                     the atbx itself) — this is how
+        ///                                     Pro records cross-toolbox refs
+        ///   "C:\full\path\Box.atbx\Name"    → absolute
+        /// </summary>
+        public static (string ToolboxPath, string ToolName) ResolveToolReference(
+            string atbxPath, string rawPath)
+        {
+            var raw = (rawPath ?? "").Trim();
+            if (raw.Length == 0) return (atbxPath, raw);
+            // Bare name (no separators) → same toolbox.
+            if (!raw.Contains('\\') && !raw.Contains('/'))
+                return (atbxPath, raw);
+
+            string full = Path.IsPathRooted(raw)
+                ? raw
+                // Pro's relative refs treat the .atbx file as a directory level:
+                // base at the atbx path itself, so "..\.." exits atbx then folder.
+                : Path.GetFullPath(Path.Combine(atbxPath, raw));
+
+            var toolName = Path.GetFileName(full);
+            var toolbox = Path.GetDirectoryName(full) ?? atbxPath;
+            return (toolbox, toolName);
+        }
+
+        /// <summary>
         /// Parses the .atbx model into a graph suitable for step-by-step execution.
         /// Unlike <see cref="DescribeModel"/>, this preserves variable IDs and the
         /// raw param structure (refs vs. literals vs. outputs) so that the executor
@@ -1865,11 +1938,25 @@ namespace APBridgeAddIn.ModelBuilder
     }
 
     /// <summary>
+    /// One declared parameter slot of a tool, read from its tool.content.
+    /// Order of a List&lt;ToolSlot&gt; is the arcpy positional calling order.
+    /// </summary>
+    internal class ToolSlot
+    {
+        public string Name { get; init; } = "";
+        public bool IsOutput { get; init; }
+        /// <summary>Derived outputs are excluded from the calling signature.</summary>
+        public bool IsDerivedOutput { get; init; }
+    }
+
+    /// <summary>
     /// What kind of tool a process invokes. The bridge can step-execute
-    /// <see cref="GpTool"/> directly; the other kinds need Pro's ribbon to run.
-    /// <see cref="Iterator"/> is the legacy <c>model_tool</c> path that
-    /// pre-dated <c>tool_type</c>; both ModelBuilder iterators and (older)
-    /// nested-model references land there.
+    /// <see cref="GpTool"/> and (since the nested-execution work) recurse into
+    /// <see cref="NestedModel"/> steps and dispatch <see cref="ScriptTool"/>
+    /// steps by qualified path. <see cref="Iterator"/> is the legacy
+    /// <c>model_tool</c> path that pre-dated <c>tool_type</c>; both
+    /// ModelBuilder iterators and (older) nested-model references land there
+    /// and still require Pro's ribbon.
     /// </summary>
     internal enum ToolKind
     {

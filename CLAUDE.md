@@ -93,7 +93,7 @@ The script verifies Pro is closed, rebuilds the Add-In, wipes the per-user Assem
 
 When a `run_model` failure surfaces, check the bridge log at the active project's home folder for the actual GP error code — Aurora model debugging history is full of cases where the MCP client gave up before the bridge could return the real error.
 
-The executor rejects non-`gpTool` step kinds with a kind-specific error: `scriptTool` and `nestedModel` steps round-trip cleanly through reader and writer (so `update_model` doesn't drop them), but executing them step-by-step is out-of-scope. Run those models via Pro's ribbon, or via `start_run_model` if Pro's whole-model executor handles the chain.
+The executor now runs `scriptTool` and `nestedModel` steps too: nested models hosted in an `.atbx` are RECURSED through the same step-by-step engine (preserving the first-run fix; cycle + depth-8 guards); script tools (and `.tbx`-hosted nested models, which can't be parsed) dispatch by qualified path via `ExecuteToolAsync("<toolbox>\<tool>")`. Their positional signature comes from `AtbxManager.GetToolSignature` (the target's own `tool.content`; declared order = arcpy calling order, `type:"derived"` params EXCLUDED from the call array per arcpy contract — recorded via the in-place pre-pass + refined from `ReturnValue`). Cross-toolbox `path` refs (`..\..\Other\Box.tbx\Tool`) resolve relative to the .atbx treated as a DIRECTORY (`AtbxManager.ResolveToolReference`). Only `iterator`/unknown kinds are still rejected. Script-tool steps are Python — the post-launch warm-up wedge applies.
 
 ### Adding a `.atbx` write path
 
