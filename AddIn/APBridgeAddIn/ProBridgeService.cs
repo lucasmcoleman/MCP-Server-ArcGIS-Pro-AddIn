@@ -2764,6 +2764,26 @@ namespace APBridgeAddIn
                 foreach (var k in unknownKeys) namedValues.Remove(k);
             }
 
+            // Base directory for resolving relative catalog paths stored in the
+            // model ("Store relative path names" projects write ".\X.gdb\FC" /
+            // "..\Other\Y.gdb\FC"). Pro resolves these against the toolbox's
+            // home folder at run time; passing them through verbatim makes
+            // arcpy resolve them against an arbitrary CWD → ERROR 000875 etc.
+            string toolboxDir;
+            try { toolboxDir = System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(path)) ?? ""; }
+            catch { toolboxDir = ""; }
+
+            string ResolveRelative(string? value)
+            {
+                if (string.IsNullOrEmpty(value) || toolboxDir.Length == 0) return value ?? "";
+                var t = value.TrimStart();
+                bool rel = t.StartsWith(@".\") || t.StartsWith("./")
+                        || t.StartsWith(@"..\") || t.StartsWith("../");
+                if (!rel) return value;
+                try { return System.IO.Path.GetFullPath(System.IO.Path.Combine(toolboxDir, t)); }
+                catch { return value; }
+            }
+
             // Seed the runtime variable map: variable id → value (path or literal).
             // User-supplied input values win over the variable's stored default.
             // Intermediate variables that have an explicit stored path are pre-
@@ -2774,7 +2794,7 @@ namespace APBridgeAddIn
                 if (v.IsParameter && namedValues.TryGetValue(v.Name, out var userVal))
                     runtimeValues[v.Id] = userVal;
                 else if (!string.IsNullOrEmpty(v.StoredValue))
-                    runtimeValues[v.Id] = v.StoredValue;
+                    runtimeValues[v.Id] = ResolveRelative(v.StoredValue);
             }
 
             // Workspace for generating derived-output paths. Same source as
@@ -2829,7 +2849,7 @@ namespace APBridgeAddIn
                             }
                             else if (pm.LiteralValue != null)
                             {
-                                val = SubstituteModelVars(pm.LiteralValue, graph, runtimeValues);
+                                val = ResolveRelative(SubstituteModelVars(pm.LiteralValue, graph, runtimeValues));
                             }
                             if (!string.IsNullOrEmpty(val)) childNamed[slotName] = val!;
                         }
@@ -3043,7 +3063,7 @@ namespace APBridgeAddIn
                     }
                     else if (pm.LiteralValue != null)
                     {
-                        values.Add(SubstituteModelVars(pm.LiteralValue, graph, runtimeValues));
+                        values.Add(ResolveRelative(SubstituteModelVars(pm.LiteralValue, graph, runtimeValues)));
                     }
                     else
                     {
@@ -3065,7 +3085,7 @@ namespace APBridgeAddIn
                         if (envParam.RefVariableId != null)
                             runtimeValues.TryGetValue(envParam.RefVariableId, out envVal);
                         else if (envParam.LiteralValue != null)
-                            envVal = SubstituteModelVars(envParam.LiteralValue, graph, runtimeValues);
+                            envVal = ResolveRelative(SubstituteModelVars(envParam.LiteralValue, graph, runtimeValues));
                         if (string.IsNullOrEmpty(envVal)) continue;
 
                         merged.RemoveAll(kv => kv.Key.Equals(envKey, StringComparison.OrdinalIgnoreCase));
