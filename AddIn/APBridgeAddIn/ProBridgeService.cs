@@ -2650,12 +2650,29 @@ namespace APBridgeAddIn
                 }
             }
 
+            // Optional variable overrides: like 'parameters' but applies to ANY
+            // model variable by name, not just exposed parameters. The repair
+            // lever for models authored against project map layers — an agent
+            // can resolve bare layer names ("Farmland_CVWD_HUC8") to dataset
+            // paths and run the model without that project/map being open.
+            Dictionary<string, string>? varOverrides = null;
+            if (args.TryGetValue("variableOverrides", out string? ovJson) && !string.IsNullOrWhiteSpace(ovJson))
+            {
+                var ovNode = JsonNode.Parse(ovJson)?.AsObject();
+                if (ovNode != null)
+                {
+                    varOverrides = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var kv in ovNode)
+                        varOverrides[kv.Key] = CoerceScalarToString(kv.Value);
+                }
+            }
+
             var allMessages = new List<object>();
             var outcome = await ExecuteGraphAsync(
                 path, modelName, namedValues, job,
                 allMessages, stepPrefix: "",
                 inFlight: new HashSet<string>(StringComparer.OrdinalIgnoreCase),
-                depth: 0);
+                depth: 0, varOverrides);
 
             if (!outcome.Ok)
                 return new(false, outcome.Error, outcome.ErrorData);
@@ -2691,7 +2708,8 @@ namespace APBridgeAddIn
             List<object> allMessages,
             string stepPrefix,
             HashSet<string> inFlight,
-            int depth)
+            int depth,
+            Dictionary<string, string>? varOverrides = null)
         {
             bool isRoot = depth == 0;
             if (depth > 8)
@@ -2798,6 +2816,18 @@ namespace APBridgeAddIn
                     runtimeValues[v.Id] = userVal;
                 else if (!string.IsNullOrEmpty(v.StoredValue))
                     runtimeValues[v.Id] = ResolveRelative(v.StoredValue);
+            }
+
+            // Direct variable overrides (any variable, by name or display name)
+            // beat both user parameter values and stored defaults. Root only.
+            if (varOverrides is { Count: > 0 })
+            {
+                foreach (var v in graph.Variables.Values)
+                {
+                    if (varOverrides.TryGetValue(v.Name, out var ov)
+                        || (v.DisplayName != null && varOverrides.TryGetValue(v.DisplayName, out ov)))
+                        runtimeValues[v.Id] = ov;
+                }
             }
 
             // Stored values themselves can embed %Var% references (intermediate
