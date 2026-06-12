@@ -2619,6 +2619,8 @@ namespace APBridgeAddIn
             public string? Error;
             public object? ErrorData;
             public int StepsRun;
+            /// <summary>Not-ready (valid=false) steps that failed and were skipped.</summary>
+            public int SkippedSteps;
             /// <summary>Final values of the model's Parameter variables, by name —
             /// how a parent maps a nested model's outputs back onto its own slots.</summary>
             public Dictionary<string, string> ParamOutputs = new(StringComparer.OrdinalIgnoreCase);
@@ -2662,6 +2664,7 @@ namespace APBridgeAddIn
             {
                 success = true,
                 stepsRun = outcome.StepsRun,
+                skippedNotReadySteps = outcome.SkippedSteps,
                 messages = allMessages
             });
         }
@@ -2822,6 +2825,7 @@ namespace APBridgeAddIn
 
             var env = DefaultRunEnvironments();
             int completedSteps = 0;
+            int skippedSteps = 0;
             // Derived-output names assigned this run. Distinct variable names can
             // sanitize to the same GDB name ("Clip Output" vs "Clip_Output");
             // with overwriteoutput pinned true the later step would silently
@@ -2875,6 +2879,15 @@ namespace APBridgeAddIn
                             stepPrefix + proc.Name + " > ", inFlight, depth + 1);
                         if (!childOutcome.Ok)
                         {
+                            if (proc.MarkedInvalid)
+                            {
+                                skippedSteps++;
+                                var skipMsg = new { step = stepPrefix + proc.Name, type = "Warning",
+                                    text = $"Skipped not-ready (valid=false) nested step after failure: {childOutcome.Error}" };
+                                allMessages.Add(skipMsg);
+                                if (job != null) { lock (job.Lock) job.Messages.Add(skipMsg); }
+                                continue;
+                            }
                             return new GraphRunOutcome
                             {
                                 Error = $"Nested model step '{stepPrefix}{proc.Name}' ({childTool}) failed: {childOutcome.Error}",
@@ -3133,6 +3146,20 @@ namespace APBridgeAddIn
                               + "or click on a map view in Pro and retry.]";
                     }
 
+                    // Not-ready steps (ModelBuilder valid="false") are best-effort:
+                    // Pro's own canvas runs skip them, so a failure here warns and
+                    // continues instead of killing the run. A step the model
+                    // considers VALID failing is a real error — abort as before.
+                    if (proc.MarkedInvalid)
+                    {
+                        skippedSteps++;
+                        var skipMsg = new { step = stepPrefix + proc.Name, type = "Warning",
+                            text = $"Skipped not-ready (valid=false) step after failure: {msgs}" };
+                        allMessages.Add(skipMsg);
+                        if (job != null) { lock (job.Lock) job.Messages.Add(skipMsg); }
+                        continue;
+                    }
+
                     return new GraphRunOutcome
                     {
                         Error = $"Step '{stepPrefix}{proc.Name}' ({executeTool}) failed: {msgs}",
@@ -3172,7 +3199,7 @@ namespace APBridgeAddIn
 
             // Expose final Parameter-variable values so a parent model (or the
             // future) can map this graph's outputs by name.
-            var outcome = new GraphRunOutcome { Ok = true, StepsRun = completedSteps };
+            var outcome = new GraphRunOutcome { Ok = true, StepsRun = completedSteps, SkippedSteps = skippedSteps };
             foreach (var v in graph.Variables.Values)
             {
                 if (v.IsParameter && runtimeValues.TryGetValue(v.Id, out var pv) && !string.IsNullOrEmpty(pv))
