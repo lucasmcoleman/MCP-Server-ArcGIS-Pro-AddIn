@@ -745,6 +745,11 @@ namespace APBridgeAddIn.ModelBuilder
                     Name = name,
                     Tool = tool,
                     Kind = kind,
+                    // ModelBuilder's not-ready marker (grayed canvas element).
+                    // Stored validity reflects the canvas at last save — steps
+                    // can become runnable once runtime parameter values arrive,
+                    // so executors treat these as best-effort, not as dead.
+                    MarkedInvalid = TryGetString(p?["valid"]) == "false",
                     // Step-by-step execution doesn't have semantics for anything
                     // outside GpTool. The executor's iterator-reject path covers
                     // all non-GP kinds; keep IsIterator true for them so existing
@@ -1982,6 +1987,10 @@ namespace APBridgeAddIn.ModelBuilder
         public string Name { get; init; } = "";
         public string Tool { get; init; } = "";
         public ToolKind Kind { get; init; } = ToolKind.GpTool;
+        /// <summary>True when the model stored valid="false" for this step —
+        /// ModelBuilder's "not ready" state. Executors run these best-effort:
+        /// a failure is logged and skipped rather than aborting the run.</summary>
+        public bool MarkedInvalid { get; init; }
         public bool IsIterator { get; init; }
         public Dictionary<string, ModelParam> Params { get; init; } = new(StringComparer.OrdinalIgnoreCase);
         /// <summary>Variable ids this process is precondition-ordered after (no data link).</summary>
