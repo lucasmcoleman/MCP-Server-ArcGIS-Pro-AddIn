@@ -2797,6 +2797,22 @@ namespace APBridgeAddIn
                     runtimeValues[v.Id] = ResolveRelative(v.StoredValue);
             }
 
+            // Stored values themselves can embed %Var% references (intermediate
+            // output variables routinely store "%Output Workspace%\Clipped_X").
+            // Substitute them against the fully-seeded map — two sweeps so a
+            // value that resolves through another %-bearing value still lands.
+            for (int sweep = 0; sweep < 2; sweep++)
+            {
+                foreach (var key in runtimeValues.Keys.ToList())
+                {
+                    var val = runtimeValues[key];
+                    if (val.IndexOf('%') < 0) continue;
+                    var substituted = SubstituteModelVars(val, graph, runtimeValues);
+                    if (!ReferenceEquals(substituted, val) && substituted != val)
+                        runtimeValues[key] = ResolveRelative(substituted);
+                }
+            }
+
             // Workspace for generating derived-output paths. Same source as
             // DefaultRunEnvironments, but we need the path string directly to
             // build per-step output paths upfront (so downstream refs resolve).
