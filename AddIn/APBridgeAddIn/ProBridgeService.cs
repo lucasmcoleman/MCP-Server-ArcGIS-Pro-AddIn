@@ -3237,10 +3237,22 @@ namespace APBridgeAddIn
                 match =>
                 {
                     var varName = match.Groups[1].Value;
+                    // ModelBuilder writes %Display Name% (the variable's label,
+                    // spaces and all) while v.Name carries the underscored
+                    // param_name — match label, name, and the space/underscore-
+                    // normalized form of each so "%Output Workspace%" finds
+                    // the "Output_Workspace" parameter.
+                    static string Norm(string? s) =>
+                        (s ?? "").Trim().Replace(' ', '_');
+                    var wanted = Norm(varName);
                     foreach (var v in graph.Variables.Values)
                     {
-                        if (!string.Equals(v.Name, varName,
-                            StringComparison.OrdinalIgnoreCase)) continue;
+                        bool hit =
+                            string.Equals(v.Name, varName, StringComparison.OrdinalIgnoreCase) ||
+                            string.Equals(v.DisplayName, varName, StringComparison.OrdinalIgnoreCase) ||
+                            string.Equals(Norm(v.Name), wanted, StringComparison.OrdinalIgnoreCase) ||
+                            string.Equals(Norm(v.DisplayName), wanted, StringComparison.OrdinalIgnoreCase);
+                        if (!hit) continue;
                         if (runtimeValues.TryGetValue(v.Id, out var val)
                             && !string.IsNullOrEmpty(val))
                             return val;
