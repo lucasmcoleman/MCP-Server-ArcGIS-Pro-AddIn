@@ -717,7 +717,11 @@ namespace ArcGisMcpServer.Tools
             [Description("Full file path to the .atbx toolbox file")] string toolboxPath,
             [Description("Name of the model to run")] string modelName,
             [Description("Optional: JSON object mapping parameter names to values, " +
-                "e.g., {\"StudyArea\": \"Counties\", \"BufferDistance\": \"1000 Meters\"}")] string? parameters = null)
+                "e.g., {\"StudyArea\": \"Counties\", \"BufferDistance\": \"1000 Meters\"}")] string? parameters = null,
+            [Description("Optional: JSON object overriding ANY model variable by name " +
+                "(not just exposed parameters). Use to substitute dataset paths for " +
+                "bare map-layer names when running a model without its project open, " +
+                "e.g., {\"Farmland_CVWD\": \"C:\\\\data\\\\x.gdb\\\\Farmland\"}.")] string? variableOverrides = null)
         {
             var args = new Dictionary<string, string>
             {
@@ -726,6 +730,8 @@ namespace ArcGisMcpServer.Tools
             };
             if (!string.IsNullOrWhiteSpace(parameters))
                 args["parameters"] = parameters;
+            if (!string.IsNullOrWhiteSpace(variableOverrides))
+                args["variableOverrides"] = variableOverrides;
 
             var r = await _client!.OpAsync("pro.runModel", args);
             return FormatResult(r, "pro.runModel");
@@ -741,7 +747,9 @@ namespace ArcGisMcpServer.Tools
             [Description("Full file path to the .atbx toolbox file")] string toolboxPath,
             [Description("Name of the model to run")] string modelName,
             [Description("Optional: JSON object mapping parameter names to values, " +
-                "e.g., {\"StudyArea\": \"Counties\", \"BufferDistance\": \"1000 Meters\"}")] string? parameters = null)
+                "e.g., {\"StudyArea\": \"Counties\", \"BufferDistance\": \"1000 Meters\"}")] string? parameters = null,
+            [Description("Optional: JSON object overriding ANY model variable by name " +
+                "(not just exposed parameters) — see run_model for usage.")] string? variableOverrides = null)
         {
             var args = new Dictionary<string, string>
             {
@@ -750,6 +758,8 @@ namespace ArcGisMcpServer.Tools
             };
             if (!string.IsNullOrWhiteSpace(parameters))
                 args["parameters"] = parameters;
+            if (!string.IsNullOrWhiteSpace(variableOverrides))
+                args["variableOverrides"] = variableOverrides;
 
             var r = await _client!.OpAsync("pro.runModelAsync", args);
             return FormatResult(r, "pro.runModelAsync");
