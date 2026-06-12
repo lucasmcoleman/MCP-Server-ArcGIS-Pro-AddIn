@@ -2612,6 +2612,18 @@ namespace APBridgeAddIn
         private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, RunJob>
             _runJobs = new();
 
+        /// <summary>Outcome of one (possibly nested) model-graph execution.</summary>
+        private sealed class GraphRunOutcome
+        {
+            public bool Ok;
+            public string? Error;
+            public object? ErrorData;
+            public int StepsRun;
+            /// <summary>Final values of the model's Parameter variables, by name —
+            /// how a parent maps a nested model's outputs back onto its own slots.</summary>
+            public Dictionary<string, string> ParamOutputs = new(StringComparer.OrdinalIgnoreCase);
+        }
+
         private static async Task<IpcResponse> RunModelCore(
             Dictionary<string, string>? args, RunJob? job)
         {
@@ -2621,55 +2633,6 @@ namespace APBridgeAddIn
                 !args.TryGetValue("modelName", out string? modelName) ||
                 string.IsNullOrWhiteSpace(modelName))
                 return new(false, "args 'toolboxPath' & 'modelName' required", null);
-
-            // Step-by-step execution. Calling ExecuteToolAsync on the model as a
-            // whole tool triggers Pro's chain pre-validation, which rejects any
-            // intermediate INPUT whose producing tool has not yet created the FC
-            // on disk — fatal on first run. The ribbon Run dialog avoids this by
-            // running ModelBuilder's own engine: each process is validated JIT
-            // immediately before it executes, after its upstream outputs already
-            // exist. We mirror that here by parsing the model graph, topologically
-            // sorting processes, and calling ExecuteToolAsync once per step with
-            // refs resolved against a runtime variable map.
-            ModelGraph graph;
-            try
-            {
-                graph = AtbxManager.WalkModel(path, modelName);
-            }
-            catch (Exception ex)
-            {
-                return new(false, $"Failed to read model from '{path}': {ex.Message}", null);
-            }
-
-            if (job != null)
-            {
-                lock (job.Lock) job.TotalSteps = graph.Processes.Count;
-            }
-
-            // Reject anything outside GpTool — script tools, nested models,
-            // legacy iterators. Step-by-step execution covers only system GP
-            // tools today; the other kinds round-trip cleanly through
-            // describe_model / create_model / update_model but need Pro's
-            // ribbon to actually run. Each ToolKind produces a slightly
-            // different message so the agent knows which substitution to try.
-            var nonGp = graph.Processes.FirstOrDefault(p => p.Kind != APBridgeAddIn.ModelBuilder.ToolKind.GpTool);
-            if (nonGp != null)
-            {
-                var hint = nonGp.Kind switch
-                {
-                    APBridgeAddIn.ModelBuilder.ToolKind.ScriptTool =>
-                        "Custom script tools must be run via Pro's ribbon or with run_gp_tool against the script tool's name.",
-                    APBridgeAddIn.ModelBuilder.ToolKind.NestedModel =>
-                        "Run the nested model directly via run_model (recurse) or via Pro's ribbon.",
-                    APBridgeAddIn.ModelBuilder.ToolKind.Iterator =>
-                        "Iterator semantics aren't supported by step-by-step execution; compose run_gp_tool calls.",
-                    _ => "Unknown step kind; expose the tool's actual signature so the bridge can dispatch it."
-                };
-                return new(false,
-                    $"Model '{modelName}' contains a non-GP step '{nonGp.Name}' " +
-                    $"(kind '{nonGp.Kind}', tool '{nonGp.Tool}'). " + hint,
-                    null);
-            }
 
             // Collect user-supplied named values (case-insensitive matching).
             var namedValues = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -2683,6 +2646,93 @@ namespace APBridgeAddIn
                     foreach (var kv in paramsNode)
                         namedValues[kv.Key] = CoerceScalarToString(kv.Value);
                 }
+            }
+
+            var allMessages = new List<object>();
+            var outcome = await ExecuteGraphAsync(
+                path, modelName, namedValues, job,
+                allMessages, stepPrefix: "",
+                inFlight: new HashSet<string>(StringComparer.OrdinalIgnoreCase),
+                depth: 0);
+
+            if (!outcome.Ok)
+                return new(false, outcome.Error, outcome.ErrorData);
+
+            return new(true, null, new
+            {
+                success = true,
+                stepsRun = outcome.StepsRun,
+                messages = allMessages
+            });
+        }
+
+        /// <summary>
+        /// Executes one model graph step-by-step; recurses for nestedModel steps.
+        /// Calling ExecuteToolAsync on a model as a whole tool triggers Pro's
+        /// chain pre-validation, which rejects any intermediate INPUT whose
+        /// producing tool has not yet created the FC on disk — fatal on first
+        /// run. The ribbon Run dialog avoids this by running ModelBuilder's own
+        /// engine: each process is validated JIT immediately before it executes,
+        /// after its upstream outputs already exist. We mirror that by parsing
+        /// the model graph, topologically sorting processes, and calling
+        /// ExecuteToolAsync once per step with refs resolved against a runtime
+        /// variable map — and we recurse the same way into nested models hosted
+        /// in .atbx toolboxes (nested models in legacy binary .tbx can't be
+        /// parsed, so those fall back to whole-tool dispatch by path, accepting
+        /// the first-run pre-validation risk).
+        /// </summary>
+        private static async Task<GraphRunOutcome> ExecuteGraphAsync(
+            string path, string modelName,
+            Dictionary<string, string> namedValues,
+            RunJob? job,
+            List<object> allMessages,
+            string stepPrefix,
+            HashSet<string> inFlight,
+            int depth)
+        {
+            bool isRoot = depth == 0;
+            if (depth > 8)
+                return new GraphRunOutcome { Error = $"Nested model depth exceeded 8 at '{modelName}' — aborting (runaway nesting?)." };
+
+            string cycleKey;
+            try { cycleKey = $"{System.IO.Path.GetFullPath(path)}::{modelName}"; }
+            catch { cycleKey = $"{path}::{modelName}"; }
+            if (!inFlight.Add(cycleKey))
+                return new GraphRunOutcome { Error = $"Nested model cycle detected: '{modelName}' ({path}) is already executing in this chain." };
+            try
+            {
+
+            ModelGraph graph;
+            try
+            {
+                graph = AtbxManager.WalkModel(path, modelName);
+            }
+            catch (Exception ex)
+            {
+                return new GraphRunOutcome { Error = $"Failed to read model from '{path}': {ex.Message}" };
+            }
+
+            if (job != null && isRoot)
+            {
+                lock (job.Lock) job.TotalSteps = graph.Processes.Count;
+            }
+
+            // Iterators (and unknown legacy encodings) still have no step-by-step
+            // semantics — reject those. scriptTool / nestedModel steps are now
+            // executed: nested models recurse through this method, script tools
+            // dispatch by qualified toolbox path.
+            var badKind = graph.Processes.FirstOrDefault(p =>
+                p.Kind is APBridgeAddIn.ModelBuilder.ToolKind.Iterator
+                       or APBridgeAddIn.ModelBuilder.ToolKind.Unknown);
+            if (badKind != null)
+            {
+                return new GraphRunOutcome
+                {
+                    Error = $"Model '{modelName}' contains step '{badKind.Name}' of kind '{badKind.Kind}' " +
+                            $"(tool '{badKind.Tool}'). Iterator/unknown steps aren't supported by " +
+                            "step-by-step execution; run that model via Pro's ribbon or compose " +
+                            "run_gp_tool calls."
+                };
             }
 
             // Determine model input parameter names (exposed Parameter variables
@@ -2702,10 +2752,16 @@ namespace APBridgeAddIn
                 .ToList();
             if (unknownKeys.Any())
             {
-                return new(false,
-                    $"Unknown model parameter(s): {string.Join(", ", unknownKeys)}. " +
-                    $"Model '{modelName}' expects: [{string.Join(", ", inputParamNames)}]",
-                    null);
+                if (isRoot)
+                    return new GraphRunOutcome
+                    {
+                        Error = $"Unknown model parameter(s): {string.Join(", ", unknownKeys)}. " +
+                                $"Model '{modelName}' expects: [{string.Join(", ", inputParamNames)}]"
+                    };
+                // Nested call: parent slot names that don't match a child input
+                // param (e.g. the child's derived params) are dropped, not fatal —
+                // the child falls back to its own declared defaults for them.
+                foreach (var k in unknownKeys) namedValues.Remove(k);
             }
 
             // Seed the runtime variable map: variable id → value (path or literal).
@@ -2729,7 +2785,6 @@ namespace APBridgeAddIn
             catch { scratchGdb = ""; }
 
             var env = DefaultRunEnvironments();
-            var allMessages = new List<object>();
             int completedSteps = 0;
             // Derived-output names assigned this run. Distinct variable names can
             // sanitize to the same GDB name ("Clip Output" vs "Clip_Output");
@@ -2741,8 +2796,78 @@ namespace APBridgeAddIn
             {
                 if (job != null)
                 {
-                    lock (job.Lock) job.CurrentStep = proc.Name;
+                    lock (job.Lock) job.CurrentStep = stepPrefix + proc.Name;
                 }
+
+                // ── Nested model in an .atbx: recurse through this executor ──
+                // (keeps the JIT per-step validation that makes first runs work).
+                if (proc.Kind == APBridgeAddIn.ModelBuilder.ToolKind.NestedModel)
+                {
+                    var (childBox, childTool) = AtbxManager.ResolveToolReference(path, proc.Tool);
+                    bool childIsAtbx = childBox.EndsWith(".atbx", StringComparison.OrdinalIgnoreCase)
+                                       && File.Exists(childBox);
+                    if (childIsAtbx)
+                    {
+                        // Map this step's resolved input slot values onto the child's
+                        // named parameters (slot keys ARE the child's param names).
+                        var childNamed = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                        foreach (var (slotName, pm) in proc.Params)
+                        {
+                            if (pm.OutputVariableId != null) continue;
+                            string? val = null;
+                            if (pm.RefVariableIds is { Count: > 1 })
+                            {
+                                var parts = new List<string>();
+                                foreach (var rid in pm.RefVariableIds)
+                                    if (runtimeValues.TryGetValue(rid, out var rv) && !string.IsNullOrEmpty(rv))
+                                        parts.Add(rv);
+                                val = string.Join(";", parts);
+                            }
+                            else if (pm.RefVariableId != null)
+                            {
+                                runtimeValues.TryGetValue(pm.RefVariableId, out val);
+                            }
+                            else if (pm.LiteralValue != null)
+                            {
+                                val = SubstituteModelVars(pm.LiteralValue, graph, runtimeValues);
+                            }
+                            if (!string.IsNullOrEmpty(val)) childNamed[slotName] = val!;
+                        }
+
+                        var childOutcome = await ExecuteGraphAsync(
+                            childBox, childTool, childNamed, job, allMessages,
+                            stepPrefix + proc.Name + " > ", inFlight, depth + 1);
+                        if (!childOutcome.Ok)
+                        {
+                            return new GraphRunOutcome
+                            {
+                                Error = $"Nested model step '{stepPrefix}{proc.Name}' ({childTool}) failed: {childOutcome.Error}",
+                                ErrorData = childOutcome.ErrorData
+                                    ?? new { failedStep = stepPrefix + proc.Name, tool = proc.Tool, completedSteps }
+                            };
+                        }
+
+                        // Child's output params (by name) → this step's output slots.
+                        foreach (var (slotName, pm) in proc.Params)
+                        {
+                            if (pm.OutputVariableId == null) continue;
+                            if (childOutcome.ParamOutputs.TryGetValue(slotName, out var ov)
+                                && !string.IsNullOrEmpty(ov))
+                                runtimeValues[pm.OutputVariableId] = ov;
+                        }
+
+                        completedSteps++;
+                        if (job != null && isRoot)
+                        {
+                            lock (job.Lock) job.CompletedSteps++;
+                        }
+                        continue;
+                    }
+                    // Nested model hosted in a legacy binary .tbx — can't parse it
+                    // for recursion; fall through to whole-tool dispatch by path
+                    // below (accepts Pro's chain pre-validation risk on first runs).
+                }
+
                 // Resolve each slot in JSON-insertion order. Pro empirically writes
                 // process params in tool-declared slot order (per Desktop's data on
                 // SummarizeWithin: in_polygons, in_sum_features, out_feature_class,
@@ -2762,8 +2887,48 @@ namespace APBridgeAddIn
                 //      omits optional slots before included ones, but the resulting
                 //      misalignment surfaces as obvious slot-mismatch errors that
                 //      point at which tool to add to the signature table.
-                var sig = GpToolCatalog.ResolveSignature(proc.Tool);
-                var slotOrder = sig != null ? sig.AsEnumerable() : proc.Params.Keys;
+                //
+                // Script tools (and .tbx-hosted nested models) dispatch by QUALIFIED
+                // PATH ("<toolbox>\<tool>"); their signature comes from the target's
+                // own tool.content when the target toolbox is an .atbx. Derived
+                // output params are EXCLUDED from the calling signature (arcpy
+                // contract) — they're recorded via the in-place pre-pass below and
+                // refined from the GP result's return value after execution.
+                string executeTool = proc.Tool;
+                IReadOnlyList<string>? sig;
+                var derivedOutSlots = new List<string>();
+                if (proc.Kind == APBridgeAddIn.ModelBuilder.ToolKind.GpTool)
+                {
+                    sig = GpToolCatalog.ResolveSignature(proc.Tool);
+                }
+                else
+                {
+                    var (toolBox, toolName) = AtbxManager.ResolveToolReference(path, proc.Tool);
+                    executeTool = System.IO.Path.Combine(toolBox, toolName);
+                    var slots = AtbxManager.GetToolSignature(toolBox, toolName);
+                    if (slots != null)
+                    {
+                        sig = slots.Where(s => !s.IsDerivedOutput).Select(s => s.Name).ToList();
+                        derivedOutSlots = slots.Where(s => s.IsDerivedOutput).Select(s => s.Name).ToList();
+                    }
+                    else
+                    {
+                        sig = null; // legacy .tbx target → dense-pack insertion order
+                    }
+                }
+                // Dense-pack fallback for path-dispatched tools: output slots are
+                // still excluded from the positional array (derived outputs are
+                // not call arguments), recorded via the pre-pass instead.
+                bool denseExcludeOutputs =
+                    proc.Kind != APBridgeAddIn.ModelBuilder.ToolKind.GpTool && sig == null;
+                if (denseExcludeOutputs)
+                    derivedOutSlots = proc.Params
+                        .Where(kv => kv.Value.OutputVariableId != null)
+                        .Select(kv => kv.Key).ToList();
+                var slotOrder =
+                    sig != null ? sig.AsEnumerable()
+                    : denseExcludeOutputs ? proc.Params.Where(kv => kv.Value.OutputVariableId == null).Select(kv => kv.Key)
+                    : proc.Params.Keys;
 
                 // Pre-pass: record outputs whose slot is NOT in the tool signature.
                 // Some tools (notably selection tools — SelectLayerByLocation,
@@ -2779,12 +2944,12 @@ namespace APBridgeAddIn
                 // value (typically in_layer). Outputs whose slot IS in the
                 // signature are still recorded by the signature walk's existing
                 // OutputVariableId branch.
-                if (sig != null)
+                if (sig != null || denseExcludeOutputs)
                 {
                     foreach (var (slotName, pm) in proc.Params)
                     {
                         if (pm.OutputVariableId == null) continue;
-                        if (sig.Contains(slotName, StringComparer.OrdinalIgnoreCase)) continue;
+                        if (sig != null && sig.Contains(slotName, StringComparer.OrdinalIgnoreCase)) continue;
                         if (runtimeValues.ContainsKey(pm.OutputVariableId)) continue;
 
                         string? sourceValue = null;
@@ -2910,7 +3075,7 @@ namespace APBridgeAddIn
                 }
 
                 var valueArray = Geoprocessing.MakeValueArray(values.ToArray());
-                var stepResult = await Geoprocessing.ExecuteToolAsync(proc.Tool, valueArray, stepEnv);
+                var stepResult = await Geoprocessing.ExecuteToolAsync(executeTool, valueArray, stepEnv);
 
                 if (stepResult.IsFailed)
                 {
@@ -2932,32 +3097,58 @@ namespace APBridgeAddIn
                               + "or click on a map view in Pro and retry.]";
                     }
 
-                    return new(false,
-                        $"Step '{proc.Name}' ({proc.Tool}) failed: {msgs}",
-                        new { failedStep = proc.Name, tool = proc.Tool, completedSteps });
+                    return new GraphRunOutcome
+                    {
+                        Error = $"Step '{stepPrefix}{proc.Name}' ({executeTool}) failed: {msgs}",
+                        ErrorData = new { failedStep = stepPrefix + proc.Name, tool = proc.Tool, completedSteps }
+                    };
+                }
+
+                // Path-dispatched tools: refine derived-output values from the GP
+                // result's return value (the pre-pass seeded them with the in-place
+                // input as a fallback). Only unambiguous with a single derived out.
+                if (derivedOutSlots.Count == 1)
+                {
+                    string? ret = null;
+                    try { ret = stepResult.ReturnValue; } catch { /* host quirk — keep pre-pass value */ }
+                    if (!string.IsNullOrEmpty(ret)
+                        && proc.Params.TryGetValue(derivedOutSlots[0], out var dpm)
+                        && dpm.OutputVariableId != null)
+                    {
+                        runtimeValues[dpm.OutputVariableId] = ret!;
+                    }
                 }
 
                 completedSteps++;
                 foreach (var m in stepResult.Messages)
-                    allMessages.Add(new { step = proc.Name, type = m.Type.ToString(), text = m.Text });
+                    allMessages.Add(new { step = stepPrefix + proc.Name, type = m.Type.ToString(), text = m.Text });
 
                 if (job != null)
                 {
                     lock (job.Lock)
                     {
-                        job.CompletedSteps++;
+                        if (isRoot) job.CompletedSteps++;
                         foreach (var m in stepResult.Messages)
-                            job.Messages.Add(new { step = proc.Name, type = m.Type.ToString(), text = m.Text });
+                            job.Messages.Add(new { step = stepPrefix + proc.Name, type = m.Type.ToString(), text = m.Text });
                     }
                 }
             }
 
-            return new(true, null, new
+            // Expose final Parameter-variable values so a parent model (or the
+            // future) can map this graph's outputs by name.
+            var outcome = new GraphRunOutcome { Ok = true, StepsRun = completedSteps };
+            foreach (var v in graph.Variables.Values)
             {
-                success = true,
-                stepsRun = graph.Processes.Count,
-                messages = allMessages
-            });
+                if (v.IsParameter && runtimeValues.TryGetValue(v.Id, out var pv) && !string.IsNullOrEmpty(pv))
+                    outcome.ParamOutputs[v.Name] = pv;
+            }
+            return outcome;
+
+            }
+            finally
+            {
+                inFlight.Remove(cycleKey);
+            }
         }
 
         /// <summary>

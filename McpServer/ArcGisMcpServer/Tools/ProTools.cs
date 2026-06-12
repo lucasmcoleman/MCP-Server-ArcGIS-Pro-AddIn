@@ -704,6 +704,12 @@ namespace ArcGisMcpServer.Tools
         [McpServerTool, Description(
             "Run a ModelBuilder model with specified parameter values. " +
             "Use describe_model first to see what parameters the model expects. " +
+            "Executes GP-tool steps, script-tool steps (dispatched by toolbox " +
+            "path, including cross-toolbox references), and nested-model steps " +
+            "(recursed step-by-step when hosted in an .atbx; legacy .tbx-hosted " +
+            "nested models run whole-tool). Iterator steps are not supported. " +
+            "Script-tool steps execute Python — subject to the same post-launch " +
+            "warm-up caveat as execute_python. " +
             "SYNCHRONOUS — blocks until the model finishes. For models that may " +
             "run longer than ~2 minutes wall-clock, use start_run_model + " +
             "get_run_status instead so the tool call doesn't time out.")]

@@ -206,6 +206,47 @@ try
     var outSlot = SystemToolboxCatalog.GetOutputSlot("management.Merge");
     Check(outSlot is { } os && os.Slot == "output", "Merge output slot derived dynamically",
         outSlot?.Slot);
+
+    Console.WriteLine("== nested-execution helpers: ResolveToolReference + GetToolSignature ==");
+    // Bare name → same toolbox.
+    var (sameBox, sameTool) = AtbxManager.ResolveToolReference(tbx, "RoundTrip");
+    Check(sameBox == tbx && sameTool == "RoundTrip", "bare name resolves to same toolbox");
+
+    // Pro-style relative ref: base is the .atbx treated as a directory
+    // (first '..' exits the atbx, second exits its containing folder).
+    // tbx = {workDir}\RoundTrip.atbx → ..\.. → parent of workDir.
+    var rel = @"..\..\" + Path.GetFileName(workDir) + @"\Other.tbx\NBPop";
+    var (relBox, relTool) = AtbxManager.ResolveToolReference(tbx, rel);
+    Check(relTool == "NBPop" &&
+          string.Equals(relBox, Path.Combine(workDir, "Other.tbx"), StringComparison.OrdinalIgnoreCase),
+        "relative ref resolves against atbx-as-directory", relBox);
+
+    // Absolute ref passes through.
+    var abs = Path.Combine(workDir, "Abs.atbx", "T1");
+    var (absBox, absTool) = AtbxManager.ResolveToolReference(tbx, abs);
+    Check(absTool == "T1" &&
+          string.Equals(absBox, Path.Combine(workDir, "Abs.atbx"), StringComparison.OrdinalIgnoreCase),
+        "absolute ref passes through", absBox);
+
+    // GetToolSignature reads a model tool's declared param order from its
+    // tool.content — the same path the executor uses for script tools and
+    // nested models. RoundTrip's params: InA, InB, BufDist, FinalOut(out).
+    var toolSig = AtbxManager.GetToolSignature(tbx, "RoundTrip");
+    Check(toolSig != null && toolSig.Count == 4 &&
+          toolSig[0].Name == "InA" && toolSig[1].Name == "InB" &&
+          toolSig[2].Name == "BufDist" && toolSig[3].Name == "FinalOut",
+        "GetToolSignature returns declared param order",
+        toolSig == null ? "null" : string.Join(",", toolSig.Select(s => s.Name)));
+    Check(toolSig != null && toolSig[3].IsOutput && !toolSig[0].IsOutput,
+        "GetToolSignature flags output direction");
+
+    // Unknown tool / non-ZIP toolbox → null (caller dense-packs).
+    Check(AtbxManager.GetToolSignature(tbx, "NoSuchTool") == null,
+        "GetToolSignature null for missing tool");
+    var fakeTbx = Path.Combine(workDir, "legacy.tbx");
+    File.WriteAllBytes(fakeTbx, new byte[] { 1, 2, 3 }); // binary, not a ZIP
+    Check(AtbxManager.GetToolSignature(fakeTbx, "Any") == null,
+        "GetToolSignature null for binary .tbx");
 }
 finally
 {
