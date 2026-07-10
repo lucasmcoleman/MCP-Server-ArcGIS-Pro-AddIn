@@ -3258,6 +3258,7 @@ namespace APBridgeAddIn
                 }
 
                 var values = new List<object>();
+                var missingOutputGdbs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 foreach (var slotName in slotOrder)
                 {
                     if (!proc.Params.TryGetValue(slotName, out var pm))
@@ -3286,6 +3287,18 @@ namespace APBridgeAddIn
                                 ? varName
                                 : $"{scratchGdb}\\{varName}";
                             runtimeValues[pm.OutputVariableId] = outPath;
+                        }
+                        // arcpy auto-creates env.scratchGDB the first time a tool
+                        // writes into it; the step-by-step executor must mirror
+                        // that or the first output routed into a not-yet-existing
+                        // File GDB (e.g. a fresh toolbox folder's scratch.gdb)
+                        // dies with ERROR 000210 before the step even runs.
+                        var parentGdb = System.IO.Path.GetDirectoryName(outPath);
+                        if (!string.IsNullOrEmpty(parentGdb)
+                            && parentGdb.EndsWith(".gdb", StringComparison.OrdinalIgnoreCase)
+                            && !Directory.Exists(parentGdb))
+                        {
+                            missingOutputGdbs.Add(parentGdb);
                         }
                         values.Add(outPath);
                     }
@@ -3353,6 +3366,26 @@ namespace APBridgeAddIn
                         merged.Add(new KeyValuePair<string, string>(envKey, envVal));
                     }
                     stepEnv = merged;
+                }
+
+                // Materialize any missing output File GDBs before the step runs
+                // (mirrors arcpy's env.scratchGDB auto-create). Best-effort: if
+                // creation fails, the step's own error surfaces the real cause.
+                foreach (var gdb in missingOutputGdbs)
+                {
+                    var gdbFolder = System.IO.Path.GetDirectoryName(gdb);
+                    var gdbName = System.IO.Path.GetFileName(gdb);
+                    if (string.IsNullOrEmpty(gdbFolder) || string.IsNullOrEmpty(gdbName)) continue;
+                    try { Directory.CreateDirectory(gdbFolder); } catch { /* step error will tell */ }
+                    var mkGdb = await Geoprocessing.ExecuteToolAsync("management.CreateFileGDB",
+                        Geoprocessing.MakeValueArray(gdbFolder, gdbName), env);
+                    var mkNote = new { step = stepPrefix + proc.Name, type = "Message",
+                        text = mkGdb.IsFailed
+                            ? $"Could not auto-create missing output GDB {gdb}: " +
+                              string.Join("; ", mkGdb.Messages.Select(m => m.Text))
+                            : $"Auto-created missing output GDB {gdb}" };
+                    allMessages.Add(mkNote);
+                    if (job != null) { lock (job.Lock) job.Messages.Add(mkNote); }
                 }
 
                 var valueArray = Geoprocessing.MakeValueArray(values.ToArray());
