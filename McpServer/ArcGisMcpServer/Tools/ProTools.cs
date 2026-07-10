@@ -549,7 +549,11 @@ namespace ArcGisMcpServer.Tools
             "Get the full definition of a ModelBuilder model, including all input parameters, " +
             "processing steps (geoprocessing tools), and data connections between them. " +
             "The definition uses a simplified JSON format where: " +
-            "'inputs' lists model parameters with name/type/default, and " +
+            "'inputs' lists model parameters with name/type/default — in the tool's real " +
+            "public-interface order, with 'optional': true on non-required parameters and " +
+            "'exposed': false on internal variables that carry ModelBuilder's Parameter flag " +
+            "but are NOT part of the tool's public interface (do not remove either flag); " +
+            "'parameterOrder' lists the full interface order (including derived outputs); and " +
             "'steps' lists geoprocessing operations with their tool name and parameter connections. " +
             "Parameter connections use {\"ref\": \"name\"} to reference inputs or previous step outputs, " +
             "and {\"output\": \"name\", \"type\": \"datatype\"} to declare step outputs.")]
@@ -617,7 +621,15 @@ namespace ArcGisMcpServer.Tools
             "  {\"name\":\"InTable\",\"type\":\"GPComposite\"," +
             "  \"compositeTypes\":[\"GPTableView\",\"GPRasterLayer\",\"GPMosaicLayer\"]}. " +
             "- 'default' (optional): string — the parameter's default value. " +
-            "- 'displayName' (optional): string — human-readable name for the GP dialog." +
+            "- 'displayName' (optional): string — human-readable name for the GP dialog. " +
+            "- 'optional' (optional): bool — true marks the parameter Optional in the tool's " +
+            "  public interface (absent/false = Required). " +
+            "- 'exposed' (optional): bool — false keeps the variable in the model WITHOUT " +
+            "  adding it to the tool's public interface (used by describe_model for internal " +
+            "  Parameter-flagged variables; preserve it on round-trips)." +
+            "\n\nOptional top-level 'parameterOrder': string[] — exact public-interface order " +
+            "for ALL parameters (inputs and derived outputs interleaved). describe_model " +
+            "emits it; pass it back unchanged to preserve the tool's dialog/arcpy calling order." +
             "\n\nCommon GP tool categories: analysis (overlay, proximity), conversion, " +
             "management (fields, joins), sa (spatial analyst - raster), na (network analyst).")]
         public static async Task<string> CreateModel(
@@ -636,7 +648,10 @@ namespace ArcGisMcpServer.Tools
             "Update an existing model's definition. Replaces the model's workflow entirely " +
             "with the new definition. Use DescribeModel first to get the current definition, " +
             "modify it, then pass the updated JSON here. The definition format is the same " +
-            "as CreateModel.")]
+            "as CreateModel. Preserve the 'optional'/'exposed' input flags and the top-level " +
+            "'parameterOrder' array exactly as describe_model returned them — they carry the " +
+            "tool's public-interface optionality and calling order; dropping them makes every " +
+            "parameter Required and re-derives the order.")]
         public static async Task<string> UpdateModel(
             [Description("Full file path to the .atbx toolbox file")] string toolboxPath,
             [Description("Name of the existing model to update")] string modelName,

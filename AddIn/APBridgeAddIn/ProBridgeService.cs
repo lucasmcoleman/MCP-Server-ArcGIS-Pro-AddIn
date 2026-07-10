@@ -2756,6 +2756,23 @@ namespace APBridgeAddIn
                 };
             }
 
+            // .pyt-hosted script tools round-trip through describe/update but are
+            // NOT step-executed: in-proc ExecuteToolAsync on a .pyt path never
+            // returns (documented hang), so attempting it would wedge this Pro
+            // session for the full IPC timeout. Reject with the reason.
+            var pytStep = graph.Processes.FirstOrDefault(p =>
+                p.Kind is APBridgeAddIn.ModelBuilder.ToolKind.PythonScriptTool);
+            if (pytStep != null)
+            {
+                return new GraphRunOutcome
+                {
+                    Error = $"Model '{modelName}' contains step '{pytStep.Name}' backed by a .pyt script " +
+                            $"tool ('{pytStep.Tool}'). .pyt tools hang Pro's in-process GP executor, so " +
+                            "run_model refuses them. Run that model via Pro's ribbon, or refactor the " +
+                            ".pyt tool into a .atbx script tool / nested model."
+                };
+            }
+
             // Determine model input parameter names (exposed Parameter variables
             // that no process produces). Used to catch agent typos early.
             var producedIds = graph.Processes
