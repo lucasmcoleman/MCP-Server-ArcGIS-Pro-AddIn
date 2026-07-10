@@ -736,7 +736,13 @@ namespace ArcGisMcpServer.Tools
             [Description("Optional: JSON object overriding ANY model variable by name " +
                 "(not just exposed parameters). Use to substitute dataset paths for " +
                 "bare map-layer names when running a model without its project open, " +
-                "e.g., {\"Farmland_CVWD\": \"C:\\\\data\\\\x.gdb\\\\Farmland\"}.")] string? variableOverrides = null)
+                "e.g., {\"Farmland_CVWD\": \"C:\\\\data\\\\x.gdb\\\\Farmland\"}.")] string? variableOverrides = null,
+            [Description("Optional: how to handle .pyt-hosted script-tool steps: " +
+                "'execute' (default — run them in a child arcpy process) or 'skip' " +
+                "(partial mode: skip them and everything downstream of them; " +
+                "reported as skippedPytSteps).")] string? pytMode = null,
+            [Description("Optional: per-.pyt-step timeout in seconds for out-of-proc " +
+                "execution (default 3600).")] int? pytTimeoutSeconds = null)
         {
             var args = new Dictionary<string, string>
             {
@@ -747,6 +753,10 @@ namespace ArcGisMcpServer.Tools
                 args["parameters"] = parameters;
             if (!string.IsNullOrWhiteSpace(variableOverrides))
                 args["variableOverrides"] = variableOverrides;
+            if (!string.IsNullOrWhiteSpace(pytMode))
+                args["pytMode"] = pytMode;
+            if (pytTimeoutSeconds is > 0)
+                args["pytTimeoutSeconds"] = pytTimeoutSeconds.Value.ToString(System.Globalization.CultureInfo.InvariantCulture);
 
             var r = await _client!.OpAsync("pro.runModel", args);
             return FormatResult(r, "pro.runModel");
@@ -764,7 +774,10 @@ namespace ArcGisMcpServer.Tools
             [Description("Optional: JSON object mapping parameter names to values, " +
                 "e.g., {\"StudyArea\": \"Counties\", \"BufferDistance\": \"1000 Meters\"}")] string? parameters = null,
             [Description("Optional: JSON object overriding ANY model variable by name " +
-                "(not just exposed parameters) — see run_model for usage.")] string? variableOverrides = null)
+                "(not just exposed parameters) — see run_model for usage.")] string? variableOverrides = null,
+            [Description("Optional: .pyt step handling — 'execute' (default) or 'skip'; " +
+                "see run_model for details.")] string? pytMode = null,
+            [Description("Optional: per-.pyt-step timeout in seconds (default 3600).")] int? pytTimeoutSeconds = null)
         {
             var args = new Dictionary<string, string>
             {
@@ -775,6 +788,10 @@ namespace ArcGisMcpServer.Tools
                 args["parameters"] = parameters;
             if (!string.IsNullOrWhiteSpace(variableOverrides))
                 args["variableOverrides"] = variableOverrides;
+            if (!string.IsNullOrWhiteSpace(pytMode))
+                args["pytMode"] = pytMode;
+            if (pytTimeoutSeconds is > 0)
+                args["pytTimeoutSeconds"] = pytTimeoutSeconds.Value.ToString(System.Globalization.CultureInfo.InvariantCulture);
 
             var r = await _client!.OpAsync("pro.runModelAsync", args);
             return FormatResult(r, "pro.runModelAsync");

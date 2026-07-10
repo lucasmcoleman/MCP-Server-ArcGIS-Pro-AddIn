@@ -2621,6 +2621,10 @@ namespace APBridgeAddIn
             public int StepsRun;
             /// <summary>Not-ready (valid=false) steps that failed and were skipped.</summary>
             public int SkippedSteps;
+            /// <summary>.pyt steps (and their dependents) skipped under pytMode="skip"
+            /// — a subset of SkippedSteps, broken out so callers can tell partial-mode
+            /// omissions from valid=false dead chains.</summary>
+            public int SkippedPytSteps;
             /// <summary>Final values of the model's Parameter variables, by name —
             /// how a parent maps a nested model's outputs back onto its own slots.</summary>
             public Dictionary<string, string> ParamOutputs = new(StringComparer.OrdinalIgnoreCase);
@@ -2667,12 +2671,27 @@ namespace APBridgeAddIn
                 }
             }
 
+            // .pyt-step handling: "execute" (default) dispatches them to a child
+            // arcpy process; "skip" is partial mode — skip them (and anything
+            // downstream of them) and run the pure-GP/nested remainder.
+            var pytMode = "execute";
+            if (args.TryGetValue("pytMode", out var pytModeRaw) && !string.IsNullOrWhiteSpace(pytModeRaw))
+            {
+                pytMode = pytModeRaw.Trim().ToLowerInvariant();
+                if (pytMode != "execute" && pytMode != "skip")
+                    return new(false, $"invalid pytMode '{pytModeRaw}' — use 'execute' or 'skip'", null);
+            }
+            int pytTimeoutSeconds = 3600;
+            if (args.TryGetValue("pytTimeoutSeconds", out var pytTimeoutRaw)
+                && int.TryParse(pytTimeoutRaw, out var pytTimeoutVal) && pytTimeoutVal > 0)
+                pytTimeoutSeconds = pytTimeoutVal;
+
             var allMessages = new List<object>();
             var outcome = await ExecuteGraphAsync(
                 path, modelName, namedValues, job,
                 allMessages, stepPrefix: "",
                 inFlight: new HashSet<string>(StringComparer.OrdinalIgnoreCase),
-                depth: 0, varOverrides);
+                depth: 0, varOverrides, pytMode, pytTimeoutSeconds);
 
             if (!outcome.Ok)
                 return new(false, outcome.Error, outcome.ErrorData);
@@ -2682,6 +2701,7 @@ namespace APBridgeAddIn
                 success = true,
                 stepsRun = outcome.StepsRun,
                 skippedNotReadySteps = outcome.SkippedSteps,
+                skippedPytSteps = outcome.SkippedPytSteps,
                 messages = allMessages
             });
         }
@@ -2709,7 +2729,9 @@ namespace APBridgeAddIn
             string stepPrefix,
             HashSet<string> inFlight,
             int depth,
-            Dictionary<string, string>? varOverrides = null)
+            Dictionary<string, string>? varOverrides = null,
+            string pytMode = "execute",
+            int pytTimeoutSeconds = 3600)
         {
             bool isRoot = depth == 0;
             if (depth > 8)
@@ -2753,23 +2775,6 @@ namespace APBridgeAddIn
                             $"(tool '{badKind.Tool}'). Iterator/unknown steps aren't supported by " +
                             "step-by-step execution; run that model via Pro's ribbon or compose " +
                             "run_gp_tool calls."
-                };
-            }
-
-            // .pyt-hosted script tools round-trip through describe/update but are
-            // NOT step-executed: in-proc ExecuteToolAsync on a .pyt path never
-            // returns (documented hang), so attempting it would wedge this Pro
-            // session for the full IPC timeout. Reject with the reason.
-            var pytStep = graph.Processes.FirstOrDefault(p =>
-                p.Kind is APBridgeAddIn.ModelBuilder.ToolKind.PythonScriptTool);
-            if (pytStep != null)
-            {
-                return new GraphRunOutcome
-                {
-                    Error = $"Model '{modelName}' contains step '{pytStep.Name}' backed by a .pyt script " +
-                            $"tool ('{pytStep.Tool}'). .pyt tools hang Pro's in-process GP executor, so " +
-                            "run_model refuses them. Run that model via Pro's ribbon, or refactor the " +
-                            ".pyt tool into a .atbx script tool / nested model."
                 };
             }
 
@@ -2873,6 +2878,33 @@ namespace APBridgeAddIn
             var env = DefaultRunEnvironments();
             int completedSteps = 0;
             int skippedSteps = 0;
+            int skippedPytSteps = 0;
+            // Output-variable ids produced by steps skipped under pytMode="skip".
+            // Steps that consume them are skipped too (cascade) — running them
+            // would surface confusing GP errors on empty inputs.
+            var skippedOutputVarIds = new HashSet<string>();
+
+            // Per-step environment overrides merged over the run defaults —
+            // same semantics as the inline merge in the GP-dispatch path below,
+            // reused by the out-of-proc .pyt branch.
+            IReadOnlyList<KeyValuePair<string, string>> MergeStepEnv(
+                APBridgeAddIn.ModelBuilder.ModelProcess p)
+            {
+                if (p.Environments is not { Count: > 0 }) return env;
+                var merged = new List<KeyValuePair<string, string>>(env);
+                foreach (var (envKey, envParam) in p.Environments)
+                {
+                    string? envVal = null;
+                    if (envParam.RefVariableId != null)
+                        runtimeValues.TryGetValue(envParam.RefVariableId, out envVal);
+                    else if (envParam.LiteralValue != null)
+                        envVal = ResolveRelative(SubstituteModelVars(envParam.LiteralValue, graph, runtimeValues));
+                    if (string.IsNullOrEmpty(envVal)) continue;
+                    merged.RemoveAll(kv => kv.Key.Equals(envKey, StringComparison.OrdinalIgnoreCase));
+                    merged.Add(new KeyValuePair<string, string>(envKey, envVal));
+                }
+                return merged;
+            }
             // Derived-output names assigned this run. Distinct variable names can
             // sanitize to the same GDB name ("Clip Output" vs "Clip_Output");
             // with overwriteoutput pinned true the later step would silently
@@ -2884,6 +2916,147 @@ namespace APBridgeAddIn
                 if (job != null)
                 {
                     lock (job.Lock) job.CurrentStep = stepPrefix + proc.Name;
+                }
+
+                // ── Cascade: inputs come from a step skipped under pytMode="skip" ──
+                if (skippedOutputVarIds.Count > 0)
+                {
+                    bool dependsOnSkipped =
+                        proc.Params.Values.Any(pm =>
+                            pm.OutputVariableId == null && (
+                                (pm.RefVariableId != null && skippedOutputVarIds.Contains(pm.RefVariableId)) ||
+                                (pm.RefVariableIds != null && pm.RefVariableIds.Any(skippedOutputVarIds.Contains))))
+                        || proc.PreconditionVariableIds.Any(skippedOutputVarIds.Contains);
+                    if (dependsOnSkipped)
+                    {
+                        skippedSteps++;
+                        skippedPytSteps++;
+                        foreach (var (_, pm) in proc.Params)
+                            if (pm.OutputVariableId != null) skippedOutputVarIds.Add(pm.OutputVariableId);
+                        var cascadeMsg = new { step = stepPrefix + proc.Name, type = "Warning",
+                            text = "Skipped: depends on the output of a skipped .pyt step (pytMode=skip cascade)." };
+                        allMessages.Add(cascadeMsg);
+                        if (job != null) { lock (job.Lock) job.Messages.Add(cascadeMsg); }
+                        continue;
+                    }
+                }
+
+                // ── .pyt-hosted script tool: out-of-proc dispatch or partial-mode skip ──
+                // In-proc ExecuteToolAsync on a .pyt path never returns (documented
+                // hang), so these steps run in a CHILD arcpy process (propy.bat
+                // spawned from Pro's own clean environment). pytMode="skip" turns
+                // them into best-effort skips instead so the GP remainder runs.
+                if (proc.Kind == APBridgeAddIn.ModelBuilder.ToolKind.PythonScriptTool)
+                {
+                    if (pytMode == "skip")
+                    {
+                        skippedSteps++;
+                        skippedPytSteps++;
+                        foreach (var (_, pm) in proc.Params)
+                            if (pm.OutputVariableId != null) skippedOutputVarIds.Add(pm.OutputVariableId);
+                        var skipMsg = new { step = stepPrefix + proc.Name, type = "Warning",
+                            text = $"Skipped .pyt step (pytMode=skip): {proc.Tool}" };
+                        allMessages.Add(skipMsg);
+                        if (job != null) { lock (job.Lock) job.Messages.Add(skipMsg); }
+                        continue;
+                    }
+
+                    var (pytBox, pytToolName) = AtbxManager.ResolveToolReference(path, proc.Tool);
+
+                    // kwargs by slot name — .pyt tools expose no tool.content to read
+                    // a positional signature from, and ImportToolbox tool functions
+                    // accept parameter names as keywords. In-direction slots only;
+                    // outputs come back via the result object.
+                    var pytKwargs = new List<KeyValuePair<string, string>>();
+                    foreach (var (slotName, pm) in proc.Params)
+                    {
+                        if (pm.OutputVariableId != null) continue;
+                        string? val = null;
+                        if (pm.RefVariableIds is { Count: > 1 })
+                        {
+                            var parts = new List<string>();
+                            foreach (var rid in pm.RefVariableIds)
+                                if (runtimeValues.TryGetValue(rid, out var rv) && !string.IsNullOrEmpty(rv))
+                                    parts.Add(rv);
+                            val = string.Join(";", parts);
+                        }
+                        else if (pm.RefVariableId != null)
+                        {
+                            runtimeValues.TryGetValue(pm.RefVariableId, out val);
+                        }
+                        else if (pm.LiteralValue != null)
+                        {
+                            val = ResolveRelative(SubstituteModelVars(pm.LiteralValue, graph, runtimeValues));
+                        }
+                        if (!string.IsNullOrEmpty(val)) pytKwargs.Add(new(slotName, val!));
+                    }
+
+                    var pytResult = File.Exists(pytBox)
+                        ? await RunPytToolAsync(pytBox, pytToolName, pytKwargs, MergeStepEnv(proc), pytTimeoutSeconds)
+                        : new PytRunResult { Error = $".pyt file not found: {pytBox}" };
+
+                    if (!pytResult.Ok)
+                    {
+                        var pytMsgs = pytResult.Error ?? "child arcpy process failed with no message";
+                        if (proc.MarkedInvalid)
+                        {
+                            // Mirror the GP valid=false semantics exactly: count the
+                            // skip but do NOT seed skippedOutputVarIds — downstream
+                            // consumers resolve the missing ref through the same
+                            // unresolved-ref logic as after a GP valid=false skip.
+                            // (Seeding here made the pytMode=skip cascade fire under
+                            // pytMode=execute, inflating skippedPytSteps and printing
+                            // a skip-mode message in the wrong mode.)
+                            skippedSteps++;
+                            var skipMsg = new { step = stepPrefix + proc.Name, type = "Warning",
+                                text = $"Skipped not-ready (valid=false) .pyt step after failure: {pytMsgs}" };
+                            allMessages.Add(skipMsg);
+                            if (job != null) { lock (job.Lock) job.Messages.Add(skipMsg); }
+                            continue;
+                        }
+                        return new GraphRunOutcome
+                        {
+                            Error = $"Step '{stepPrefix}{proc.Name}' (.pyt {proc.Tool}) failed: {pytMsgs}",
+                            ErrorData = new { failedStep = stepPrefix + proc.Name, tool = proc.Tool, completedSteps }
+                        };
+                    }
+
+                    // Map result outputs → out-direction slots in stored order;
+                    // arcpy Result.getOutput(i) indexes output params in declared
+                    // order, which empirically matches the stored slot order.
+                    int outIdx = 0;
+                    foreach (var (_, pm) in proc.Params)
+                    {
+                        if (pm.OutputVariableId == null) continue;
+                        if (outIdx < pytResult.Outputs.Count && !string.IsNullOrEmpty(pytResult.Outputs[outIdx]))
+                            runtimeValues[pm.OutputVariableId] = pytResult.Outputs[outIdx];
+                        outIdx++;
+                    }
+                    // Fallback for any out slot the result didn't cover: first
+                    // resolved input value (the in-place pre-pass pattern).
+                    var firstInput = pytKwargs.FirstOrDefault().Value;
+                    foreach (var (_, pm) in proc.Params)
+                    {
+                        if (pm.OutputVariableId == null || runtimeValues.ContainsKey(pm.OutputVariableId)) continue;
+                        if (!string.IsNullOrEmpty(firstInput))
+                            runtimeValues[pm.OutputVariableId] = firstInput;
+                    }
+
+                    completedSteps++;
+                    var okMsg = new { step = stepPrefix + proc.Name, type = "Message",
+                        text = $".pyt tool '{pytToolName}' executed out-of-proc; outputs: [{string.Join("; ", pytResult.Outputs)}]" };
+                    allMessages.Add(okMsg);
+                    if (!string.IsNullOrEmpty(pytResult.Messages))
+                        allMessages.Add(new { step = stepPrefix + proc.Name, type = "Message", text = pytResult.Messages! });
+                    if (job != null)
+                    {
+                        lock (job.Lock)
+                        {
+                            if (isRoot) job.CompletedSteps++;
+                            job.Messages.Add(okMsg);
+                        }
+                    }
+                    continue;
                 }
 
                 // ── Nested model in an .atbx: recurse through this executor ──
@@ -2923,7 +3096,8 @@ namespace APBridgeAddIn
 
                         var childOutcome = await ExecuteGraphAsync(
                             childBox, childTool, childNamed, job, allMessages,
-                            stepPrefix + proc.Name + " > ", inFlight, depth + 1);
+                            stepPrefix + proc.Name + " > ", inFlight, depth + 1,
+                            pytMode: pytMode, pytTimeoutSeconds: pytTimeoutSeconds);
                         if (!childOutcome.Ok)
                         {
                             if (proc.MarkedInvalid)
@@ -2943,6 +3117,12 @@ namespace APBridgeAddIn
                             };
                         }
 
+                        // Surface the child's skip counts on the parent outcome so
+                        // the root result reflects the whole recursion, not just
+                        // top-level steps.
+                        skippedSteps += childOutcome.SkippedSteps;
+                        skippedPytSteps += childOutcome.SkippedPytSteps;
+
                         // Child's output params (by name) → this step's output slots.
                         foreach (var (slotName, pm) in proc.Params)
                         {
@@ -2950,6 +3130,11 @@ namespace APBridgeAddIn
                             if (childOutcome.ParamOutputs.TryGetValue(slotName, out var ov)
                                 && !string.IsNullOrEmpty(ov))
                                 runtimeValues[pm.OutputVariableId] = ov;
+                            else if (childOutcome.SkippedPytSteps > 0)
+                                // The child skipped .pyt steps and this output never
+                                // materialized — cascade the skip to whatever
+                                // consumes it instead of feeding empty refs to GP.
+                                skippedOutputVarIds.Add(pm.OutputVariableId);
                         }
 
                         completedSteps++;
@@ -3246,7 +3431,13 @@ namespace APBridgeAddIn
 
             // Expose final Parameter-variable values so a parent model (or the
             // future) can map this graph's outputs by name.
-            var outcome = new GraphRunOutcome { Ok = true, StepsRun = completedSteps, SkippedSteps = skippedSteps };
+            var outcome = new GraphRunOutcome
+            {
+                Ok = true,
+                StepsRun = completedSteps,
+                SkippedSteps = skippedSteps,
+                SkippedPytSteps = skippedPytSteps
+            };
             foreach (var v in graph.Variables.Values)
             {
                 if (v.IsParameter && runtimeValues.TryGetValue(v.Id, out var pv) && !string.IsNullOrEmpty(pv))
@@ -3258,6 +3449,201 @@ namespace APBridgeAddIn
             finally
             {
                 inFlight.Remove(cycleKey);
+            }
+        }
+
+        /// <summary>Result of one out-of-proc .pyt tool execution.</summary>
+        private sealed class PytRunResult
+        {
+            public bool Ok;
+            public string? Error;
+            public List<string> Outputs = new();
+            public string? Messages;
+        }
+
+        // Python source for the out-of-proc .pyt step runner. Reads a JSON spec
+        // (pyt path, tool name, kwargs, env), imports the toolbox, calls the
+        // tool with keyword args, and prints ONE marked result line the bridge
+        // parses from stdout. Single-quoted strings only — this is embedded in
+        // a C# verbatim string.
+        private const string PytRunnerScript = @"
+import arcpy, json, sys, traceback
+
+def main():
+    with open(sys.argv[1], encoding='utf-8') as f:
+        spec = json.load(f)
+    env_attrs = {a.lower(): a for a in dir(arcpy.env)}
+    for k, v in (spec.get('env') or {}).items():
+        try:
+            if isinstance(v, str) and v.lower() in ('true', 'false'):
+                v = v.lower() == 'true'
+            setattr(arcpy.env, env_attrs.get(k.lower(), k), v)
+        except Exception:
+            pass
+    mod = arcpy.ImportToolbox(spec['pyt'])
+    fn = getattr(mod, spec['tool'])
+    res = fn(**(spec.get('kwargs') or {}))
+    outs = []
+    try:
+        for i in range(res.outputCount):
+            outs.append(str(res.getOutput(i)))
+    except Exception:
+        pass
+    msgs = ''
+    try:
+        msgs = res.getMessages()[:8000]
+    except Exception:
+        pass
+    print('::PYT_OK::' + json.dumps({'outputs': outs, 'messages': msgs}))
+
+try:
+    main()
+except arcpy.ExecuteError:
+    print('::PYT_ERR::' + json.dumps({'error': (arcpy.GetMessages(2) or 'ExecuteError')[:4000]}))
+    sys.exit(1)
+except Exception:
+    print('::PYT_ERR::' + json.dumps({'error': traceback.format_exc()[:4000]}))
+    sys.exit(1)
+";
+
+        /// <summary>
+        /// Locates propy.bat under the running Pro install (the Add-In lives in
+        /// ArcGISPro.exe, so its directory IS the install's bin folder).
+        /// </summary>
+        private static string? FindPropyBat()
+        {
+            try
+            {
+                var exe = System.Diagnostics.Process.GetCurrentProcess().MainModule?.FileName;
+                var bin = string.IsNullOrEmpty(exe) ? null : System.IO.Path.GetDirectoryName(exe);
+                if (bin != null)
+                {
+                    var p = System.IO.Path.Combine(bin, "Python", "Scripts", "propy.bat");
+                    if (File.Exists(p)) return p;
+                }
+            }
+            catch { /* fall through to the default install path */ }
+            var fallback = @"C:\Program Files\ArcGIS\Pro\bin\Python\Scripts\propy.bat";
+            return File.Exists(fallback) ? fallback : null;
+        }
+
+        /// <summary>
+        /// Executes one .pyt-hosted tool in a CHILD arcpy process via propy.bat.
+        /// In-proc ExecuteToolAsync on a .pyt path never returns; a child
+        /// process spawned from Pro inherits Pro's clean environment (conda
+        /// activation works — the corrupt agent-shell PATH problem does not
+        /// apply) and leaves Pro's Python lane untouched. Cross-process
+        /// caveats: no selection propagation, no in_memory datasets — inputs
+        /// must be concrete catalog paths, which is what the executor's
+        /// runtime map holds for materialized intermediates.
+        /// </summary>
+        private static async Task<PytRunResult> RunPytToolAsync(
+            string pytPath, string toolName,
+            IReadOnlyList<KeyValuePair<string, string>> kwargs,
+            IReadOnlyList<KeyValuePair<string, string>> envs,
+            int timeoutSeconds)
+        {
+            var propy = FindPropyBat();
+            if (propy == null)
+                return new PytRunResult
+                {
+                    Error = "propy.bat not found under the Pro install — cannot dispatch .pyt " +
+                            "steps out-of-proc. Re-run with pytMode=\"skip\" to run the rest of the model."
+                };
+
+            var workDir = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "ArcGisMcpBridge");
+            Directory.CreateDirectory(workDir);
+            var stamp = Guid.NewGuid().ToString("N").Substring(0, 8);
+            var scriptPath = System.IO.Path.Combine(workDir, $"pytrun_{stamp}.py");
+            var specPath = System.IO.Path.Combine(workDir, $"pytrun_{stamp}.json");
+
+            var kwObj = new JsonObject();
+            foreach (var kv in kwargs) kwObj[kv.Key] = kv.Value;
+            var envObj = new JsonObject();
+            foreach (var kv in envs) envObj[kv.Key] = kv.Value;
+            var spec = new JsonObject
+            {
+                ["pyt"] = pytPath,
+                ["tool"] = toolName,
+                ["kwargs"] = kwObj,
+                ["env"] = envObj
+            };
+
+            try
+            {
+                File.WriteAllText(specPath, spec.ToJsonString(), new System.Text.UTF8Encoding(false));
+                File.WriteAllText(scriptPath, PytRunnerScript, new System.Text.UTF8Encoding(false));
+
+                var psi = new System.Diagnostics.ProcessStartInfo
+                {
+                    // propy.bat is a batch file — launch through cmd; /s keeps
+                    // the nested quoting intact, /d skips AutoRun.
+                    FileName = "cmd.exe",
+                    Arguments = $"/d /s /c \"\"{propy}\" \"{scriptPath}\" \"{specPath}\"\"",
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true,
+                    WorkingDirectory = workDir
+                };
+                using var p = System.Diagnostics.Process.Start(psi);
+                if (p == null)
+                    return new PytRunResult { Error = "failed to start the child arcpy process" };
+
+                var stdoutTask = p.StandardOutput.ReadToEndAsync();
+                var stderrTask = p.StandardError.ReadToEndAsync();
+                using var cts = new System.Threading.CancellationTokenSource(
+                    TimeSpan.FromSeconds(Math.Max(30, timeoutSeconds)));
+                try
+                {
+                    await p.WaitForExitAsync(cts.Token);
+                }
+                catch (OperationCanceledException)
+                {
+                    try { p.Kill(entireProcessTree: true); } catch { /* already gone */ }
+                    return new PytRunResult
+                    {
+                        Error = $".pyt step timed out after {timeoutSeconds}s (child arcpy process killed). " +
+                                "Raise pytTimeoutSeconds if the tool legitimately runs longer."
+                    };
+                }
+                var stdout = await stdoutTask;
+                var stderr = await stderrTask;
+
+                var line = stdout.Split('\n')
+                    .Select(l => l.TrimEnd('\r'))
+                    .LastOrDefault(l => l.StartsWith("::PYT_OK::") || l.StartsWith("::PYT_ERR::"));
+                if (line == null)
+                {
+                    var detail = (stderr + "\n" + stdout).Trim();
+                    if (detail.Length > 4000) detail = detail.Substring(0, 4000);
+                    return new PytRunResult
+                    {
+                        Error = $"child arcpy process exited ({p.ExitCode}) without a result marker: {detail}"
+                    };
+                }
+                if (line.StartsWith("::PYT_ERR::"))
+                {
+                    var errNode = JsonNode.Parse(line.Substring("::PYT_ERR::".Length));
+                    return new PytRunResult { Error = errNode?["error"]?.ToString() ?? "unknown .pyt error" };
+                }
+
+                var okNode = JsonNode.Parse(line.Substring("::PYT_OK::".Length));
+                var result = new PytRunResult { Ok = true };
+                if (okNode?["outputs"] is JsonArray outputsArr)
+                    foreach (var o in outputsArr)
+                        result.Outputs.Add(o?.ToString() ?? "");
+                result.Messages = okNode?["messages"]?.ToString();
+                return result;
+            }
+            catch (Exception ex)
+            {
+                return new PytRunResult { Error = $"out-of-proc .pyt dispatch failed: {ex.Message}" };
+            }
+            finally
+            {
+                try { File.Delete(scriptPath); } catch { /* temp cleanup only */ }
+                try { File.Delete(specPath); } catch { /* temp cleanup only */ }
             }
         }
 
