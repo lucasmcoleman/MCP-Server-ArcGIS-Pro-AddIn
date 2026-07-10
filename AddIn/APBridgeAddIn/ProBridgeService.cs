@@ -2991,9 +2991,41 @@ namespace APBridgeAddIn
                         if (!string.IsNullOrEmpty(val)) pytKwargs.Add(new(slotName, val!));
                     }
 
+                    // Release GP-held schema locks in the parent before the child
+                    // writes: Pro's GP session keeps shared locks on every file
+                    // GDB it has touched this run, and a child needing an
+                    // EXCLUSIVE schema lock (e.g. CopyFeatures over an existing
+                    // FC in %scratchGDB%) dies with ERROR 000464 otherwise.
+                    // ClearWorkspaceCache is the documented remedy; best-effort.
+                    try
+                    {
+                        await Geoprocessing.ExecuteToolAsync("management.ClearWorkspaceCache",
+                            Geoprocessing.MakeValueArray(), env);
+                    }
+                    catch { /* child's own error surfaces if locks persist */ }
+
                     var pytResult = File.Exists(pytBox)
                         ? await RunPytToolAsync(pytBox, pytToolName, pytKwargs, MergeStepEnv(proc), pytTimeoutSeconds)
                         : new PytRunResult { Error = $".pyt file not found: {pytBox}" };
+
+                    // One lock-aware retry: 000464 is transient when the parent's
+                    // cache was repopulated between the clear and the child's
+                    // write (or a prior child/attempt left a lock draining).
+                    if (!pytResult.Ok && pytResult.Error?.Contains("000464") == true)
+                    {
+                        var retryNote = new { step = stepPrefix + proc.Name, type = "Warning",
+                            text = "Schema-lock contention (ERROR 000464) — clearing parent workspace cache and retrying the .pyt child once." };
+                        allMessages.Add(retryNote);
+                        if (job != null) { lock (job.Lock) job.Messages.Add(retryNote); }
+                        try
+                        {
+                            await Geoprocessing.ExecuteToolAsync("management.ClearWorkspaceCache",
+                                Geoprocessing.MakeValueArray(), env);
+                        }
+                        catch { /* proceed to retry regardless */ }
+                        await Task.Delay(TimeSpan.FromSeconds(3));
+                        pytResult = await RunPytToolAsync(pytBox, pytToolName, pytKwargs, MergeStepEnv(proc), pytTimeoutSeconds);
+                    }
 
                     if (!pytResult.Ok)
                     {
