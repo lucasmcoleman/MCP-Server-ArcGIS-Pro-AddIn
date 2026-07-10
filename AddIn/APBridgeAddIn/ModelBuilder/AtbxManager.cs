@@ -43,6 +43,22 @@ namespace APBridgeAddIn.ModelBuilder
             return null;
         }
 
+        // Agents send JSON booleans; hand-authored definitions sometimes carry
+        // "true"/"false" strings. Accept both, like the output-"parameter" flag.
+        private static bool JsonFlagTrue(JsonNode? node)
+        {
+            if (node is not JsonValue v) return false;
+            if (v.TryGetValue<bool>(out var b)) return b;
+            return string.Equals(TryGetString(v), "true", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool JsonFlagFalse(JsonNode? node)
+        {
+            if (node is not JsonValue v) return false;
+            if (v.TryGetValue<bool>(out var b)) return !b;
+            return string.Equals(TryGetString(v), "false", StringComparison.OrdinalIgnoreCase);
+        }
+
         /// <summary>
         /// Builds a Pro-native datatype JSON object for a parameter. For most
         /// types this is just <c>{"type": typeName}</c>. For GPComposite — when
@@ -203,8 +219,30 @@ namespace APBridgeAddIn.ModelBuilder
                 }
             }
 
-            // Build inputs list (Parameter variables not produced by any process)
-            var inputs = new JsonArray();
+            // Build inputs list (Parameter variables not produced by any process).
+            //
+            // tool.content's "params" object is Pro's authoritative public
+            // interface: its KEY ORDER is the dialog/arcpy calling order, and
+            // its per-entry "type" carries required/optional (absent = required).
+            // tool.model's variables array is creation order — the two routinely
+            // disagree on Pro-authored models. Collect inputs first, then emit
+            // them in tool.content order so a describe→update round-trip
+            // preserves the real interface instead of re-deriving it from
+            // variable-creation order.
+            var contentParamsObj = toolContent?["params"]?.AsObject();
+            var contentOrder = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            var contentEntries = new Dictionary<string, JsonNode?>(StringComparer.OrdinalIgnoreCase);
+            if (contentParamsObj != null)
+            {
+                int ci = 0;
+                foreach (var kv in contentParamsObj)
+                {
+                    contentOrder[kv.Key] = ci++;
+                    contentEntries[kv.Key] = kv.Value;
+                }
+            }
+
+            var inputList = new List<JsonObject>();
             foreach (var v in variables)
             {
                 var id = TryGetString(v?["id"]);
@@ -288,6 +326,35 @@ namespace APBridgeAddIn.ModelBuilder
                 if (displayName != varNames[id])
                     input["displayName"] = displayName;
 
+                // required/optional lives ONLY in tool.content ("type":"optional";
+                // absent = required). Surface it so update_model can write it
+                // back — previously it was dropped here and every rewritten
+                // input silently became required (ERROR 000735 at run time).
+                contentEntries.TryGetValue(varNames[id], out var contentEntry);
+                if (string.Equals(TryGetString(contentEntry?["type"]), "optional",
+                        StringComparison.OrdinalIgnoreCase))
+                    input["optional"] = true;
+
+                // A variable can carry connection_type "Parameter" in tool.model
+                // yet have NO tool.content entry — Pro does not expose it in the
+                // tool's public interface (GetParameterInfo omits it; seen on
+                // Pro-authored models with auto-named variables like "28").
+                // Mark such strays so update_model preserves the variable
+                // WITHOUT promoting it into the rewritten interface.
+                if (contentParamsObj != null && !contentEntries.ContainsKey(varNames[id]))
+                    input["exposed"] = false;
+
+                inputList.Add(input);
+            }
+
+            // Interface members in tool.content order; strays (exposed:false)
+            // and any entries missing from tool.content keep variable order,
+            // after the ordered ones (OrderBy is stable).
+            var inputs = new JsonArray();
+            foreach (var input in inputList.OrderBy(o =>
+                         contentOrder.TryGetValue(TryGetString(o["name"]) ?? "", out var idx)
+                             ? idx : int.MaxValue))
+            {
                 inputs.Add(input);
             }
 
@@ -297,7 +364,7 @@ namespace APBridgeAddIn.ModelBuilder
             {
                 var processId = TryGetString(p?["id"]);
                 var title = TryGetString(p?["title"]);
-                // Same four-shape detection as WalkModel — keep them in lockstep.
+                // Same five-shape detection as WalkModel — keep them in lockstep.
                 var systemTool = TryGetString(p?["system_tool"]);
                 var modelTool  = TryGetString(p?["model_tool"]);
                 var toolType   = TryGetString(p?["tool_type"]);
@@ -305,6 +372,10 @@ namespace APBridgeAddIn.ModelBuilder
                 string tool; string kind;
                 if (systemTool != null) { tool = systemTool;             kind = "gpTool"; }
                 else if (toolType == "ScriptTool") { tool = toolPath ?? "unknown"; kind = "scriptTool"; }
+                // .pyt-hosted script tool (path like "..\Tools.pyt\ToolName").
+                // Distinct from "ScriptTool" so the round-trip preserves Pro's
+                // stored tool_type verbatim.
+                else if (toolType == "PythonScriptTool") { tool = toolPath ?? "unknown"; kind = "pythonScriptTool"; }
                 else if (toolType == "ModelTool")  { tool = toolPath ?? "unknown"; kind = "nestedModel"; }
                 else if (modelTool != null)        { tool = modelTool;              kind = "iterator"; }
                 else                                { tool = "unknown";             kind = "unknown"; }
@@ -467,9 +538,22 @@ namespace APBridgeAddIn.ModelBuilder
             {
                 ["name"] = modelName,
                 ["description"] = description,
-                ["inputs"] = inputs,
-                ["steps"] = steps
+                ["inputs"] = inputs
             };
+
+            // Full public-interface order: tool.content's params key order,
+            // including derived-output parameters at their true positions
+            // (outputs are NOT necessarily last in a Pro-authored interface).
+            // update_model writes tool.content back in exactly this order.
+            if (contentParamsObj != null && contentParamsObj.Count > 0)
+            {
+                var orderArr = new JsonArray();
+                foreach (var kv in contentParamsObj)
+                    orderArr.Add(kv.Key);
+                result["parameterOrder"] = orderArr;
+            }
+
+            result["steps"] = steps;
 
             return result.ToJsonString(JsonOpts);
         }
@@ -613,15 +697,17 @@ namespace APBridgeAddIn.ModelBuilder
                 var modelTool  = TryGetString(p?["model_tool"]);
                 var toolType   = TryGetString(p?["tool_type"]);
                 var toolPath   = TryGetString(p?["path"]);
-                // Process header takes one of four shapes:
-                //   {system_tool:"alias.toolName"}             → built-in GP tool
-                //   {tool_type:"ScriptTool", path:"Name"}      → custom script tool by name
-                //   {tool_type:"ModelTool",  path:"Name"}      → nested model by name
-                //   {model_tool:"..."}                         → legacy iterator (and very old nested-model encoding)
+                // Process header takes one of five shapes:
+                //   {system_tool:"alias.toolName"}                  → built-in GP tool
+                //   {tool_type:"ScriptTool", path:"Name"}           → custom script tool by name
+                //   {tool_type:"PythonScriptTool", path:"X.pyt\\T"} → .pyt-hosted script tool
+                //   {tool_type:"ModelTool",  path:"Name"}           → nested model by name
+                //   {model_tool:"..."}                              → legacy iterator (and very old nested-model encoding)
                 ToolKind kind;
                 string tool;
                 if (systemTool != null) { tool = systemTool;             kind = ToolKind.GpTool; }
                 else if (toolType == "ScriptTool") { tool = toolPath ?? "unknown"; kind = ToolKind.ScriptTool; }
+                else if (toolType == "PythonScriptTool") { tool = toolPath ?? "unknown"; kind = ToolKind.PythonScriptTool; }
                 else if (toolType == "ModelTool")  { tool = toolPath ?? "unknown"; kind = ToolKind.NestedModel; }
                 else if (modelTool != null)        { tool = modelTool;              kind = ToolKind.Iterator; }
                 else                                { tool = "unknown";             kind = ToolKind.Unknown; }
@@ -1186,6 +1272,15 @@ namespace APBridgeAddIn.ModelBuilder
                 var displayName = TryGetString(input?["displayName"]) ?? name;
                 var dependencies = input?["dependencies"]?.AsArray();
                 var compositeTypes = input?["compositeTypes"]?.AsArray();
+                // "optional": true → tool.content "type":"optional" (absent =
+                // required). Round-trips describe_model's reading of the same
+                // flag; without this every rewritten input became required.
+                bool optional = JsonFlagTrue(input?["optional"]);
+                // "exposed": false marks a tool.model variable that carries the
+                // Parameter flag but has NO tool.content entry (Pro-authored
+                // stray — see DescribeModel). Preserve the variable, but do NOT
+                // manufacture a public-interface entry for it.
+                bool exposed = !JsonFlagFalse(input?["exposed"]);
                 var id = nextId++.ToString();
 
                 nameToId[name] = id;
@@ -1236,6 +1331,8 @@ namespace APBridgeAddIn.ModelBuilder
                 {
                     ["displayname"] = $"$rc:{name.ToLowerInvariant()}.title"
                 };
+                if (optional)
+                    contentParam["type"] = "optional";
                 if (type != null)
                     contentParam["datatype"] = BuildDataTypeJson(type, compositeTypes);
                 else if (hasDeps)
@@ -1262,8 +1359,11 @@ namespace APBridgeAddIn.ModelBuilder
                     if (depsArr.Count > 0)
                         contentParam["depends"] = depsArr;
                 }
-                contentParams[name] = contentParam;
-                rcMap[$"{name.ToLowerInvariant()}.title"] = displayName;
+                if (exposed)
+                {
+                    contentParams[name] = contentParam;
+                    rcMap[$"{name.ToLowerInvariant()}.title"] = displayName;
+                }
 
                 // Diagram node (ellipse for variables)
                 diagramNodes.Add((id, displayName, "Ellipse", currentX, currentY));
@@ -1292,6 +1392,7 @@ namespace APBridgeAddIn.ModelBuilder
                 bool kindOk =
                     pKind.Equals("gpTool", StringComparison.OrdinalIgnoreCase) ||
                     pKind.Equals("scriptTool", StringComparison.OrdinalIgnoreCase) ||
+                    pKind.Equals("pythonScriptTool", StringComparison.OrdinalIgnoreCase) ||
                     pKind.Equals("nestedModel", StringComparison.OrdinalIgnoreCase);
                 if (!kindOk)
                     throw new Exception(
@@ -1520,9 +1621,10 @@ namespace APBridgeAddIn.ModelBuilder
                 }
 
                 // Process header shape varies by step kind:
-                //   gpTool      → {system_tool: "alias.toolName"}
-                //   scriptTool  → {tool_type: "ScriptTool", path: "Name"}
-                //   nestedModel → {tool_type: "ModelTool",  path: "Name"}
+                //   gpTool           → {system_tool: "alias.toolName"}
+                //   scriptTool       → {tool_type: "ScriptTool", path: "Name"}
+                //   pythonScriptTool → {tool_type: "PythonScriptTool", path: "X.pyt\\Tool"}
+                //   nestedModel      → {tool_type: "ModelTool",  path: "Name"}
                 // Path values are names relative to the host toolbox, no
                 // extension. WalkModel mirrors the inverse mapping.
                 var process = new JsonObject
@@ -1534,6 +1636,11 @@ namespace APBridgeAddIn.ModelBuilder
                 if (string.Equals(kind, "scriptTool", StringComparison.OrdinalIgnoreCase))
                 {
                     process["tool_type"] = "ScriptTool";
+                    process["path"] = tool;
+                }
+                else if (string.Equals(kind, "pythonScriptTool", StringComparison.OrdinalIgnoreCase))
+                {
+                    process["tool_type"] = "PythonScriptTool";
                     process["path"] = tool;
                 }
                 else if (string.Equals(kind, "nestedModel", StringComparison.OrdinalIgnoreCase))
@@ -1612,6 +1719,36 @@ namespace APBridgeAddIn.ModelBuilder
                 ["variables"] = variables,
                 ["processes"] = processes
             };
+
+            // Honor caller-supplied interface order. describe_model emits
+            // "parameterOrder" from tool.content's params key order — the
+            // dialog/arcpy calling order, in which derived outputs may sit
+            // ANYWHERE, not just last. Without it, order falls back to
+            // [inputs in definition order] + [output params in step order]
+            // (the pre-existing behavior, kept for older clients).
+            var orderArr = def["parameterOrder"]?.AsArray();
+            if (orderArr != null && orderArr.Count > 0 && contentParams.Count > 0)
+            {
+                var ordered = new JsonObject();
+                foreach (var nameNode in orderArr)
+                {
+                    var pn = TryGetString(nameNode);
+                    if (pn == null || ordered.ContainsKey(pn)) continue;
+                    if (contentParams[pn] is JsonNode entry)
+                    {
+                        contentParams.Remove(pn);
+                        ordered[pn] = entry;
+                    }
+                }
+                // Params not named in parameterOrder (e.g. freshly added by the
+                // caller) keep their generated relative order, after the rest.
+                foreach (var kv in contentParams.ToList())
+                {
+                    contentParams.Remove(kv.Key);
+                    ordered[kv.Key] = kv.Value;
+                }
+                contentParams = ordered;
+            }
 
             // Build tool.content
             var toolContent = new JsonObject
@@ -1972,6 +2109,13 @@ namespace APBridgeAddIn.ModelBuilder
     {
         GpTool,
         ScriptTool,
+        /// <summary>
+        /// .pyt-hosted script tool (tool_type "PythonScriptTool", path like
+        /// "..\Tools.pyt\ToolName"). Round-trips faithfully through
+        /// describe/update; NOT step-executed — in-proc ExecuteToolAsync on a
+        /// .pyt path is the documented hang landmine (see CLAUDE.md).
+        /// </summary>
+        PythonScriptTool,
         NestedModel,
         Iterator,
         Unknown
