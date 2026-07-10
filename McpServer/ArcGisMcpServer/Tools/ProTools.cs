@@ -742,7 +742,11 @@ namespace ArcGisMcpServer.Tools
                 "(partial mode: skip them and everything downstream of them; " +
                 "reported as skippedPytSteps).")] string? pytMode = null,
             [Description("Optional: per-.pyt-step timeout in seconds for out-of-proc " +
-                "execution (default 3600).")] int? pytTimeoutSeconds = null)
+                "execution (default 3600).")] int? pytTimeoutSeconds = null,
+            [Description("Optional: isolate .pyt children's env-derived writes into a " +
+                "run-private scratch GDB (default true — avoids ERROR 000464 schema-lock " +
+                "contention with Pro's live scratch). Set false only for models whose " +
+                "stored literal paths expect .pyt outputs inside the parent scratch GDB.")] bool? pytIsolatedScratch = null)
         {
             var args = new Dictionary<string, string>
             {
@@ -757,6 +761,8 @@ namespace ArcGisMcpServer.Tools
                 args["pytMode"] = pytMode;
             if (pytTimeoutSeconds is > 0)
                 args["pytTimeoutSeconds"] = pytTimeoutSeconds.Value.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            if (pytIsolatedScratch.HasValue)
+                args["pytIsolatedScratch"] = pytIsolatedScratch.Value ? "true" : "false";
 
             var r = await _client!.OpAsync("pro.runModel", args);
             return FormatResult(r, "pro.runModel");
@@ -777,7 +783,9 @@ namespace ArcGisMcpServer.Tools
                 "(not just exposed parameters) — see run_model for usage.")] string? variableOverrides = null,
             [Description("Optional: .pyt step handling — 'execute' (default) or 'skip'; " +
                 "see run_model for details.")] string? pytMode = null,
-            [Description("Optional: per-.pyt-step timeout in seconds (default 3600).")] int? pytTimeoutSeconds = null)
+            [Description("Optional: per-.pyt-step timeout in seconds (default 3600).")] int? pytTimeoutSeconds = null,
+            [Description("Optional: isolate .pyt children's env-derived writes into a " +
+                "run-private scratch GDB (default true); see run_model.")] bool? pytIsolatedScratch = null)
         {
             var args = new Dictionary<string, string>
             {
@@ -792,6 +800,8 @@ namespace ArcGisMcpServer.Tools
                 args["pytMode"] = pytMode;
             if (pytTimeoutSeconds is > 0)
                 args["pytTimeoutSeconds"] = pytTimeoutSeconds.Value.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            if (pytIsolatedScratch.HasValue)
+                args["pytIsolatedScratch"] = pytIsolatedScratch.Value ? "true" : "false";
 
             var r = await _client!.OpAsync("pro.runModelAsync", args);
             return FormatResult(r, "pro.runModelAsync");
