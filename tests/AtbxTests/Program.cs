@@ -203,6 +203,23 @@ try
     var optRedesc = JsonNode.Parse(AtbxManager.DescribeModel(tbx, "OptModel"))!;
     Check(JsonNode.DeepEquals(optDesc, optRedesc), "optional-flag model round-trip stable");
 
+    // Every $rc: displayname ref in tool.content must have a backing key in
+    // tool.content.rc's map — a dangling ref renders as a blank label in Pro.
+    // Covers newly-exposed output params (field-report from the relay session).
+    {
+        var rcNode = JsonNode.Parse(ReadEntryJsonText(tbx, "OptModel.tool/tool.content.rc"))!;
+        var rcKeys = rcNode["map"]!.AsObject().Select(kv => kv.Key).ToHashSet(StringComparer.Ordinal);
+        var contentNow = JsonNode.Parse(ReadEntryJsonText(tbx, "OptModel.tool/tool.content"))!;
+        var dangling = contentNow["params"]!.AsObject()
+            .Select(kv => kv.Value?["displayname"]?.GetValue<string>())
+            .Where(dn => dn != null && dn.StartsWith("$rc:") && !rcKeys.Contains(dn[4..]))
+            .ToList();
+        Check(dangling.Count == 0, "no dangling $rc: displayname refs after update",
+            string.Join(",", dangling));
+        Check(rcKeys.Contains("bufout.title"),
+            "output-parameter rc title key present", string.Join(",", rcKeys.OrderBy(k => k)));
+    }
+
     // Simulate a Pro-authored file: (a) tool.content param order differs from
     // tool.model variable order (dialog order is authoritative); (b) a stray
     // auto-named variable ("28") carries connection_type Parameter in
