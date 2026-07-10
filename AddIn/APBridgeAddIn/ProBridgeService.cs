@@ -3073,13 +3073,19 @@ namespace APBridgeAddIn
                         ? await RunPytToolAsync(pytBox, pytToolName, pytKwargs, childEnv, pytTimeoutSeconds)
                         : new PytRunResult { Error = $".pyt file not found: {pytBox}" };
 
-                    // One lock-aware retry: 000464 is transient when the parent's
-                    // cache was repopulated between the clear and the child's
-                    // write (or a prior child/attempt left a lock draining).
+                    // One lock-aware retry with INPUT isolation: 000464 on a .pyt
+                    // child usually means the tool modifies an input in place
+                    // (AddField etc.) and the input lives in a GDB the parent
+                    // process holds locks on. The retry tells the CHILD to copy
+                    // such inputs into its isolated scratch first (child-side
+                    // copy — the child's read takes only a shared lock, and the
+                    // parent never touches the isolated GDB) and run against
+                    // the copies; the rewritten kwargs come back in the result.
                     if (!pytResult.Ok && pytResult.Error?.Contains("000464") == true)
                     {
                         var retryNote = new { step = stepPrefix + proc.Name, type = "Warning",
-                            text = "Schema-lock contention (ERROR 000464) — clearing parent workspace cache and retrying the .pyt child once." };
+                            text = "Schema-lock contention (ERROR 000464) — retrying the .pyt child with " +
+                                   "contended parent-GDB inputs copied into the isolated scratch." };
                         allMessages.Add(retryNote);
                         if (job != null) { lock (job.Lock) job.Messages.Add(retryNote); }
                         try
@@ -3089,7 +3095,8 @@ namespace APBridgeAddIn
                         }
                         catch { /* proceed to retry regardless */ }
                         await Task.Delay(TimeSpan.FromSeconds(3));
-                        pytResult = await RunPytToolAsync(pytBox, pytToolName, pytKwargs, childEnv, pytTimeoutSeconds);
+                        pytResult = await RunPytToolAsync(pytBox, pytToolName, pytKwargs, childEnv,
+                            pytTimeoutSeconds, isolateInputs: true);
                     }
 
                     if (!pytResult.Ok)
@@ -3130,8 +3137,12 @@ namespace APBridgeAddIn
                         outIdx++;
                     }
                     // Fallback for any out slot the result didn't cover: first
-                    // resolved input value (the in-place pre-pass pattern).
-                    var firstInput = pytKwargs.FirstOrDefault().Value;
+                    // resolved input value (the in-place pre-pass pattern). Use
+                    // the kwargs the child ACTUALLY ran with — after an
+                    // isolate_inputs retry the modified dataset is the isolated
+                    // COPY, not the original parent path.
+                    var firstInput = pytResult.KwargsUsed?.Values.FirstOrDefault()
+                                     ?? pytKwargs.FirstOrDefault().Value;
                     foreach (var (_, pm) in proc.Params)
                     {
                         if (pm.OutputVariableId == null || runtimeValues.ContainsKey(pm.OutputVariableId)) continue;
@@ -3590,6 +3601,10 @@ namespace APBridgeAddIn
             public string? Error;
             public List<string> Outputs = new();
             public string? Messages;
+            /// <summary>The kwargs the child actually ran with — differs from
+            /// what was sent when isolate_inputs copied contended inputs into
+            /// the child's scratch. Used for the in-place output fallback.</summary>
+            public Dictionary<string, string>? KwargsUsed;
         }
 
         // Python source for the out-of-proc .pyt step runner. Reads a JSON spec
@@ -3601,6 +3616,7 @@ namespace APBridgeAddIn
 import arcpy, json, sys, traceback
 
 def main():
+    import os
     with open(sys.argv[1], encoding='utf-8') as f:
         spec = json.load(f)
     env_attrs = {a.lower(): a for a in dir(arcpy.env)}
@@ -3611,9 +3627,42 @@ def main():
             setattr(arcpy.env, env_attrs.get(k.lower(), k), v)
         except Exception:
             pass
+    kw = dict(spec.get('kwargs') or {})
+    # Lock-contention retry mode: tools that MODIFY an input in place
+    # (AddField etc.) need an exclusive schema lock that the parent Pro
+    # process may hold on the input's GDB. Copy such inputs into THIS
+    # child's scratch — child-side copy, because our read takes only a
+    # shared lock and our write targets a GDB the parent never touched —
+    # and run against the copies. Rewritten kwargs are reported back so
+    # the bridge maps outputs onto the right paths.
+    if spec.get('isolate_inputs'):
+        iso = str(arcpy.env.scratchWorkspace or arcpy.env.workspace or '')
+        if iso:
+            for k, v in list(kw.items()):
+                if not isinstance(v, str):
+                    continue
+                parts = v.split(';')
+                changed = False
+                for i, p in enumerate(parts):
+                    q = p.strip()
+                    if '.gdb' not in q.lower():
+                        continue
+                    if q.lower().startswith(iso.lower()):
+                        continue
+                    try:
+                        if not arcpy.Exists(q):
+                            continue
+                        tgt = os.path.join(iso, os.path.basename(q))
+                        arcpy.management.Copy(q, tgt)
+                        parts[i] = tgt
+                        changed = True
+                    except Exception:
+                        pass
+                if changed:
+                    kw[k] = ';'.join(parts)
     mod = arcpy.ImportToolbox(spec['pyt'])
     fn = getattr(mod, spec['tool'])
-    res = fn(**(spec.get('kwargs') or {}))
+    res = fn(**kw)
     outs = []
     try:
         for i in range(res.outputCount):
@@ -3625,7 +3674,7 @@ def main():
         msgs = res.getMessages()[:8000]
     except Exception:
         pass
-    print('::PYT_OK::' + json.dumps({'outputs': outs, 'messages': msgs}))
+    print('::PYT_OK::' + json.dumps({'outputs': outs, 'messages': msgs, 'kwargs_used': kw}))
 
 try:
     main()
@@ -3672,7 +3721,8 @@ except Exception:
             string pytPath, string toolName,
             IReadOnlyList<KeyValuePair<string, string>> kwargs,
             IReadOnlyList<KeyValuePair<string, string>> envs,
-            int timeoutSeconds)
+            int timeoutSeconds,
+            bool isolateInputs = false)
         {
             var propy = FindPropyBat();
             if (propy == null)
@@ -3699,6 +3749,8 @@ except Exception:
                 ["kwargs"] = kwObj,
                 ["env"] = envObj
             };
+            if (isolateInputs)
+                spec["isolate_inputs"] = true;
 
             try
             {
@@ -3765,6 +3817,12 @@ except Exception:
                     foreach (var o in outputsArr)
                         result.Outputs.Add(o?.ToString() ?? "");
                 result.Messages = okNode?["messages"]?.ToString();
+                if (okNode?["kwargs_used"] is JsonObject usedObj)
+                {
+                    result.KwargsUsed = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var kv in usedObj)
+                        result.KwargsUsed[kv.Key] = kv.Value?.ToString() ?? "";
+                }
                 return result;
             }
             catch (Exception ex)
