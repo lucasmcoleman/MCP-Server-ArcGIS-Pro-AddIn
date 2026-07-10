@@ -2686,12 +2686,38 @@ namespace APBridgeAddIn
                 && int.TryParse(pytTimeoutRaw, out var pytTimeoutVal) && pytTimeoutVal > 0)
                 pytTimeoutSeconds = pytTimeoutVal;
 
+            // Isolated child scratch (default ON): .pyt children write their
+            // env-derived outputs (arcpy.env.scratchGDB / env.workspace) into a
+            // run-private GDB instead of Pro's live scratch. Pro's main process
+            // holds SHARED locks on every file GDB it writes in-proc during the
+            // run, so a child needing an EXCLUSIVE schema lock there dies with
+            // ERROR 000464 — ClearWorkspaceCache alone proved insufficient in
+            // the field. Downstream steps follow the child's ACTUAL output
+            // paths via the getOutput mapping, so connected chains work; only
+            // models whose stored LITERAL paths expect .pyt outputs inside the
+            // parent scratch need pytIsolatedScratch=false.
+            string? pytScratchGdb = null;
+            bool isolatePyt = !(args.TryGetValue("pytIsolatedScratch", out var isoRaw)
+                && string.Equals(isoRaw?.Trim(), "false", StringComparison.OrdinalIgnoreCase));
+            if (isolatePyt && pytMode == "execute")
+            {
+                try
+                {
+                    var tbxDir = System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(path));
+                    var stamp = Guid.NewGuid().ToString("N").Substring(0, 8);
+                    pytScratchGdb = System.IO.Path.Combine(
+                        string.IsNullOrEmpty(tbxDir) ? System.IO.Path.GetTempPath() : tbxDir!,
+                        $"pyt_scratch_{stamp}.gdb");
+                }
+                catch { pytScratchGdb = null; }
+            }
+
             var allMessages = new List<object>();
             var outcome = await ExecuteGraphAsync(
                 path, modelName, namedValues, job,
                 allMessages, stepPrefix: "",
                 inFlight: new HashSet<string>(StringComparer.OrdinalIgnoreCase),
-                depth: 0, varOverrides, pytMode, pytTimeoutSeconds);
+                depth: 0, varOverrides, pytMode, pytTimeoutSeconds, pytScratchGdb);
 
             if (!outcome.Ok)
                 return new(false, outcome.Error, outcome.ErrorData);
@@ -2731,7 +2757,8 @@ namespace APBridgeAddIn
             int depth,
             Dictionary<string, string>? varOverrides = null,
             string pytMode = "execute",
-            int pytTimeoutSeconds = 3600)
+            int pytTimeoutSeconds = 3600,
+            string? pytScratchGdb = null)
         {
             bool isRoot = depth == 0;
             if (depth > 8)
@@ -2991,12 +3018,50 @@ namespace APBridgeAddIn
                         if (!string.IsNullOrEmpty(val)) pytKwargs.Add(new(slotName, val!));
                     }
 
+                    // Isolated child scratch: create the run-private GDB on first
+                    // use and point the child's workspace + scratchWorkspace at
+                    // it, so env-derived writes (arcpy.env.scratchGDB fallbacks
+                    // like NetNeed's Net_Unmet_Need) never contend with the
+                    // shared locks Pro's main process holds on the live scratch.
+                    // Inputs stay absolute parent paths — cross-process READS
+                    // take shared locks and don't conflict.
+                    if (pytScratchGdb != null && !Directory.Exists(pytScratchGdb))
+                    {
+                        var isoFolder = System.IO.Path.GetDirectoryName(pytScratchGdb);
+                        var isoName = System.IO.Path.GetFileName(pytScratchGdb);
+                        if (!string.IsNullOrEmpty(isoFolder) && !string.IsNullOrEmpty(isoName))
+                        {
+                            try { Directory.CreateDirectory(isoFolder); } catch { /* CreateFileGDB error will tell */ }
+                            var mkIso = await Geoprocessing.ExecuteToolAsync("management.CreateFileGDB",
+                                Geoprocessing.MakeValueArray(isoFolder, isoName), env);
+                            var isoNote = new { step = stepPrefix + proc.Name, type = "Message",
+                                text = mkIso.IsFailed
+                                    ? $"Could not create isolated .pyt scratch GDB {pytScratchGdb}: " +
+                                      string.Join("; ", mkIso.Messages.Select(m => m.Text))
+                                    : $"Isolated .pyt scratch GDB: {pytScratchGdb}" };
+                            allMessages.Add(isoNote);
+                            if (job != null) { lock (job.Lock) job.Messages.Add(isoNote); }
+                        }
+                    }
+                    IReadOnlyList<KeyValuePair<string, string>> childEnv = MergeStepEnv(proc);
+                    if (pytScratchGdb != null && Directory.Exists(pytScratchGdb))
+                    {
+                        var redirected = new List<KeyValuePair<string, string>>(childEnv);
+                        redirected.RemoveAll(kv =>
+                            kv.Key.Equals("workspace", StringComparison.OrdinalIgnoreCase) ||
+                            kv.Key.Equals("scratchWorkspace", StringComparison.OrdinalIgnoreCase));
+                        redirected.Add(new KeyValuePair<string, string>("workspace", pytScratchGdb));
+                        redirected.Add(new KeyValuePair<string, string>("scratchWorkspace", pytScratchGdb));
+                        childEnv = redirected;
+                    }
+
                     // Release GP-held schema locks in the parent before the child
                     // writes: Pro's GP session keeps shared locks on every file
                     // GDB it has touched this run, and a child needing an
                     // EXCLUSIVE schema lock (e.g. CopyFeatures over an existing
                     // FC in %scratchGDB%) dies with ERROR 000464 otherwise.
-                    // ClearWorkspaceCache is the documented remedy; best-effort.
+                    // Kept alongside scratch isolation as defense in depth for
+                    // tools that write to explicit parent-GDB paths.
                     try
                     {
                         await Geoprocessing.ExecuteToolAsync("management.ClearWorkspaceCache",
@@ -3005,7 +3070,7 @@ namespace APBridgeAddIn
                     catch { /* child's own error surfaces if locks persist */ }
 
                     var pytResult = File.Exists(pytBox)
-                        ? await RunPytToolAsync(pytBox, pytToolName, pytKwargs, MergeStepEnv(proc), pytTimeoutSeconds)
+                        ? await RunPytToolAsync(pytBox, pytToolName, pytKwargs, childEnv, pytTimeoutSeconds)
                         : new PytRunResult { Error = $".pyt file not found: {pytBox}" };
 
                     // One lock-aware retry: 000464 is transient when the parent's
@@ -3024,7 +3089,7 @@ namespace APBridgeAddIn
                         }
                         catch { /* proceed to retry regardless */ }
                         await Task.Delay(TimeSpan.FromSeconds(3));
-                        pytResult = await RunPytToolAsync(pytBox, pytToolName, pytKwargs, MergeStepEnv(proc), pytTimeoutSeconds);
+                        pytResult = await RunPytToolAsync(pytBox, pytToolName, pytKwargs, childEnv, pytTimeoutSeconds);
                     }
 
                     if (!pytResult.Ok)
@@ -3129,7 +3194,8 @@ namespace APBridgeAddIn
                         var childOutcome = await ExecuteGraphAsync(
                             childBox, childTool, childNamed, job, allMessages,
                             stepPrefix + proc.Name + " > ", inFlight, depth + 1,
-                            pytMode: pytMode, pytTimeoutSeconds: pytTimeoutSeconds);
+                            pytMode: pytMode, pytTimeoutSeconds: pytTimeoutSeconds,
+                            pytScratchGdb: pytScratchGdb);
                         if (!childOutcome.Ok)
                         {
                             if (proc.MarkedInvalid)
