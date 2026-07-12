@@ -362,8 +362,9 @@ MigrationBackup/
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
 
-# Claude Code per-user session state
-.claude/
+# Claude Code per-user session state (but track the repo skill set in .claude/skills/)
+.claude/*
+!.claude/skills/
 
 # MCP server published single-file exe (rebuilt locally via build-mcp-server.ps1)
 McpServer/ArcGisMcpServer/publish/
