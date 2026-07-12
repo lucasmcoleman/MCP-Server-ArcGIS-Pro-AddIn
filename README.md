@@ -1,6 +1,6 @@
 # ArcGIS Pro MCP Bridge
 
-An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that lets MCP clients — Claude Code, GitHub Copilot Agent Mode, M365 Copilot Studio, Anthropic API integrations, anything that speaks MCP — drive **ArcGIS Pro** in real time. The server brokers calls over a named pipe to an in-process Pro Add-In, exposing **84 tools** spanning layer introspection, map operations, editing, symbology, project lifecycle, geoprocessing (with dynamic tool-schema discovery), ModelBuilder, layout production, an in-process **Python/arcpy escape hatch**, and **map-view capture** so the agent can literally see the map it's making.
+An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that lets MCP clients — Claude Code, GitHub Copilot Agent Mode, M365 Copilot Studio, Anthropic API integrations, anything that speaks MCP — drive **ArcGIS Pro** in real time. The server brokers calls over a named pipe to an in-process Pro Add-In, exposing **83 tools** spanning layer introspection, map operations, editing, symbology, project lifecycle, geoprocessing (with dynamic tool-schema discovery), ModelBuilder, layout production, an in-process **Python/arcpy escape hatch**, and **map-view capture** so the agent can literally see the map it's making.
 
 Two transports are supported in the same binary:
 - **stdio** (default) — for local clients that spawn the server as a subprocess (`.mcp.json` in Claude Code, etc.)
@@ -11,7 +11,7 @@ Two transports are supported in the same binary:
 ## What it does
 
 - **Drive Pro from natural language.** Ask the agent to "buffer the West Coast states by 50 miles, dissolve, calculate area in square miles, then export a PDF" and it chains the right MCP tools together.
-- **84 first-class tools** across 12 domains (full list below). All return structured JSON, not opaque strings — agents can introspect errors and chain operations programmatically.
+- **83 first-class tools** across 12 domains (full list below). All return structured JSON, not opaque strings — agents can introspect errors and chain operations programmatically.
 - **The agent can SEE the map.** `capture_map_view` exports the live map view to PNG; combined with symbology/labeling/layout tools this closes the see-act-verify loop for cartography.
 - **Full arcpy access.** `execute_python` runs arbitrary Python in-process in Pro's embedded interpreter — `arcpy.mp.ArcGISProject('CURRENT')` manipulates the open project, stdout is captured, tracebacks come back for self-correction.
 - **GP tool self-service.** `describe_gp_tool` / `search_gp_tools` read Pro's installed system-toolbox metadata at runtime, so the agent gets exact positional signatures, types, coded-value domains, and defaults for ~1,700 system tools instead of guessing.
@@ -30,7 +30,7 @@ See [`CHANGELOG.md`](CHANGELOG.md) for the evolution from a basic pipe demo to t
    │  MCP Client         │◀──────────────────────▶│  ArcGisMcpServer.exe │
    │  (Claude Code,      │                        │  (.NET 8 console)    │
    │   Copilot Agent…)   │                        │                      │
-   └─────────────────────┘                        │  - 28 [McpServerTool]│
+   └─────────────────────┘                        │  - 83 [McpServerTool]│
                                                   │    methods           │
                                                   │  - BridgeClient      │
                                                   │  - BridgeDiscovery   │
@@ -644,7 +644,9 @@ See `CHANGELOG.md` for the historical context (which fix introduced which patter
 
 ## License
 
-This project is provided as-is for demonstration and development purposes. Check with the repo owner for production-use licensing.
+MIT License — see [LICENSE](LICENSE) for the full text. This applies to this repository's original work.
+
+This project originated as a fork of [nicogis/MCP-Server-ArcGIS-Pro-AddIn](https://github.com/nicogis/MCP-Server-ArcGIS-Pro-AddIn), which carries no license; any surviving upstream-derived fragments remain their original author's. In practice the codebase has been almost entirely rewritten since the fork — of the files that still exist from the last upstream merge, only one small file is byte-identical to upstream, while the core logic files have grown roughly 10-25x with near-total insertions over the original content.
 
 ---
 
