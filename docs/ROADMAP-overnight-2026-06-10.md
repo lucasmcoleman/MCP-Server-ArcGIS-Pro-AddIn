@@ -1,5 +1,12 @@
 # Overnight Deep-Dive Roadmap — 2026-06-10
 
+> **STALE — checkbox state is not maintained. Do not use this file as a backlog.**
+> Audited 2026-07-12: nearly every unchecked item below actually shipped (Batches B–I
+> are fully delivered; most of Batch A too — verified against code). The only items
+> confirmed still open are **A11** (SanitizeGdbName has no collision-suffix logic) and
+> **F6** (`add_layer_from_file`/`add_layer_from_url` never got the `map` parameter).
+> Grep the code before treating anything here as un-built.
+
 Synthesized from a 25-agent audit (5 review dimensions with adversarial verification,
 4 capability-gap analysts incl. SDK research + competitive scan) plus a full inline
 read of the codebase. Self-approved per Lucas's overnight authorization.
