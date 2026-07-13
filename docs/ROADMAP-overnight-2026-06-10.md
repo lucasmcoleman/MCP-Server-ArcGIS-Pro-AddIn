@@ -2,10 +2,16 @@
 
 > **STALE — checkbox state is not maintained. Do not use this file as a backlog.**
 > Audited 2026-07-12: nearly every unchecked item below actually shipped (Batches B–I
-> are fully delivered; most of Batch A too — verified against code). The only items
-> confirmed still open are **A11** (SanitizeGdbName has no collision-suffix logic) and
-> **F6** (`add_layer_from_file`/`add_layer_from_url` never got the `map` parameter).
-> Grep the code before treating anything here as un-built.
+> are fully delivered; most of Batch A too — verified against code). The two items
+> this file previously listed as confirmed-still-open, **A11** (SanitizeGdbName
+> collision suffixes) and **F6** (`map` param on `add_layer_from_file`/`add_layer_from_url`),
+> both landed the same day (2026-07-12, see CHANGELOG.md "Handover Hardening") —
+> checkboxes below updated accordingly. A11's fix is Add-In-side (extends the
+> pre-existing dedup `HashSet` run-wide across nested-model recursion) and only
+> takes effect after the `.esriAddinX` bundle is rebuilt and redeployed; F6's fix
+> is server-side only and is live as soon as the MCP exe is republished.
+> No other item's checkbox state was re-audited — grep the code before treating
+> anything else here as un-built.
 
 Synthesized from a 25-agent audit (5 review dimensions with adversarial verification,
 4 capability-gap analysts incl. SDK research + competitive scan) plus a full inline
@@ -36,7 +42,7 @@ control, map/project bootstrap, GP tool schema discovery, and catalog browsing.
 - [ ] A8 Per-step environments applied during run_model
 - [ ] A9 Iterator/unknown steps: writer throws instead of silently corrupting
 - [ ] A10 Derived-output-as-parameter round-trip fidelity
-- [ ] A11 SanitizeGdbName collision suffixes
+- [x] A11 SanitizeGdbName collision suffixes (run-wide across nested-model recursion, 2026-07-12 — pending Add-In redeploy)
 - [ ] A12 Params dict case-insensitive; completedSteps payload fix; step-name fallback
 - [ ] A13 No-project guards; async-job failures logged; get_run_status incremental messages
 - [ ] A14 BridgeClient: bridge-down → structured actionable error (not generic IOException)
@@ -75,7 +81,7 @@ control, map/project bootstrap, GP tool schema discovery, and catalog browsing.
 - [ ] F3 set_definition_query / clear (+ surfaced in get_layer_properties)
 - [ ] F4 set_layer_transparency
 - [ ] F5 set_labeling (enable/disable + expression)
-- [ ] F6 map param on add_layer_from_file/url
+- [x] F6 map param on add_layer_from_file/url (2026-07-12)
 
 ## Batch G — Layout furniture
 - [ ] G1 add_legend / add_north_arrow / add_scale_bar
