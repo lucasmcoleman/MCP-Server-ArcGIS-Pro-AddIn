@@ -383,11 +383,14 @@ namespace ArcGisMcpServer.Tools
             "Also accepts image services, tile services, WMS, and other Pro-supported URI sources.")]
         public static async Task<string> AddLayerFromUrl(
             [Description("URL to the service or layer endpoint")] string url,
-            [Description("Optional: display name for the new layer in the TOC")] string? name = null)
+            [Description("Optional: display name for the new layer in the TOC")] string? name = null,
+            [Description("Optional: name of the map to operate on. Default: active map.")] string? map = null)
         {
             var args = new Dictionary<string, string> { ["url"] = url };
             if (!string.IsNullOrWhiteSpace(name))
                 args["name"] = name;
+            if (!string.IsNullOrWhiteSpace(map))
+                args["map"] = map;
             var r = await _client!.OpAsync("pro.addLayerFromUrl", args);
             return FormatResult(r, "pro.addLayerFromUrl");
         }
@@ -400,11 +403,14 @@ namespace ArcGisMcpServer.Tools
             "(e.g., 'F:/projects/my.gdb/Roads').")]
         public static async Task<string> AddLayerFromFile(
             [Description("Full file-system path to the data source")] string path,
-            [Description("Optional: display name for the new layer in the TOC")] string? name = null)
+            [Description("Optional: display name for the new layer in the TOC")] string? name = null,
+            [Description("Optional: name of the map to operate on. Default: active map.")] string? map = null)
         {
             var args = new Dictionary<string, string> { ["path"] = path };
             if (!string.IsNullOrWhiteSpace(name))
                 args["name"] = name;
+            if (!string.IsNullOrWhiteSpace(map))
+                args["map"] = map;
             var r = await _client!.OpAsync("pro.addLayerFromFile", args);
             return FormatResult(r, "pro.addLayerFromFile");
         }
@@ -1627,6 +1633,18 @@ namespace ArcGisMcpServer.Tools
                         "select_bridge cannot override an operator pin. To work across multiple Pro " +
                         "instances from one session, either run this server unpinned or configure one " +
                         "pinned server entry per instance in .mcp.json."),
+                    IndentedJsonContext.Default.FormatErrorPayload);
+
+            // RuntimeOverride is process-global (see BridgeDiscovery.HttpMode doc
+            // comment); on the shared HTTP transport, refuse unless the operator
+            // has explicitly accepted the cross-caller redirect risk.
+            if (BridgeDiscovery.HttpMode
+                && Environment.GetEnvironmentVariable("MCP_HTTP_ALLOW_SELECT_BRIDGE") != "true")
+                return JsonSerializer.Serialize(
+                    new FormatErrorPayload(false, "select_bridge",
+                        "select_bridge is disabled on the shared HTTP transport because the override " +
+                        "is process-global and would redirect ALL callers; pin per-user via " +
+                        "ARCGIS_PROJECT, or set MCP_HTTP_ALLOW_SELECT_BRIDGE=true to accept the risk."),
                     IndentedJsonContext.Default.FormatErrorPayload);
 
             BridgeDiscovery.RuntimeOverride = project;

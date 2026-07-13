@@ -3,6 +3,11 @@ using System.Text.Json.Serialization;
 
 namespace ArcGisMcpServer.Ipc
 {
+    // IpcRequest/IpcResponse are hand-mirrored between this project and
+    // AddIn/APBridgeAddIn/IpcModels.cs — there is no shared assembly across
+    // the named-pipe boundary. Any field added here MUST be mirrored in
+    // AddIn/APBridgeAddIn/IpcModels.cs or it silently vanishes at runtime
+    // (deserialized as default/missing on the other side, no compile error).
     public record IpcRequest(
         [property: JsonPropertyName("op")] string Op,
         [property: JsonPropertyName("args")] Dictionary<string, string>? Args

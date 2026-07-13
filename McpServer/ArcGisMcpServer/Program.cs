@@ -1,6 +1,7 @@
 using ArcGisMcpServer.Ipc;
 using ArcGisMcpServer.Tools;
 using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -37,7 +38,18 @@ if (httpMode)
     // M365 Copilot Studio (and any other remote MCP client) connects through a
     // reverse proxy that terminates TLS; this server speaks plain HTTP on a
     // private LAN/loopback port.
+    // Flag select_bridge that RuntimeOverride is process-global here — the
+    // tool refuses to run (absent an explicit opt-in) so one HTTP caller
+    // can't silently redirect every other caller sharing this process.
+    BridgeDiscovery.HttpMode = true;
+
     var builder = WebApplication.CreateBuilder(args);
+
+    // Parity with the documented nginx reverse-proxy config (client_max_body_size 0,
+    // i.e. unlimited) — otherwise Kestrel's ~30MB default request-body cap silently
+    // rejects large payloads (e.g. big geometry/attribute batches) the proxy would
+    // have let through.
+    builder.WebHost.ConfigureKestrel(o => o.Limits.MaxRequestBodySize = null);
 
     builder.Services.AddSingleton(new BridgeClient(pipeNameResolver));
     builder.Services.AddMcpServer()
