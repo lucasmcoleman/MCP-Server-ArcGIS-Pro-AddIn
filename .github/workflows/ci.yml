@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  build-and-test:
+    name: Build MCP server + run AtbxTests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Build MCP server (syntax/compile check)
+        shell: pwsh
+        run: dotnet build McpServer/ArcGisMcpServer -c Release
+
+      # Note: the ArcGIS Pro Add-In (AddIn/APBridgeAddIn) is intentionally NOT
+      # built here. It requires ArcGIS.Desktop.*.dll from a licensed Pro 3.6+
+      # install plus MSBuild's CodeTaskFactory (Esri.ProApp.SDK.Desktop.targets)
+      # — neither is available on hosted runners. See release.yml's build-addin
+      # job, which is gated on a self-hosted runner for the same reason.
+      - name: Run AtbxTests (out-of-process ModelBuilder file-layer suite)
+        shell: pwsh
+        run: dotnet run --project tests/AtbxTests -c Release

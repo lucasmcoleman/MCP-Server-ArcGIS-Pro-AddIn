@@ -26,6 +26,10 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
+      - name: Run AtbxTests (out-of-process ModelBuilder file-layer suite)
+        shell: pwsh
+        run: dotnet run --project tests/AtbxTests -c Release
+
       - name: Publish single-file exe (self-contained, trimmed)
         id: publish
         shell: pwsh
@@ -128,3 +132,13 @@ jobs:
           draft: true
           generate_release_notes: true
           files: release-assets/*
+          body: |
+            ## Manual steps still required (see .claude/skills/releasing-and-deploying/SKILL.md)
+
+            - The `.esriAddinX` Add-In bundle is built locally (MSBuild, not CI) and
+              uploaded manually: `gh release upload ${{ steps.tag.outputs.tag }} <path-to-.esriAddinX>`.
+            - Regenerate `SHA256SUMS.txt` to cover **both** artifacts and re-upload it
+              with `--clobber` — the one staged here only hashes what this job saw
+              (the exe, plus the Add-In only if `build-addin` actually ran).
+            - This release is created as a **Draft**. Publish it explicitly:
+              `gh release edit ${{ steps.tag.outputs.tag }} --draft=false`.
