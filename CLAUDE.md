@@ -56,6 +56,8 @@ Output: `AddIn/APBridgeAddIn/bin/Release/net8.0-windows8.0/APBridgeAddIn.esriAdd
 
 Deploy by copying that file to `C:\Users\<you>\Documents\ArcGIS\AddIns\ArcGISPro\{c56ccfd4-f12a-4916-84c2-64248b3d746c}\APBridgeAddIn.esriAddinX`. The GUID is the `AddInInfo id` from `Config.daml` — stable across builds. Pro must be closed during the copy.
 
+**`pwsh ./build-addin.ps1` does all of this in one shot** (vswhere-located MSBuild → AssemblyCache wipe → deploy) **without touching the MCP exe — Claude Code sessions stay open.** Only Pro must be closed, and only for the deploy step; `-BuildOnly` gives a compile check while Pro is still running. Use it for any `AddIn/**`-only change instead of the full `restart-dev-cycle.ps1`.
+
 `CS8632` warnings are cosmetic — ignore.
 
 ### MCP Server (`McpServer/ArcGisMcpServer/`)
