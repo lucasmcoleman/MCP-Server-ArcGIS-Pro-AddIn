@@ -639,9 +639,10 @@ namespace APBridgeAddIn.ModelBuilder
         /// in topological order (a process appears after every process whose output
         /// it consumes).
         ///
-        /// Iterators / nested-model processes (anything that has model_tool but no
-        /// system_tool) are flagged as IsIterator so the executor can reject them
-        /// with a clear message — step-by-step semantics don't apply to iteration.
+        /// Iterators are rejected up front by <c>Kind</c>: the executor tests
+        /// <c>p.Kind</c> directly against <see cref="ToolKind"/> and refuses
+        /// anything it doesn't recognize with a clear message — step-by-step
+        /// semantics don't apply to iteration.
         /// </summary>
         public static ModelGraph WalkModel(string atbxPath, string modelName)
         {
@@ -836,11 +837,6 @@ namespace APBridgeAddIn.ModelBuilder
                     // can become runnable once runtime parameter values arrive,
                     // so executors treat these as best-effort, not as dead.
                     MarkedInvalid = TryGetString(p?["valid"]) == "false",
-                    // Step-by-step execution doesn't have semantics for anything
-                    // outside GpTool. The executor's iterator-reject path covers
-                    // all non-GP kinds; keep IsIterator true for them so existing
-                    // callers (and the executor's FirstOrDefault check) stay correct.
-                    IsIterator = kind != ToolKind.GpTool,
                     Params = paramsDict,
                     PreconditionVariableIds = preconditionIds,
                     Environments = envDict,
@@ -1210,12 +1206,29 @@ namespace APBridgeAddIn.ModelBuilder
                 ?? throw new Exception("Invalid model definition JSON");
             def["name"] = modelName;
 
-            var (toolModel, toolContent, toolContentRc, diagram, diagramXml) =
-                GenerateModelFiles(def, modelName);
-
             WriteAtbxAtomically(atbxPath, zip =>
             {
                 var folder = $"{modelName}.tool";
+
+                // CRITICAL: read the existing tool.model / tool.content BEFORE
+                // any writes (ZipArchive Update-mode read-before-write rule —
+                // see WriteAtbxAtomically). GenerateModelFiles writes tool.model
+                // / tool.content as ONLY the keys it owns (version/updated/
+                // variables/processes, and type/displayname/description/
+                // app_ver/product/updated/params respectively); anything else
+                // Pro stored at those roots (e.g. model-level default
+                // environments from the Model Properties dialog) must survive
+                // an update untouched, so we hand the generator the existing
+                // objects to merge onto rather than build from scratch.
+                var existingModelText = ReadEntryTextOrDefault(zip, $"{folder}/tool.model", "");
+                var existingContentText = ReadEntryTextOrDefault(zip, $"{folder}/tool.content", "");
+                var existingModel = string.IsNullOrWhiteSpace(existingModelText)
+                    ? null : JsonNode.Parse(existingModelText) as JsonObject;
+                var existingContent = string.IsNullOrWhiteSpace(existingContentText)
+                    ? null : JsonNode.Parse(existingContentText) as JsonObject;
+
+                var (toolModel, toolContent, toolContentRc, diagram, diagramXml) =
+                    GenerateModelFiles(def, modelName, existingModel, existingContent);
 
                 RemoveEntryIfExists(zip, $"{folder}/tool.model");
                 RemoveEntryIfExists(zip, $"{folder}/tool.content");
@@ -1234,9 +1247,17 @@ namespace APBridgeAddIn.ModelBuilder
         /// <summary>
         /// Generates all internal .atbx model files from a simplified definition.
         /// Returns (tool.model, tool.content, tool.content.rc, tool.model.diagram, tool.model.diagram.xml)
+        ///
+        /// <paramref name="existingToolModel"/> / <paramref name="existingToolContent"/>
+        /// are the UPDATE path's pre-existing root objects (null on create). When
+        /// supplied, they are used as the base and only the keys this generator
+        /// owns are replaced — every other root key Pro may have written (e.g.
+        /// model-level default environments from Model Properties) survives the
+        /// update verbatim instead of being dropped.
         /// </summary>
         private static (string, string, string, string, string) GenerateModelFiles(
-            JsonNode def, string modelName)
+            JsonNode def, string modelName,
+            JsonObject? existingToolModel = null, JsonObject? existingToolContent = null)
         {
             var description = def["description"]?.GetValue<string>() ?? "";
             var inputs = def["inputs"]?.AsArray() ?? new JsonArray();
@@ -1283,6 +1304,15 @@ namespace APBridgeAddIn.ModelBuilder
                 bool exposed = !JsonFlagFalse(input?["exposed"]);
                 var id = nextId++.ToString();
 
+                // Duplicate names silently overwrite in nameToId (one shared
+                // namespace across parameter and step-output names) and every
+                // ref resolves to whichever entry was written last — a
+                // mis-wired model that "succeeds" on write. Fail loudly
+                // instead so create_model/update_model surface a structured
+                // bridge error.
+                if (nameToId.ContainsKey(name))
+                    throw new Exception(
+                        $"Duplicate name '{name}' in model definition: parameter/output names must be unique across the model");
                 nameToId[name] = id;
 
                 var variable = new JsonObject
@@ -1482,6 +1512,12 @@ namespace APBridgeAddIn.ModelBuilder
                         }
 
                         var outputId = nextId++.ToString();
+
+                        // See the input-parameter duplicate check above — same
+                        // shared namespace, same silent-corruption failure mode.
+                        if (nameToId.ContainsKey(outputName))
+                            throw new Exception(
+                                $"Duplicate name '{outputName}' in model definition: parameter/output names must be unique across the model");
                         nameToId[outputName] = outputId;
 
                         var outputVar = new JsonObject
@@ -1711,14 +1747,17 @@ namespace APBridgeAddIn.ModelBuilder
                 stepRow++;
             }
 
-            // Build tool.model
-            var toolModel = new JsonObject
-            {
-                ["version"] = "1.0",
-                ["updated"] = DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss"),
-                ["variables"] = variables,
-                ["processes"] = processes
-            };
+            // Build tool.model. On update, start from the existing root object
+            // so any key this generator doesn't own (e.g. model-level
+            // "environments" from Model Properties) survives untouched; only
+            // the four keys below are ever written by this generator.
+            var toolModel = existingToolModel != null
+                ? existingToolModel.DeepClone()!.AsObject()
+                : new JsonObject();
+            toolModel["version"] = "1.0";
+            toolModel["updated"] = DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss");
+            toolModel["variables"] = variables;
+            toolModel["processes"] = processes;
 
             // Honor caller-supplied interface order. describe_model emits
             // "parameterOrder" from tool.content's params key order — the
@@ -1750,18 +1789,23 @@ namespace APBridgeAddIn.ModelBuilder
                 contentParams = ordered;
             }
 
-            // Build tool.content
-            var toolContent = new JsonObject
-            {
-                ["type"] = "ModelTool",
-                ["displayname"] = "$rc:title",
-                ["description"] = "$rc:description",
-                ["app_ver"] = "13.4",
-                ["product"] = "100",
-                ["updated"] = DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss")
-            };
+            // Build tool.content. Same merge-onto-existing behavior as
+            // tool.model above; "params" is owned by this generator too, so an
+            // update with zero contentParams removes a stale "params" key
+            // rather than leaving the pre-existing one dangling.
+            var toolContent = existingToolContent != null
+                ? existingToolContent.DeepClone()!.AsObject()
+                : new JsonObject();
+            toolContent["type"] = "ModelTool";
+            toolContent["displayname"] = "$rc:title";
+            toolContent["description"] = "$rc:description";
+            toolContent["app_ver"] = "13.4";
+            toolContent["product"] = "100";
+            toolContent["updated"] = DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss");
             if (contentParams.Count > 0)
                 toolContent["params"] = contentParams;
+            else
+                toolContent.Remove("params");
 
             // Build tool.content.rc
             rcMap["title"] = modelName;
@@ -2112,8 +2156,12 @@ namespace APBridgeAddIn.ModelBuilder
         /// <summary>
         /// .pyt-hosted script tool (tool_type "PythonScriptTool", path like
         /// "..\Tools.pyt\ToolName"). Round-trips faithfully through
-        /// describe/update; NOT step-executed — in-proc ExecuteToolAsync on a
-        /// .pyt path is the documented hang landmine (see CLAUDE.md).
+        /// describe/update, and IS step-executed — but out-of-proc: in-proc
+        /// ExecuteToolAsync on a .pyt path never returns (the documented hang
+        /// landmine, see CLAUDE.md), so the executor spawns a propy.bat child
+        /// per step and calls the tool by slot name via ImportToolbox. Cross-
+        /// process caveats apply: no selection propagation, no in_memory
+        /// datasets — inputs must be concrete paths.
         /// </summary>
         PythonScriptTool,
         NestedModel,
@@ -2135,7 +2183,6 @@ namespace APBridgeAddIn.ModelBuilder
         /// ModelBuilder's "not ready" state. Executors run these best-effort:
         /// a failure is logged and skipped rather than aborting the run.</summary>
         public bool MarkedInvalid { get; init; }
-        public bool IsIterator { get; init; }
         public Dictionary<string, ModelParam> Params { get; init; } = new(StringComparer.OrdinalIgnoreCase);
         /// <summary>Variable ids this process is precondition-ordered after (no data link).</summary>
         public List<string> PreconditionVariableIds { get; init; } = new();

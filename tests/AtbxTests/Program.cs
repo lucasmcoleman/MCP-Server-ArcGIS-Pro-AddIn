@@ -1,6 +1,10 @@
 // Out-of-process round-trip tests for the AtbxManager model engine and the
-// SystemToolboxCatalog. Runs without ArcGIS Pro — the ModelBuilder file layer
-// is pure System.* (ZIP + JSON). Exit code 0 = all pass.
+// SystemToolboxCatalog. The ModelBuilder file layer (AtbxManager) is pure
+// System.* (ZIP + JSON) and runs without ArcGIS Pro. The SystemToolboxCatalog
+// section additionally requires ArcGIS Pro installed (it reads Pro's shipped
+// system-toolbox schemas from disk) and auto-skips — printing SKIP lines
+// instead of failing — on a machine where Pro isn't found. Exit code 0 = all
+// pass (SKIPs don't count as failures).
 using System.IO.Compression;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -362,6 +366,70 @@ try
             "writer rejects iterator kind");
     }
 
+    Console.WriteLine("== duplicate-name guard ==");
+    // Parameter name collides with a step-output name — same shared
+    // nameToId namespace. Without the guard this silently overwrites and
+    // every ref resolves to the last-assigned id (mis-wired model).
+    var dupDef = """
+    {
+      "name": "DupModel", "description": "duplicate name guard test",
+      "inputs": [ { "name": "Collide", "type": "GPFeatureLayer" } ],
+      "steps": [
+        {
+          "name": "Buf",
+          "tool": "analysis.Buffer",
+          "parameters": {
+            "in_features": { "ref": "Collide" },
+            "out_feature_class": { "output": "Collide", "type": "DEFeatureClass" },
+            "buffer_distance_or_field": "100 Meters"
+          }
+        }
+      ]
+    }
+    """;
+    try
+    {
+        AtbxManager.CreateModel(tbx, dupDef);
+        Check(false, "writer rejects duplicate name", "no exception");
+    }
+    catch (Exception ex)
+    {
+        Check(ex.Message.Contains("Duplicate name 'Collide'") &&
+              ex.Message.Contains("parameter/output names must be unique across the model"),
+            "writer rejects duplicate name with clear message", ex.Message);
+    }
+
+    Console.WriteLine("== update_model preserves unrecognized model-level metadata ==");
+    // Doctor RoundTrip's tool.model / tool.content with extra root keys that
+    // GenerateModelFiles does not itself author (e.g. model-level default
+    // environments from the Model Properties dialog). update_model must
+    // preserve them verbatim instead of dropping them.
+    DoctorEntry(tbx, "RoundTrip.tool/tool.model", text =>
+    {
+        var m = JsonNode.Parse(text)!.AsObject();
+        m["environments"] = new JsonArray(new JsonObject { ["name"] = "extent", ["value"] = "-1 -1 11 11" });
+        return m.ToJsonString();
+    });
+    DoctorEntry(tbx, "RoundTrip.tool/tool.content", text =>
+    {
+        var c = JsonNode.Parse(text)!.AsObject();
+        c["customFlag"] = "keepme";
+        return c.ToJsonString();
+    });
+
+    var rtDescBeforeMetaUpdate = JsonNode.Parse(AtbxManager.DescribeModel(tbx, "RoundTrip"))!;
+    AtbxManager.UpdateModel(tbx, "RoundTrip", rtDescBeforeMetaUpdate.ToJsonString());
+
+    var modelAfterMetaUpdate = JsonNode.Parse(ReadEntryJsonText(tbx, "RoundTrip.tool/tool.model"))!;
+    Check(modelAfterMetaUpdate["environments"]?[0]?["value"]?.GetValue<string>() == "-1 -1 11 11",
+        "update_model preserves unrecognized tool.model root key ('environments')",
+        modelAfterMetaUpdate["environments"]?.ToJsonString());
+
+    var contentAfterMetaUpdate = JsonNode.Parse(ReadEntryJsonText(tbx, "RoundTrip.tool/tool.content"))!;
+    Check(contentAfterMetaUpdate["customFlag"]?.GetValue<string>() == "keepme",
+        "update_model preserves unrecognized tool.content root key ('customFlag')",
+        contentAfterMetaUpdate["customFlag"]?.ToJsonString());
+
     Console.WriteLine("== surgical writes ==");
     AtbxManager.SetParameterDefault(tbx, "RoundTrip", "BufDist", "250 Meters");
     var afterDefault = JsonNode.Parse(AtbxManager.DescribeModel(tbx, "RoundTrip"))!;
@@ -374,36 +442,59 @@ try
         .First(s => s!["name"]!.GetValue<string>() == "Buffer Step")!["parameters"]!["dissolve_option"];
     Check(dissolve!.GetValue<string>() == "NONE", "set_step_parameter applies");
 
-    Console.WriteLine("== SystemToolboxCatalog (live Pro install) ==");
-    var bufferSig = SystemToolboxCatalog.GetSignature("analysis.Buffer");
-    var expectedBuffer = new[] { "in_features", "out_feature_class", "buffer_distance_or_field",
-        "line_side", "line_end_type", "dissolve_option", "dissolve_field", "method" };
-    Check(bufferSig != null && bufferSig.SequenceEqual(expectedBuffer, StringComparer.OrdinalIgnoreCase),
-        "Buffer signature from system toolboxes matches arcpy order",
-        bufferSig == null ? "null" : string.Join(",", bufferSig));
+    Console.WriteLine("== SystemToolboxCatalog (requires ArcGIS Pro installed; auto-skips when absent) ==");
+    // Probe with a known-good tool. GetSignature returns null both when the
+    // catalog disabled itself (sanity check failed) and when no toolbox root
+    // could be resolved at all (Pro not installed, and ARCGIS_PRO_TOOLBOXES_DIR
+    // unset or pointing nowhere) — either way, the whole section is untestable
+    // here, so skip it loudly rather than reporting spurious failures.
+    var systemCatalogAvailable = SystemToolboxCatalog.GetSignature("analysis.Buffer") != null;
+    void Skip(string name) => Console.WriteLine(
+        $"  SKIP  {name} (ArcGIS Pro system toolboxes not found — install not detected / ARCGIS_PRO_TOOLBOXES_DIR unset or invalid)");
 
-    var mergeSig = SystemToolboxCatalog.GetSignature("management.Merge");
-    Check(mergeSig != null && mergeSig[0].Equals("inputs", StringComparison.OrdinalIgnoreCase),
-        "Merge signature resolved dynamically (not hand-pinned)",
-        mergeSig == null ? "null" : string.Join(",", mergeSig));
+    if (systemCatalogAvailable)
+    {
+        var bufferSig = SystemToolboxCatalog.GetSignature("analysis.Buffer");
+        var expectedBuffer = new[] { "in_features", "out_feature_class", "buffer_distance_or_field",
+            "line_side", "line_end_type", "dissolve_option", "dissolve_field", "method" };
+        Check(bufferSig != null && bufferSig.SequenceEqual(expectedBuffer, StringComparer.OrdinalIgnoreCase),
+            "Buffer signature from system toolboxes matches arcpy order",
+            bufferSig == null ? "null" : string.Join(",", bufferSig));
 
-    var addFieldSchema = SystemToolboxCatalog.GetSchema("management.AddField");
-    var fieldTypeParam = addFieldSchema?.Params.FirstOrDefault(p => p.Name == "field_type");
-    Check(fieldTypeParam?.DomainValues != null && fieldTypeParam.DomainValues.Contains("TEXT"),
-        "AddField field_type coded domain extracted",
-        fieldTypeParam?.DomainValues == null ? "null" : string.Join(",", fieldTypeParam.DomainValues));
+        var mergeSig = SystemToolboxCatalog.GetSignature("management.Merge");
+        Check(mergeSig != null && mergeSig[0].Equals("inputs", StringComparison.OrdinalIgnoreCase),
+            "Merge signature resolved dynamically (not hand-pinned)",
+            mergeSig == null ? "null" : string.Join(",", mergeSig));
 
+        var addFieldSchema = SystemToolboxCatalog.GetSchema("management.AddField");
+        var fieldTypeParam = addFieldSchema?.Params.FirstOrDefault(p => p.Name == "field_type");
+        Check(fieldTypeParam?.DomainValues != null && fieldTypeParam.DomainValues.Contains("TEXT"),
+            "AddField field_type coded domain extracted",
+            fieldTypeParam?.DomainValues == null ? "null" : string.Join(",", fieldTypeParam.DomainValues));
+
+        var search = SystemToolboxCatalog.SearchTools("PairwiseBuffer", 5);
+        Check(search.Count >= 1 && search[0].ToolId.Contains("PairwiseBuffer"),
+            "SearchTools finds PairwiseBuffer");
+
+        var outSlot = SystemToolboxCatalog.GetOutputSlot("management.Merge");
+        Check(outSlot is { } os && os.Slot == "output", "Merge output slot derived dynamically",
+            outSlot?.Slot);
+    }
+    else
+    {
+        Skip("Buffer signature from system toolboxes matches arcpy order");
+        Skip("Merge signature resolved dynamically (not hand-pinned)");
+        Skip("AddField field_type coded domain extracted");
+        Skip("SearchTools finds PairwiseBuffer");
+        Skip("Merge output slot derived dynamically");
+    }
+
+    // Hand-pinned catalog — GpToolCatalog.Signatures is a static dictionary
+    // compiled into the assembly, independent of a Pro install, so this check
+    // always runs (not part of the skip-when-absent section above).
     var projectSig = GpToolCatalog.ResolveSignature("management.Project");
     Check(projectSig != null && projectSig[3] == "transform_method",
         "hand-pinned signatures still win via ResolveSignature");
-
-    var search = SystemToolboxCatalog.SearchTools("PairwiseBuffer", 5);
-    Check(search.Count >= 1 && search[0].ToolId.Contains("PairwiseBuffer"),
-        "SearchTools finds PairwiseBuffer");
-
-    var outSlot = SystemToolboxCatalog.GetOutputSlot("management.Merge");
-    Check(outSlot is { } os && os.Slot == "output", "Merge output slot derived dynamically",
-        outSlot?.Slot);
 
     Console.WriteLine("== nested-execution helpers: ResolveToolReference + GetToolSignature ==");
     // Bare name → same toolbox.
