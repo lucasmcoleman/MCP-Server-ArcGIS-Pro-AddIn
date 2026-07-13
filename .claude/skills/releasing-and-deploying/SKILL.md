@@ -27,7 +27,7 @@ This repo has two independently-built artifacts (MCP server exe, Pro Add-In bund
 | Change touches | Run | Precondition | Verify |
 |---|---|---|---|
 | MCP server only (`McpServer/**`) | `pwsh ./build-mcp-server.ps1` | Exit any MCP client (Claude Code, etc.) holding `ArcGisMcpServer.exe` — the script refuses to publish while the process is running, by design (see script header) | New `publish/ArcGisMcpServer.exe` timestamp |
-| Add-In only (`AddIn/**`) | MSBuild directly (below), then manual copy | ArcGIS Pro closed before you overwrite the deployed bundle | Reopen Pro, confirm Add-In loads |
+| Add-In only (`AddIn/**`) | `pwsh ./build-addin.ps1` (builds via vswhere-located MSBuild, wipes AssemblyCache, deploys — MCP exe untouched, Claude Code sessions stay open; `-BuildOnly` for a compile check with Pro still running) | ArcGIS Pro closed for the deploy step only | Reopen Pro, confirm Add-In loads |
 | Both halves | `pwsh ./restart-dev-cycle.ps1` | Pro closed, Claude Code closed | Script prints "Ready. Reopen Claude Code first, then ArcGIS Pro." |
 
 Add-In build command (VS MSBuild only — `dotnet build` fails, the Pro SDK targets file uses `CodeTaskFactory`):
