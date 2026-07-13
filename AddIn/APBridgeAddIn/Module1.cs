@@ -23,6 +23,44 @@ namespace APBridgeAddIn
         /// </summary>
         internal ProBridgeService BridgeService => _service;
 
+        /// <summary>This Pro process's PID — matches the registry filename and the pipe-name suffix.</summary>
+        internal int Pid => _pid;
+
+        /// <summary>The named pipe the bridge listens on ("ArcGisProBridge_&lt;PID&gt;").</summary>
+        internal string PipeName => _pipeName;
+
+        /// <summary>Path to this instance's discovery-registry JSON file.</summary>
+        internal string RegistryFilePath => BridgeRegistry.FilePath(_pid);
+
+        /// <summary>Best-effort liveness check — see ProBridgeService.IsRunning.</summary>
+        internal bool IsServiceAlive => _service != null && _service.IsRunning;
+
+        /// <summary>
+        /// Disposes the current service (if any) and starts a fresh one on the
+        /// SAME pipe name, then re-registers with the discovery registry.
+        /// Used by the ribbon status button's manual-recovery path — the
+        /// bridge auto-starts on module load, but a wedged/dead listener has
+        /// no other in-Pro way to recover short of restarting Pro itself.
+        /// </summary>
+        internal (bool Success, string? Error) RestartBridgeService()
+        {
+            try { _service?.Dispose(); } catch { /* best-effort — proceed to recreate regardless */ }
+
+            try
+            {
+                _service = new ProBridgeService(_pipeName);
+                _service.Start();
+                var (path, name) = TryGetProjectInfo();
+                BridgeRegistry.Register(_pid, _pipeName, path, name);
+                return (true, null);
+            }
+            catch (Exception ex)
+            {
+                _service = null;
+                return (false, ex.Message);
+            }
+        }
+
         protected override bool Initialize()
         {
             // Pipe name is per-Pro-instance (PID-suffixed) so multiple

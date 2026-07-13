@@ -32,6 +32,19 @@ namespace APBridgeAddIn
         private CancellationTokenSource _cts;
         private Task _serverLoop;
 
+        /// <summary>The named pipe this instance listens on ("ArcGisProBridge_&lt;PID&gt;").</summary>
+        public string PipeName => _pipeName;
+
+        /// <summary>
+        /// Best-effort liveness signal for the ribbon status button: true once
+        /// Start() has launched the accept loop and that loop hasn't cancelled
+        /// or otherwise completed. RunAsync only exits via cancellation (it
+        /// swallows and retries transient pipe errors internally), so this
+        /// reads as false only after Dispose() or an unexpected loop crash —
+        /// not a live round-trip probe of the pipe itself.
+        /// </summary>
+        public bool IsRunning => _serverLoop != null && !_serverLoop.IsCompleted;
+
         public ProBridgeService(string pipeName) => _pipeName = pipeName;
 
         public void Start()
@@ -2612,6 +2625,19 @@ namespace APBridgeAddIn
         private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, RunJob>
             _runJobs = new();
 
+        /// <summary>
+        /// Serializes actual model-run execution. Both the sync and async
+        /// run_model paths funnel through RunModelCore, and nothing else
+        /// stopped two concurrent RunModelCore calls from driving Pro's one
+        /// arcpy session at the same time — each run's ClearWorkspaceCache
+        /// calls (see the .pyt lock-retry path) are process-wide, so a
+        /// second run's cache clear can pull the rug out from under the
+        /// first run's in-flight step. Held for the whole root-level
+        /// execution (acquired once in RunModelCore, not per nested
+        /// ExecuteGraphAsync recursion).
+        /// </summary>
+        private static readonly SemaphoreSlim _runModelGate = new(1, 1);
+
         /// <summary>Outcome of one (possibly nested) model-graph execution.</summary>
         private sealed class GraphRunOutcome
         {
@@ -2639,6 +2665,24 @@ namespace APBridgeAddIn
                 !args.TryGetValue("modelName", out string? modelName) ||
                 string.IsNullOrWhiteSpace(modelName))
                 return new(false, "args 'toolboxPath' & 'modelName' required", null);
+
+            // Concurrency guard: only one RunModelCore execution may drive
+            // Pro's single arcpy session at a time (see _runModelGate). If
+            // another run already holds the gate, record why on both the
+            // immediate response messages and the async job (so
+            // get_run_status shows "waiting", not a silent stall) before
+            // blocking on the wait.
+            var allMessages = new List<object>();
+            if (!_runModelGate.Wait(0))
+            {
+                var waitMsg = new { step = (string?)null, type = "Message",
+                    text = "waiting: another model run is in progress" };
+                allMessages.Add(waitMsg);
+                if (job != null) { lock (job.Lock) job.Messages.Add(waitMsg); }
+                await _runModelGate.WaitAsync();
+            }
+            try
+            {
 
             // Collect user-supplied named values (case-insensitive matching).
             var namedValues = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -2712,7 +2756,6 @@ namespace APBridgeAddIn
                 catch { pytScratchGdb = null; }
             }
 
-            var allMessages = new List<object>();
             var outcome = await ExecuteGraphAsync(
                 path, modelName, namedValues, job,
                 allMessages, stepPrefix: "",
@@ -2730,6 +2773,12 @@ namespace APBridgeAddIn
                 skippedPytSteps = outcome.SkippedPytSteps,
                 messages = allMessages
             });
+
+            } // end try (concurrency guard)
+            finally
+            {
+                _runModelGate.Release();
+            }
         }
 
         /// <summary>
@@ -2758,9 +2807,17 @@ namespace APBridgeAddIn
             Dictionary<string, string>? varOverrides = null,
             string pytMode = "execute",
             int pytTimeoutSeconds = 3600,
-            string? pytScratchGdb = null)
+            string? pytScratchGdb = null,
+            HashSet<string>? usedDerivedNames = null)
         {
             bool isRoot = depth == 0;
+            // Run-wide (not per-graph-level) collision set for sanitized derived-
+            // output names: the root call leaves this null and we allocate once
+            // here, then thread the SAME instance into every nested-model
+            // recursion below so a parent step and a nested model's own step
+            // can't sanitize to the same GDB name and silently overwrite each
+            // other's output (A11 — see SanitizeGdbName's call site).
+            usedDerivedNames ??= new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             if (depth > 8)
                 return new GraphRunOutcome { Error = $"Nested model depth exceeded 8 at '{modelName}' — aborting (runaway nesting?)." };
 
@@ -2932,11 +2989,12 @@ namespace APBridgeAddIn
                 }
                 return merged;
             }
-            // Derived-output names assigned this run. Distinct variable names can
-            // sanitize to the same GDB name ("Clip Output" vs "Clip_Output");
-            // with overwriteoutput pinned true the later step would silently
-            // replace the earlier step's data. Uniquify on collision.
-            var usedDerivedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            // Derived-output names assigned this run (usedDerivedNames, threaded
+            // in from the parameter above). Distinct variable names can sanitize
+            // to the same GDB name ("Clip Output" vs "Clip_Output"); with
+            // overwriteoutput pinned true the later step would silently replace
+            // the earlier step's data. Uniquify on collision — run-wide, so a
+            // nested model's own outputs are checked against the parent's too.
 
             foreach (var proc in graph.Processes)
             {
@@ -3081,11 +3139,11 @@ namespace APBridgeAddIn
                     // copy — the child's read takes only a shared lock, and the
                     // parent never touches the isolated GDB) and run against
                     // the copies; the rewritten kwargs come back in the result.
-                    if (!pytResult.Ok && pytResult.Error?.Contains("000464") == true)
+                    if (!pytResult.Ok && IsLockContentionError(pytResult.Error))
                     {
                         var retryNote = new { step = stepPrefix + proc.Name, type = "Warning",
-                            text = "Schema-lock contention (ERROR 000464) — retrying the .pyt child with " +
-                                   "contended parent-GDB inputs copied into the isolated scratch." };
+                            text = "Schema-lock contention (ERROR 000464 or equivalent) — retrying the " +
+                                   ".pyt child with contended parent-GDB inputs copied into the isolated scratch." };
                         allMessages.Add(retryNote);
                         if (job != null) { lock (job.Lock) job.Messages.Add(retryNote); }
                         try
@@ -3206,7 +3264,7 @@ namespace APBridgeAddIn
                             childBox, childTool, childNamed, job, allMessages,
                             stepPrefix + proc.Name + " > ", inFlight, depth + 1,
                             pytMode: pytMode, pytTimeoutSeconds: pytTimeoutSeconds,
-                            pytScratchGdb: pytScratchGdb);
+                            pytScratchGdb: pytScratchGdb, usedDerivedNames: usedDerivedNames);
                         if (!childOutcome.Ok)
                         {
                             if (proc.MarkedInvalid)
@@ -3290,6 +3348,23 @@ namespace APBridgeAddIn
                 if (proc.Kind == APBridgeAddIn.ModelBuilder.ToolKind.GpTool)
                 {
                     sig = GpToolCatalog.ResolveSignature(proc.Tool);
+                    // A miss here means the tool isn't in the hand-curated
+                    // GpToolCatalog.Signatures AND SystemToolboxCatalog either
+                    // doesn't know it either or has disabled itself entirely
+                    // (see SystemToolboxCatalog.DisabledReason). The executor
+                    // still runs — falling back to dense-packing by JSON
+                    // insertion order — but that's silently wrong for any tool
+                    // whose model omitted an optional slot, so surface WHY the
+                    // safety net is down instead of just degrading quietly.
+                    if (sig == null && SystemToolboxCatalog.DisabledReason != null)
+                    {
+                        var catalogWarn = new { step = stepPrefix + proc.Name, type = "Warning",
+                            text = $"dynamic tool catalog disabled: {SystemToolboxCatalog.DisabledReason} — " +
+                                   "signatures degraded to insertion order; a Pro upgrade may have changed " +
+                                   "tool.content format." };
+                        allMessages.Add(catalogWarn);
+                        if (job != null) { lock (job.Lock) job.Messages.Add(catalogWarn); }
+                    }
                 }
                 else
                 {
@@ -3542,8 +3617,8 @@ namespace APBridgeAddIn
                 }
 
                 // Path-dispatched tools: refine derived-output values from the GP
-                // result's return value (the pre-pass seeded them with the in-place
-                // input as a fallback). Only unambiguous with a single derived out.
+                // result (the pre-pass seeded them with the in-place input as a
+                // fallback). Single derived output is unambiguous via ReturnValue.
                 if (derivedOutSlots.Count == 1)
                 {
                     string? ret = null;
@@ -3553,6 +3628,39 @@ namespace APBridgeAddIn
                         && dpm.OutputVariableId != null)
                     {
                         runtimeValues[dpm.OutputVariableId] = ret!;
+                    }
+                }
+                else if (derivedOutSlots.Count > 1)
+                {
+                    // Multiple derived outputs: IGPResult.Values exposes ALL output
+                    // parameter values in declared order (same contract as the .pyt
+                    // out-of-proc branch's Result.getOutput(i) mapping above). Only
+                    // trust it when the count lines up exactly with our declared
+                    // derived-output slots — anything else (extra/missing entries)
+                    // means we can't be sure which value belongs to which slot, so
+                    // fall back to the pre-pass placeholders and say so loudly
+                    // rather than silently mis-mapping a downstream ref.
+                    List<string>? multiValues = null;
+                    try { multiValues = stepResult.Values?.ToList(); } catch { /* host quirk */ }
+                    if (multiValues != null && multiValues.Count == derivedOutSlots.Count)
+                    {
+                        for (int dvi = 0; dvi < derivedOutSlots.Count; dvi++)
+                        {
+                            if (!string.IsNullOrEmpty(multiValues[dvi])
+                                && proc.Params.TryGetValue(derivedOutSlots[dvi], out var dpm2)
+                                && dpm2.OutputVariableId != null)
+                            {
+                                runtimeValues[dpm2.OutputVariableId] = multiValues[dvi];
+                            }
+                        }
+                    }
+                    else
+                    {
+                        var multiOutWarn = new { step = stepPrefix + proc.Name, type = "Warning",
+                            text = $"Step declares {derivedOutSlots.Count} derived outputs; positional " +
+                                   "refinement unavailable — downstream refs may resolve to placeholders." };
+                        allMessages.Add(multiOutWarn);
+                        if (job != null) { lock (job.Lock) job.Messages.Add(multiOutWarn); }
                     }
                 }
 
@@ -3944,6 +4052,27 @@ except Exception:
         /// underscores, and prefixes a letter if the result would otherwise
         /// start with a digit. Empty/null input falls back to "out".
         /// </summary>
+        /// <summary>
+        /// Detects schema/workspace lock contention from a .pyt child's error
+        /// text so the isolate_inputs retry (see the .pyt dispatch branch
+        /// above) fires regardless of exact wording — arcpy sometimes raises
+        /// the bare GP code (000464), sometimes a "Schema Lock" / "cannot
+        /// acquire ... lock" message with no code at all (e.g. when the
+        /// error surfaces from a wrapped exception rather than a GP message).
+        /// Case-insensitive; conservative (only matches lock-shaped text, so
+        /// unrelated failures still fail without the extra retry+delay).
+        /// </summary>
+        private static bool IsLockContentionError(string? error)
+        {
+            if (string.IsNullOrEmpty(error)) return false;
+            if (error.Contains("000464", StringComparison.OrdinalIgnoreCase)) return true;
+            if (error.Contains("schema lock", StringComparison.OrdinalIgnoreCase)) return true;
+            if (System.Text.RegularExpressions.Regex.IsMatch(
+                    error, @"cannot\s+acquire.*lock", System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+                return true;
+            return false;
+        }
+
         private static string SanitizeGdbName(string? name)
         {
             if (string.IsNullOrWhiteSpace(name)) return "out";

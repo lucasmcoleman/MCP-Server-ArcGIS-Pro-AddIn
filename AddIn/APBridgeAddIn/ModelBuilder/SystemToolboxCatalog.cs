@@ -33,6 +33,16 @@ namespace APBridgeAddIn.ModelBuilder
         private static Dictionary<string, string>? _aliasDirs; // alias → toolbox dir
         private static bool _disabled;
 
+        /// <summary>
+        /// Non-null once <see cref="_disabled"/> has been set, naming the
+        /// specific reason for process lifetime (root not found, enumeration
+        /// failure, or the Buffer sanity check tripping on a format change).
+        /// Surfaced by the executor so a signature-lookup miss reads as
+        /// "the dynamic catalog gave up, here's why" instead of a silent
+        /// fall-back to insertion-order dense-packing.
+        /// </summary>
+        public static string? DisabledReason { get; private set; }
+
         // "alias.Tool" → parsed schema (null = definitively not found)
         private static readonly ConcurrentDictionary<string, ToolSchema?> _cache =
             new(StringComparer.OrdinalIgnoreCase);
@@ -111,7 +121,13 @@ namespace APBridgeAddIn.ModelBuilder
             {
                 if (_aliasDirs != null) return _aliasDirs;
                 var root = ToolboxesRoot();
-                if (root == null) { _disabled = true; return null; }
+                if (root == null)
+                {
+                    _disabled = true;
+                    DisabledReason = "system toolboxes root directory not found " +
+                        "(neither ARCGIS_PRO_TOOLBOXES_DIR nor the Pro-relative/standard install path resolved)";
+                    return null;
+                }
 
                 var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
                 try
@@ -130,7 +146,12 @@ namespace APBridgeAddIn.ModelBuilder
                         catch { /* one bad toolbox shouldn't kill discovery */ }
                     }
                 }
-                catch { _disabled = true; return null; }
+                catch (Exception ex)
+                {
+                    _disabled = true;
+                    DisabledReason = $"toolbox directory enumeration under '{root}' failed: {ex.Message}";
+                    return null;
+                }
 
                 _aliasDirs = map;
 
@@ -145,6 +166,9 @@ namespace APBridgeAddIn.ModelBuilder
                     !buffer.Params.Select(p => p.Name).SequenceEqual(expected, StringComparer.OrdinalIgnoreCase))
                 {
                     _disabled = true;
+                    DisabledReason = "sanity check failed — analysis.Buffer did not parse to the 8 " +
+                        "known slots in the known order; tool.content's on-disk format may have " +
+                        "changed (Pro upgrade?)";
                     _aliasDirs = null;
                     return null;
                 }

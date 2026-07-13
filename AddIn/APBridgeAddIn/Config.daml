@@ -16,8 +16,8 @@
         </group>
       </groups>
       <controls>
-        <button id="APBridgeAddIn_Button1" caption="Start MCP Bridge" className="Button1" loadOnClick="true" smallImage="Images\AddInDesktop16.png" largeImage="Images\AddInDesktop32.png">
-          <tooltip heading="MCP Bridge">Start the Named Pipe server for Claude MCP integration<disabledText /></tooltip>
+        <button id="APBridgeAddIn_Button1" caption="MCP Bridge Status" className="Button1" loadOnClick="true" smallImage="Images\AddInDesktop16.png" largeImage="Images\AddInDesktop32.png">
+          <tooltip heading="MCP Bridge">Show bridge status and restart the named-pipe server if needed<disabledText /></tooltip>
         </button>
       </controls>
     </insertModule>
