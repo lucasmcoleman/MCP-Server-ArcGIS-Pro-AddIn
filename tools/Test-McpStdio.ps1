@@ -13,7 +13,11 @@ param(
     # Sequence of calls in ONE server process (needed to test session state
     # like select_bridge). Each item: 'tool_name' or 'tool_name|{"arg":"v"}'.
     [string[]]$Calls,
-    [string]$ServerPath = "McpServer\ArcGisMcpServer\bin\Release\net8.0\ArcGisMcpServer.dll",
+    # Defaults to the published single-file exe — the artifact .mcp.json actually
+    # wires up for MCP clients. Falls back to the bin/Release DLL (a DIFFERENT,
+    # separately-built artifact) with a loud warning if the exe hasn't been
+    # published yet.
+    [string]$ServerPath = "McpServer\ArcGisMcpServer\publish\ArcGisMcpServer.exe",
     [hashtable]$Env = @{},
     [int]$TimeoutSec = 30
 )
@@ -24,6 +28,12 @@ if (-not $Calls) {
 }
 
 $ErrorActionPreference = 'Stop'
+
+if ($ServerPath -eq "McpServer\ArcGisMcpServer\publish\ArcGisMcpServer.exe" -and -not (Test-Path $ServerPath)) {
+    $fallback = "McpServer\ArcGisMcpServer\bin\Release\net8.0\ArcGisMcpServer.dll"
+    Write-Warning "Published exe not found at '$ServerPath'. Falling back to '$fallback' — NOTE: this is NOT the artifact .mcp.json wires up for real MCP clients; run build-mcp-server.ps1 to test the real thing."
+    $ServerPath = $fallback
+}
 
 $psi = [System.Diagnostics.ProcessStartInfo]::new()
 if ($ServerPath.EndsWith('.dll')) {

@@ -56,6 +56,12 @@ namespace ArcGisMcpServer.Ipc
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "ArcGisMcpBridge");
 
+        // Set true by Program.cs when the server is running the HTTP transport.
+        // RuntimeOverride (select_bridge) is process-global — on HTTP, one
+        // caller's override silently redirects every other caller sharing this
+        // process, so the SelectBridge tool gates on this flag.
+        public static bool HttpMode { get; set; } = false;
+
         public static string? PinnedProject =>
             Environment.GetEnvironmentVariable("ARCGIS_PROJECT") is { } p
             && !string.IsNullOrWhiteSpace(p) ? p : null;
