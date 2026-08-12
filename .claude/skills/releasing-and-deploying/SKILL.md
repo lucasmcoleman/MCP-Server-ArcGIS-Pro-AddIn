@@ -80,8 +80,10 @@ Done on 2026-07-12 — do not redo:
 
 - ~~Delete `origin/claude/generate-addin-mcp-release-Ey5vN`~~ — deleted 2026-07-12; its two stray commits (an obsolete `-SelfContained` build switch) are preserved under the local tag `archive/claude-selfcontained-branch` should anyone ever need them.
 
+Done on 2026-08-12 — do not redo:
+- ~~Cut `v0.4.0`~~ — cut and **published** 2026-08-12 from `c8c1068` (65 commits past `v0.3.0`), with all 3 assets and a both-artifact `SHA256SUMS.txt`; `v0.4.0` now holds `Latest`. The ritual below was followed end-to-end and every step behaved exactly as documented: CI's `build-addin` job skipped in 0s, and the CI-staged `SHA256SUMS.txt` again shipped hashing only the exe. Downloaded-and-validated after publishing — both checksums verified against the live assets.
+
 Still open:
-- **Master is 53+ commits past `v0.3.0`** (as of 2026-07-12) — a `v0.4.0` cut is overdue.
 - **Decide the `build-addin` job's fate**: register a real ArcGIS-Pro-licensed self-hosted runner labeled `arcgis-pro` and set the `HAS_ARCGIS_RUNNER` repo variable to `true`, or delete the job as aspirational dead weight that has skipped on every run since it was added.
 
 ## Context: who this affects
