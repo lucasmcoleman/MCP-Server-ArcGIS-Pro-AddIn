@@ -45,32 +45,37 @@ C:\Users\<you>\Documents\ArcGIS\AddIns\ArcGISPro\{c56ccfd4-f12a-4916-84c2-64248b
 
 ## The release ritual
 
-CI (`.github/workflows/release.yml`, triggered on `v*` tag push or manual `workflow_dispatch`) builds and uploads **only `ArcGisMcpServer.exe`**. Its `build-addin` job is gated `if: vars.HAS_ARCGIS_RUNNER == 'true'` on a `runs-on: [self-hosted, windows, arcgis-pro]` runner — that runner has never been registered (`gh api .../actions/variables` returns zero variables) and the job has shown `conclusion: "skipped"` completing in under a second on all 3 historical runs. Do not expect it to produce the Add-In.
+CI (`.github/workflows/release.yml`, triggered on `v*` tag push or manual `workflow_dispatch`) builds the exe **and, since 2026-08-12, the Add-In too** — the `build-addin` job's `if: vars.HAS_ARCGIS_RUNNER == 'true'` gate is now satisfied and a self-hosted runner is registered (see **Self-hosted runner** below). That collapses the old 6-step ritual to 3 steps. **The un-draft step is still manual and is still the one that gets forgotten.**
 
-Full checklist — every step is manual until noted otherwise:
+Ritual as of v0.5.0 onward:
 
-1. **Tag and push.**
+1. **Land the CHANGELOG section for this cut**, then **tag and push.**
    ```
-   git tag vX.Y.Z && git push origin vX.Y.Z
+   git tag -a vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z
    ```
-   CI kicks off automatically and creates a **Draft** release with the exe attached (`draft: true` in the workflow's `softprops/action-gh-release` step — this is deliberate, not a bug).
-2. **Build the Add-In locally** with the MSBuild command above (CI will not do this for you).
-3. **Upload it to the release CI already created:**
-   ```
-   gh release upload vX.Y.Z <path-to-.esriAddinX>
-   ```
-4. **Regenerate `SHA256SUMS.txt` covering BOTH artifacts and upload it** — the CI-generated one only hashes the exe (see the workflow's "Stage release assets" step, which only ever sees the exe artifact locally when the Add-In job skips) and will otherwise be silently short.
-   ```powershell
-   Get-FileHash ArcGisMcpServer.exe, APBridgeAddIn.esriAddinX -Algorithm SHA256 |
-     ForEach-Object { "$($_.Hash.ToLower())  $($_.Path | Split-Path -Leaf)" } | Out-File SHA256SUMS.txt -Encoding ascii
-   gh release upload vX.Y.Z SHA256SUMS.txt --clobber
-   ```
-5. **Publish it: `gh release edit vX.Y.Z --draft=false`.** THIS IS THE STEP THAT WAS MISSED TWICE — v0.2.0 and v0.3.0 sat as Drafts for two months while `gh release list` reported v0.1.0 as "Latest" simply because it was the only non-draft release, even though it was chronologically the oldest tag.
-6. **Verify:**
+   (All four historical tags are annotated — keep that.) CI creates a **Draft** release (`draft: true` is deliberate, not a bug) with all three assets: the exe, the `.esriAddinX`, and a `SHA256SUMS.txt` that now covers **both** artifacts, because the `build-addin` artifact finally exists when "Stage release assets" runs.
+2. **Publish it: `gh release edit vX.Y.Z --draft=false`.** THIS IS THE STEP THAT WAS MISSED TWICE — v0.2.0 and v0.3.0 sat as Drafts for two months while `gh release list` reported v0.1.0 as "Latest" simply because it was the only non-draft release, even though it was chronologically the oldest tag. **Automating the other steps did not automate this one.**
+3. **Verify:**
    ```
    gh release view vX.Y.Z --json isDraft,assets
    ```
    Confirm `isDraft: false` and exactly 3 assets (`ArcGisMcpServer.exe`, `APBridgeAddIn.esriAddinX`, `SHA256SUMS.txt`).
+
+If the runner is offline at tag time the `build-addin` job **queues rather than skips** (the gate is now `true`), so the release job waits instead of silently shipping a short release. Bring the runner up, or fall back to the manual path: build locally with `build-addin.ps1 -BuildOnly`, `gh release upload`, and regenerate `SHA256SUMS.txt` over both artifacts.
+
+Note the CI-built and locally-built `.esriAddinX` are **not byte-identical** (182,852 vs 182,888 bytes for the same source — the ZIP embeds timestamps and paths). Never mix a locally-built bundle with CI-generated checksums; regenerate the sums over whichever bundle actually ships.
+
+## Self-hosted runner (registered 2026-08-12)
+
+`lucas-pc-arcgis` — the repo owner's own workstation, labels `self-hosted, Windows, X64, arcgis-pro`, installed at `C:\actions-runner`. Verified end-to-end: it resolves VS 2022 Community's MSBuild, links against the real `C:\Program Files\ArcGIS\Pro\bin\ArcGIS.Desktop.*.dll` assemblies, and produces a valid `.esriAddinX` in ~15s.
+
+**Security posture — read before touching workflow triggers.** This repo is **public**, so a self-hosted runner is inherently exposed: `release.yml` can only be triggered by tag push or `workflow_dispatch` (both write-gated, unreachable from a fork), but `ci.yml` triggers on `pull_request`, and for that event GitHub runs the workflow file **from the PR's head branch**. A fork PR could therefore add `runs-on: [self-hosted, windows, arcgis-pro]` to `ci.yml` and execute arbitrary code on the owner's workstation — which holds the `MCP_AUTH_TOKEN` env var, an employer OneDrive tree, and LAN access. The compensating control is `approval_policy: all_external_contributors` (set 2026-08-12, tightened from GitHub's `first_time_contributors` default), so **every** outside PR needs an explicit maintainer click before any workflow runs.
+
+Consequences to respect:
+- **Never relax that approval policy** while a self-hosted runner is registered and the repo is public. Check it with `gh api repos/OWNER/REPO/actions/permissions/fork-pr-contributor-approval`.
+- **Approving an external PR is now a code-execution decision**, not a politeness. Read the diff — especially `.github/workflows/**` — before clicking.
+- If the repo ever goes private, this vector closes and the policy can be relaxed.
+- To retire the runner: `gh api --method DELETE repos/OWNER/REPO/actions/runners/<id>`, then unset `HAS_ARCGIS_RUNNER` so the job returns to skipping rather than queueing forever.
 
 ## Current entropy state (updated 2026-07-12)
 
@@ -83,8 +88,10 @@ Done on 2026-07-12 — do not redo:
 Done on 2026-08-12 — do not redo:
 - ~~Cut `v0.4.0`~~ — cut and **published** 2026-08-12 from `c8c1068` (65 commits past `v0.3.0`), with all 3 assets and a both-artifact `SHA256SUMS.txt`; `v0.4.0` now holds `Latest`. The ritual below was followed end-to-end and every step behaved exactly as documented: CI's `build-addin` job skipped in 0s, and the CI-staged `SHA256SUMS.txt` again shipped hashing only the exe. Downloaded-and-validated after publishing — both checksums verified against the live assets.
 
+- ~~Decide the `build-addin` job's fate~~ — **resolved 2026-08-12: registered.** `lucas-pc-arcgis` is live and `HAS_ARCGIS_RUNNER=true` is set, so the job now runs instead of skipping. Proven with a throwaway `runner-smoke.yml` (mirroring the job's exact steps) before ungating, then deleted. Fork-PR approval was tightened to `all_external_contributors` in the same change — see **Self-hosted runner** above for why that pairing is mandatory, not optional.
+
 Still open:
-- **Decide the `build-addin` job's fate**: register a real ArcGIS-Pro-licensed self-hosted runner labeled `arcgis-pro` and set the `HAS_ARCGIS_RUNNER` repo variable to `true`, or delete the job as aspirational dead weight that has skipped on every run since it was added.
+- **The runner is interactive, not a service.** It was configured without `--runasservice` (the agent session lacked elevation), so it only listens while `C:\actions-runner\run.cmd` is running and dies on logoff/reboot. To make it durable, from an **elevated** shell: `cd C:\actions-runner; .\svc.cmd install; .\svc.cmd start`. Until then, check `gh api repos/OWNER/REPO/actions/runners` shows `"status":"online"` before tagging a release, or the `build-addin` job will queue and stall the release job.
 
 ## Context: who this affects
 
