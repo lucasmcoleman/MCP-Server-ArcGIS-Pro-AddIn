@@ -6,6 +6,21 @@ This project is a hardened fork/evolution of [nicogis/MCP-Server-ArcGIS-Pro-AddI
 
 ---
 
+## [CI: Self-Hosted Add-In Builds] — 2026-08-12
+
+Unreleased; ships with the next tag. `release.yml`'s `build-addin` job had been dead weight since it was added — gated on a self-hosted runner that was never registered, it reported `skipped` in under a second on all four historical runs, which is why every release so far needed the `.esriAddinX` built and uploaded by hand and a hand-regenerated `SHA256SUMS.txt`.
+
+### Added
+- **Self-hosted Actions runner `lucas-pc-arcgis`** (labels `self-hosted, Windows, X64, arcgis-pro`, runner 2.336.0 at `C:\actions-runner`) and the `HAS_ARCGIS_RUNNER=true` repo variable that ungates `build-addin`. CI now produces the `.esriAddinX` itself, and because that artifact finally exists when the release job's "Stage release assets" step runs, the generated `SHA256SUMS.txt` covers **both** artifacts instead of silently hashing only the exe. The release ritual drops from 6 manual steps to 3 — tag, un-draft, verify. Validated before ungating via a temporary `runner-smoke.yml` mirroring the job's exact steps: MSBuild resolved from VS 2022 Community, linked against the real `ArcGIS.Desktop.*` assemblies under `C:\Program Files\ArcGIS\Pro\bin`, valid bundle produced in ~15s.
+
+### Security
+- **Fork-PR approval tightened to `all_external_contributors`** (from GitHub's `first_time_contributors` default), a prerequisite for the above rather than an independent change. This repo is public, and while `release.yml` is unreachable from a fork (tag-push and `workflow_dispatch` are both write-gated), `ci.yml` triggers on `pull_request` — an event for which GitHub runs the workflow file *from the PR's head branch*. An outside PR could therefore have added `runs-on: [self-hosted, windows, arcgis-pro]` to `ci.yml` and executed arbitrary code on the runner host. Every external PR now requires an explicit maintainer approval before any workflow runs. **Approving an outside PR is now a code-execution decision** — see the `releasing-and-deploying` skill before relaxing this or changing workflow triggers.
+
+### Known limitation
+- The runner is registered **interactively, not as a Windows service**, so it stops listening on logoff/reboot. Elevated `svc.cmd install` + `svc.cmd start` makes it durable. Until then, confirm the runner reports `"status":"online"` before tagging — with the gate now `true`, an offline runner makes `build-addin` **queue** rather than skip, stalling the release job instead of quietly shipping a short release.
+
+---
+
 ## [Dev-Cycle Tooling] — 2026-07-13
 
 Released as **v0.4.0**, which rolls up every section from *Standalone tables + optional map parameter* (2026-05-12) through this one — 65 commits since `v0.3.0`. The headline work in that range is `.pyt` out-of-process execution, parameter-interface round-trip fidelity, multi-instance bridge routing, and the Handover Hardening defect sweep; see the sections below for detail.
