@@ -6,6 +6,19 @@ This project is a hardened fork/evolution of [nicogis/MCP-Server-ArcGIS-Pro-AddI
 
 ---
 
+## [Dev-Cycle Tooling] — 2026-07-13
+
+Released as **v0.4.0**, which rolls up every section from *Standalone tables + optional map parameter* (2026-05-12) through this one — 65 commits since `v0.3.0`. The headline work in that range is `.pyt` out-of-process execution, parameter-interface round-trip fidelity, multi-instance bridge routing, and the Handover Hardening defect sweep; see the sections below for detail.
+
+### Added
+- **`build-addin.ps1`** — a third build script sitting between the two existing ones: it rebuilds and deploys **only** the Pro Add-In, never touching `publish/ArcGisMcpServer.exe`. That distinction matters operationally — the MCP exe is file-locked by any attached MCP client, so the previous options for an `AddIn/**`-only change were to close every Claude Code session and run `restart-dev-cycle.ps1`, or to hand-run MSBuild plus the AssemblyCache wipe and bundle copy. The script locates MSBuild via `vswhere` (the Pro SDK targets file uses `CodeTaskFactory`, so `dotnet build` cannot work), wipes `%LOCALAPPDATA%\ESRI\ArcGISPro\AssemblyCache\{c56ccfd4-…}`, and deploys the bundle. Only ArcGIS Pro must be closed, and only for the deploy step. `-BuildOnly` runs the compile alone, so a syntax check works with Pro still open — and doubles as the release-time bundle build. The bundle is verified to exist *and* be newer than the build start, so a failed build can't silently pass on a stale artifact from an earlier run.
+- **`workflow_dispatch` trigger on `ci.yml`** — the build+test workflow could previously only be re-run by pushing a commit or via a PR event; it can now be kicked manually from the Actions tab (`release.yml` already had one).
+
+### Documentation
+- **`CLAUDE.md` synced to post-hardening reality** — the build/deploy section now documents `build-addin.ps1` as the correct script for `AddIn/**`-only changes, and the testing section reflects that CI gates AtbxTests on every push/PR while the Add-In is still built and uploaded manually.
+
+---
+
 ## [Handover Hardening] — 2026-07-12
 
 Closes the two remaining confirmed-open ROADMAP items (A11, F6) plus a round of correctness/safety fixes surfaced while auditing the ModelBuilder writer, the HTTP transport, and `run_model`'s concurrency model. Adds a CI workflow so the AtbxTests suite gates every push/PR, not just release cuts.
